@@ -10,6 +10,7 @@ This is a prerelease for hands-on evaluation. The version uses a numeric prerele
 - Require Node.js 24 for development and CI; refresh frontend dependencies and retain the DOMPurify security override.
 - Harden provider configuration file permissions, reject credential-bearing extra headers, remove obsolete keychain entries after authentication changes, and default release logs to less detailed output.
 - Bundle SQLite 3.54.1 through `libsqlite3-sys` 0.39.1 to address RustSec-2026-0459 (CVE-2026-119375).
+- Linux prerelease artifacts are AppImage and Debian packages; the RPM bundler rejects SemVer prerelease versions containing a hyphen.
 
 ## Verification
 

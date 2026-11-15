@@ -876,9 +876,9 @@ mod tests {
         w(h.join(".pg_service.conf"), "[a]\nhost=x\n");
         let found = discover(h);
         let has = |s: ImportSource, tail: &str| {
-            found
-                .iter()
-                .any(|f| f.source == s && f.path.to_string_lossy().ends_with(tail))
+            found.iter().any(|f| {
+                f.source == s && f.path.to_string_lossy().replace('\\', "/").ends_with(tail)
+            })
         };
         assert!(has(ImportSource::DataGrip, "shop/.idea/dataSources.xml"));
         assert!(has(ImportSource::DataGrip, "options/dataSources.xml"));

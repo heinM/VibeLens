@@ -18,7 +18,7 @@ Builds are **unsigned until you add the signing secrets** (§5, §6). They work,
 |---|---|---|---|
 | macOS (Apple Silicon + Intel) | `VibeLens_X.Y.Z_universal.dmg` (and the `.app` inside) | Developer ID Application + notarisation | "Apple could not verify 'VibeLens' is free of malware". On macOS 15+ the right-click-Open bypass is gone; users must go to System Settings → Privacy & Security → **Open Anyway**. |
 | Windows 10/11 x64 | `VibeLens_X.Y.Z_x64-setup.exe` (NSIS), `VibeLens_X.Y.Z_x64_en-US.msi` | Authenticode (OV or EV) | SmartScreen "Windows protected your PC" → More info → Run anyway. **Windows 11 Smart App Control blocks unsigned apps outright**, and users can only turn SAC off entirely. |
-| Linux x64 | `.AppImage`, `.deb`, `.rpm` | none expected; publish SHA-256 checksums | nothing (but secrets are memory-only on Linux, see README) |
+| Linux x64 | Stable: `.AppImage`, `.deb`, `.rpm`; prerelease: `.AppImage`, `.deb` | none expected; publish SHA-256 checksums | nothing (but secrets are memory-only on Linux, see README) |
 
 Artifacts land under `VibeLens/target/<triple>/release/bundle/…` (the workspace `target/`, not `src-tauri/target/`).
 
@@ -68,7 +68,7 @@ git commit -am "Release v$V" && git tag "v$V" && git push && git push --tags
 ```
 
 - Use SemVer.
-- Pre-releases (`0.2.0-beta.1`) are fine on macOS/Linux and for NSIS, but **the MSI bundler only accepts a numeric pre-release identifier** (`0.2.0-1`). For betas, either use that form, ship NSIS only (`--bundles nsis`), or set `bundle.windows.wix.version`.
+- Pre-releases (`0.2.0-beta.1`) are fine on macOS and for NSIS, but **the MSI bundler only accepts a numeric pre-release identifier** (`0.2.0-1`). RPM's version field rejects SemVer prerelease hyphens, so prerelease Linux builds ship `.AppImage` and `.deb` only. For betas, either use a numeric Windows pre-release, ship NSIS only (`--bundles nsis`), or set `bundle.windows.wix.version`.
 - Never reuse a version number; updaters and Windows installers both rely on it increasing.
 
 Keep `identifier` (`com.heinvandermerwe.vibelens`) stable for future updates; it keys the app's config directory, keychain service, and Windows install registration. This release uses a fresh identity and does not import profiles or saved secrets from earlier app versions.

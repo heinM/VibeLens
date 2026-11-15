@@ -1059,10 +1059,14 @@ mod tests {
     async fn sql_catalog_migration_only_on_dev() {
         install_sql_drivers();
         let dir = tempfile::tempdir().unwrap();
+        let database_path = dir.path().join("catalog.db");
+        #[cfg(windows)]
         let uri = format!(
-            "sqlite://{}?mode=rwc",
-            dir.path().join("catalog.db").display()
+            "sqlite:///{}?mode=rwc",
+            database_path.to_string_lossy().replace('\\', "/")
         );
+        #[cfg(not(windows))]
+        let uri = format!("sqlite://{}?mode=rwc", database_path.display());
         {
             let pool = sqlx::any::AnyPoolOptions::new()
                 .max_connections(1)
