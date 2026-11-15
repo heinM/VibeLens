@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["src-tauri", "crates/vibelens-core"]
+
+[workspace.package]
+version = "0.1.0-1"
+edition = "2024"
+license-file = "../LICENCE.md"
+authors = ["Hein van der Merwe"]
+
+# Dependencies (DataFusion, Arrow, AWS SDK) are huge with full debug info: keep only line tables
+# for our crates and none for deps. Cuts target/ size and link time dramatically.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

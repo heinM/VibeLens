@@ -1,0 +1,55 @@
+# Local targets for trying VibeLens and for integration tests. (scripts/dev-mac.sh does all of this.)
+#   docker compose -f docker-compose.dev.yml up -d
+# Postgres seeds a demo `shop` schema on first start. Seed Valkey with:
+#   scripts/seed/valkey-seed.sh | docker compose -f docker-compose.dev.yml exec -T valkey valkey-cli
+#   export VG_TEST_PG="host=127.0.0.1 port=55432 user=postgres password=vibelens dbname=vibelens_test"
+#   export VG_TEST_VALKEY=redis://127.0.0.1:56379
+#   cargo test -p vibelens-core
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: vibelens
+      POSTGRES_DB: vibelens_test
+    ports: ["127.0.0.1:55432:5432"]
+    volumes:
+      - ./scripts/seed/01-shop.sql:/docker-entrypoint-initdb.d/01-shop.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      retries: 20
+  valkey:
+    image: valkey/valkey:8
+    ports: ["127.0.0.1:56379:6379"]
+
+  # --- Apache Iceberg: REST catalog (official Apache test fixture) + S3-compatible storage ---
+  # VibeLens connection: Iceberg → REST, URI http://localhost:8181, auth none,
+  #   storage "S3-compatible with access keys": endpoint http://localhost:9000, region us-east-1, path-style on,
+  #   access key admin / secret password. Seed demo tables (also creates the `warehouse` bucket):
+  #   pip install "pyiceberg[pyarrow,s3fs,pyiceberg-core]==0.12.0" && python3 scripts/seed/iceberg-seed.py
+  #   (scripts/dev-mac.sh --iceberg does all of this.)
+  #
+  # Upstream MinIO community edition is archived (Apr 2026) and has published no images since
+  # Oct 2025, so `minio/minio:latest` is frozen and unpatched. This is Pigsty's maintained AGPLv3
+  # fork ("Silo", github.com/pgsty/minio): same server, same env vars, same API. Pinned on purpose:
+  # bump deliberately. Any S3-compatible store works here (SeaweedFS, Garage, RustFS, …).
+  minio:
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+      MINIO_DOMAIN: minio
+    ports: ["127.0.0.1:9000:9000", "127.0.0.1:9001:9001"]
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture@sha256:db8de90b5b7693d4ac334c336f91d9bbe320d7b19f4f514d26de84cdfbcbfe8d # no release tag for this build yet
+    depends_on: [minio] # the fixture only touches S3 when tables are written; the seed waits for MinIO
+    ports: ["127.0.0.1:8181:8181"]
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"

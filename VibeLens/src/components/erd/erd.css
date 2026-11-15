@@ -1,0 +1,150 @@
+/* ER diagram styling. Everything draws from the app tokens so dark and light both work. */
+.vg-erd {
+  --erd-card: var(--vg-panel);
+  --erd-head: var(--vg-panel-2);
+  --erd-line: color-mix(in srgb, var(--vg-muted) 62%, transparent);
+  --erd-shadow: rgba(0, 0, 0, 0.38);
+  --erd-key: #f59e0b;
+  --erd-dot: color-mix(in srgb, var(--vg-muted) 26%, transparent);
+  background-color: var(--vg-bg);
+  background-image: radial-gradient(circle, var(--erd-dot) 1px, transparent 1.2px);
+  background-size: 24px 24px;
+}
+:root.light .vg-erd {
+  --erd-shadow: rgba(15, 23, 42, 0.1);
+  --erd-key: #b45309;
+  --erd-line: color-mix(in srgb, var(--vg-muted) 80%, transparent);
+  --erd-dot: color-mix(in srgb, var(--vg-muted) 34%, transparent);
+}
+
+.vg-erd svg {
+  display: block;
+  touch-action: none;
+}
+.vg-erd text {
+  font-family: var(--font-sans);
+  pointer-events: none;
+}
+.vg-erd .mono {
+  font-family: var(--font-mono);
+}
+
+/* Cards */
+.vg-node {
+  cursor: default;
+}
+.vg-node .shadow {
+  fill: var(--erd-shadow);
+}
+.vg-node .card {
+  fill: var(--erd-card);
+  stroke: var(--vg-border);
+  stroke-width: 1;
+}
+.vg-node .head {
+  fill: var(--erd-head);
+}
+.vg-node .divider {
+  stroke: var(--vg-border);
+}
+.vg-node .t-name {
+  fill: var(--vg-fg);
+  font-weight: 600;
+}
+.vg-node .t-col {
+  fill: var(--vg-fg);
+}
+.vg-node .t-col.pk {
+  font-weight: 600;
+}
+.vg-node .t-muted {
+  fill: var(--vg-muted);
+}
+.vg-node .ico-key {
+  stroke: var(--erd-key);
+}
+.vg-node .ico-link {
+  stroke: var(--vg-accent);
+}
+.vg-node .toggle rect {
+  fill: transparent;
+  stroke: var(--vg-border);
+}
+.vg-node .toggle:hover rect {
+  fill: var(--vg-panel);
+  stroke: var(--vg-accent);
+}
+.vg-node .toggle {
+  cursor: pointer;
+}
+.vg-node[data-sel] .card {
+  stroke: var(--vg-accent);
+  stroke-width: 2;
+}
+.vg-node[data-sel] {
+  filter: drop-shadow(0 0 14px color-mix(in srgb, var(--vg-accent) 38%, transparent));
+}
+.vg-node:hover .card {
+  stroke: color-mix(in srgb, var(--vg-accent) 55%, var(--vg-border));
+}
+
+/* Edges */
+.vg-edge path {
+  fill: none;
+  stroke: var(--erd-line);
+  stroke-width: 1.4;
+  stroke-linecap: round;
+}
+.vg-edge path.hit {
+  stroke: transparent;
+  stroke-width: 12;
+  pointer-events: stroke;
+}
+.vg-edge[data-self] path.line {
+  stroke-dasharray: 4 3;
+}
+.vg-erd[data-focus] .vg-node {
+  opacity: 0.28;
+  transition: opacity 140ms ease;
+}
+.vg-erd[data-focus] .vg-node[data-rel] {
+  opacity: 1;
+}
+.vg-erd[data-focus] .vg-edge {
+  opacity: 0.1;
+  transition: opacity 140ms ease;
+}
+.vg-erd[data-focus] .vg-edge[data-hl] {
+  opacity: 1;
+}
+.vg-edge[data-hl] path:not(.hit) {
+  stroke: var(--vg-accent);
+  stroke-width: 2;
+}
+
+/* Low-detail mode: names stay legible at any zoom (screen-constant size). */
+.vg-erd .lod-name {
+  font-weight: 600;
+  fill: var(--vg-fg);
+  font-size: min(calc(13px * var(--inv, 1)), 34px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vg-erd[data-focus] .vg-node,
+  .vg-erd[data-focus] .vg-edge {
+    transition: none;
+  }
+}
+
+.vg-erd .lod-bar {
+  fill: var(--vg-muted);
+  opacity: 0.28;
+}
+.vg-erd .lod-bar.pk {
+  fill: var(--erd-key);
+  opacity: 0.7;
+}
+.vg-erd .lod-bar.fk {
+  fill: var(--vg-accent);
+  opacity: 0.55;
+}
