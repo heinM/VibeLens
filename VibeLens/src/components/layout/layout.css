@@ -1,0 +1,83 @@
+/* Workspace chrome: resizable separators, focus rings, editor accents, scrollbars. */
+
+/* react-resizable-panels v4 exposes interaction state as data-separator="inactive|hover|active|focus|disabled". */
+.vg-sep {
+  position: relative;
+  flex: none;
+  background: var(--vg-border);
+  outline: none;
+  transition: background-color 120ms ease;
+}
+.vg-sep[aria-orientation="vertical"] {
+  width: 1px;
+}
+.vg-sep[aria-orientation="horizontal"] {
+  height: 1px;
+}
+.vg-sep[data-separator="hover"],
+.vg-sep[data-separator="active"],
+.vg-sep[data-separator="focus"] {
+  background: var(--vg-accent);
+}
+/* a slightly fatter, invisible-until-hover grab zone on top of the 1px line */
+.vg-sep[aria-orientation="vertical"][data-separator="hover"],
+.vg-sep[aria-orientation="vertical"][data-separator="active"] {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--vg-accent) 55%, transparent);
+}
+.vg-sep[aria-orientation="horizontal"][data-separator="hover"],
+.vg-sep[aria-orientation="horizontal"][data-separator="active"] {
+  box-shadow: 0 1px 0 0 color-mix(in srgb, var(--vg-accent) 55%, transparent), 0 -1px 0 0 color-mix(in srgb, var(--vg-accent) 55%, transparent);
+}
+
+/* Keyboard focus ring for every control that does not draw its own. */
+:where(button, [role="button"], [role="tab"], [role="option"], [role="radio"], [role="switch"], select, summary):focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--vg-accent) 65%, transparent);
+  outline-offset: -2px;
+}
+
+/* Statement under the cursor in multi-statement scripts. */
+.vg-stmt-active {
+  background: color-mix(in srgb, var(--vg-accent) 6%, transparent);
+}
+.vg-stmt-bar {
+  margin-left: 3px;
+  width: 2px !important;
+  border-radius: 1px;
+  background: color-mix(in srgb, var(--vg-accent) 70%, transparent);
+}
+
+/* Result grid rows. */
+.vg-row:hover {
+  background: color-mix(in srgb, var(--vg-accent) 5%, transparent);
+}
+
+/* Slim, theme-aware scrollbars everywhere; corners match the panel. */
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--vg-muted);
+  background-clip: content-box;
+}
+
+/* Native form controls follow the theme. */
+:root.dark {
+  color-scheme: dark;
+}
+:root.light {
+  color-scheme: light;
+}
+select option {
+  background: var(--vg-panel);
+  color: var(--vg-fg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vg-sep {
+    transition: none;
+  }
+  .animate-spin,
+  .animate-pulse {
+    animation-duration: 2s;
+  }
+}

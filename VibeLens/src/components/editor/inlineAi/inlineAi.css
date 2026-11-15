@@ -1,0 +1,96 @@
+/* Inline AI: prompt bar zone, diff/ghost zones and removed-line marks. Colours follow the app tokens;
+   the rgba fallbacks keep older Safari builds (no color-mix) looking right. */
+.vg-ai-bar-zone {
+  box-sizing: border-box;
+  height: 100%;
+  padding: 6px 18px 6px var(--vg-gutter, 56px);
+  display: flex;
+  align-items: stretch;
+  font-family: var(--font-sans);
+}
+.vg-ai-bar {
+  position: relative;
+  overflow: hidden;
+  width: 100%;
+  max-width: 760px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 5px;
+  padding: 7px 10px 6px;
+  border-radius: 10px;
+  border: 1px solid rgba(94, 234, 212, 0.38);
+  background: var(--vg-panel);
+  box-shadow: 0 10px 28px -8px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(0, 0, 0, 0.2);
+  color: var(--vg-fg);
+}
+.vg-ai-bar[data-phase="error"] {
+  border-color: rgba(248, 113, 113, 0.5);
+}
+.vg-ai-bar[data-phase="running"]::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--vg-accent), transparent);
+  background-size: 40% 100%;
+  background-repeat: no-repeat;
+  animation: vg-ai-sweep 1.3s ease-in-out infinite;
+}
+@keyframes vg-ai-sweep {
+  from { background-position: -40% 0; }
+  to { background-position: 140% 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .vg-ai-bar[data-phase="running"]::before { animation: none; background-size: 100% 100%; opacity: 0.5; }
+}
+.vg-ai-kbd {
+  display: inline-flex;
+  align-items: center;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 4px;
+  border: 1px solid var(--vg-border);
+  background: var(--vg-panel-2);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1;
+  color: var(--vg-muted);
+}
+
+/* Proposed lines (diff additions and ghost blocks) live in view zones under the code. */
+.vg-ai-zone {
+  box-sizing: border-box;
+  width: 100%;
+  padding-left: var(--vg-gutter, 56px);
+  font-size: 13px;
+  line-height: 20px;
+  overflow: hidden;
+}
+.vg-ai-line {
+  position: relative;
+  height: 20px;
+  white-space: pre;
+  overflow: hidden;
+}
+.vg-ai-line::before {
+  position: absolute;
+  left: calc(-1 * var(--vg-gutter, 56px));
+  width: var(--vg-gutter, 56px);
+  text-align: center;
+  font-size: 12px;
+}
+.vg-ai-add { background: rgba(74, 222, 128, 0.14); box-shadow: inset 2px 0 0 #4ade80; }
+.vg-ai-add .vg-ai-line::before { content: "+"; color: #4ade80; }
+.vg-ai-ghost { background: rgba(94, 234, 212, 0.07); box-shadow: inset 2px 0 0 rgba(94, 234, 212, 0.7); }
+.vg-ai-ghost .vg-ai-line { opacity: 0.88; font-style: normal; }
+.vg-ai-ghost .vg-ai-line::before { content: "✦"; color: var(--vg-accent); }
+.vg-ai-zone .vg-ai-line span { white-space: pre; }
+
+/* Removed lines stay in place, tinted red and struck through. */
+.vg-ai-del { background: rgba(248, 113, 113, 0.26); box-shadow: inset 2px 0 0 #f87171; }
+.vg-ai-del-text { text-decoration: line-through; text-decoration-color: rgba(248, 113, 113, 0.85); opacity: 0.75; }
+:root.light .vg-ai-add { background: rgba(21, 128, 61, 0.1); box-shadow: inset 2px 0 0 #15803d; }
+:root.light .vg-ai-add .vg-ai-line::before { color: #15803d; }
+:root.light .vg-ai-ghost { background: rgba(13, 148, 136, 0.07); box-shadow: inset 2px 0 0 rgba(13, 148, 136, 0.7); }
+:root.light .vg-ai-del { background: rgba(220, 38, 38, 0.16); box-shadow: inset 2px 0 0 #dc2626; }

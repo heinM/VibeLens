@@ -1,0 +1,88 @@
+@import "tailwindcss" source("../src");
+
+/* Design tokens. Dark-first (DB tools live in dark mode); light via <html class="light">. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  --color-bg: var(--vg-bg);
+  --color-panel: var(--vg-panel);
+  --color-panel-2: var(--vg-panel-2);
+  --color-border: var(--vg-border);
+  --color-fg: var(--vg-fg);
+  --color-muted: var(--vg-muted);
+  --color-accent: var(--vg-accent);
+  --color-accent-fg: var(--vg-accent-fg);
+  --color-warn: var(--vg-warn);
+  --color-danger: var(--vg-danger);
+  --color-ok: var(--vg-ok);
+  --color-env-dev: #22c55e;
+  --color-env-test: #3b82f6;
+  --color-env-staging: #f59e0b;
+  --color-env-prod: #ef4444;
+}
+
+:root {
+  --vg-bg: #f7f8fa;
+  --vg-panel: #ffffff;
+  --vg-panel-2: #f0f2f5;
+  --vg-border: #dfe3e8;
+  --vg-fg: #111827;
+  --vg-muted: #6b7280;
+  --vg-accent: #0d9488;
+  --vg-accent-fg: #ffffff;
+  --vg-warn: #b45309;
+  --vg-danger: #dc2626;
+  --vg-ok: #15803d;
+}
+
+:root.dark {
+  --vg-bg: #0b0f14;
+  --vg-panel: #11161d;
+  --vg-panel-2: #171e27;
+  --vg-border: #232c38;
+  --vg-fg: #e6edf3;
+  --vg-muted: #8b98a8;
+  --vg-accent: #5eead4;
+  --vg-accent-fg: #042f2e;
+  --vg-warn: #f59e0b;
+  --vg-danger: #f87171;
+  --vg-ok: #4ade80;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--vg-bg);
+  color: var(--vg-fg);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+  user-select: none; /* desktop app feel; editors/grids re-enable selection */
+  overflow: hidden;
+}
+
+.selectable,
+.monaco-editor,
+input,
+textarea {
+  user-select: text;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--vg-border);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}

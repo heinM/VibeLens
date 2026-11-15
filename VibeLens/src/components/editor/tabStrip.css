@@ -1,0 +1,11 @@
+/* Hide the tab strip's scrollbar. `scrollbar-width` is only honoured by Safari 18.2+; older WebKit
+   (the macOS webview) needs the ::-webkit-scrollbar rule. Scoped to this class. */
+.vg-tabstrip-scroll {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.vg-tabstrip-scroll::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}

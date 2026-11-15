@@ -1,0 +1,166 @@
+name: Release
+
+# Builds installers for macOS (universal), Windows (x64) and Linux (x64) into a DRAFT GitHub release.
+# Signing/notarisation happen only when the corresponding secrets exist (see docs/RELEASING.md §9),
+# so this works unsigned out of the box.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the draft release and upload assets
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS (universal)
+            os: macos-15
+            args: --target universal-apple-darwin
+            targets: aarch64-apple-darwin,x86_64-apple-darwin
+          - name: Windows (x64)
+            os: windows-2025
+            args: ""
+            targets: ""
+          # 22.04 on purpose: AppImages built here run on older glibc distros too.
+          # RPM's Version field rejects SemVer prerelease hyphens; keep RC builds to deb + AppImage.
+          - name: Linux (x64)
+            os: ubuntu-22.04
+            args: ""
+            targets: ""
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: VibeLens
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 · Node 24
+
+      - name: Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev patchelf xdg-utils
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0 · Node 24
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: VibeLens/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: ${{ matrix.targets }}
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: VibeLens
+          key: release-${{ matrix.os }}
+
+      - run: npm ci
+
+      # bundle.resources = resources/* — the build fails without the RDS CA bundle.
+      - name: Fetch Amazon RDS CA bundle
+        run: ./scripts/fetch-rds-ca.sh
+
+      - name: Configure macOS signing (only if secrets are set)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          if [[ -z "$APPLE_CERTIFICATE" || -z "$APPLE_SIGNING_IDENTITY" ]]; then
+            echo "::warning::No Apple signing secrets: building an UNSIGNED macOS app (users will need 'Open Anyway')."
+            exit 0
+          fi
+          {
+            echo "APPLE_CERTIFICATE=$APPLE_CERTIFICATE"
+            echo "APPLE_CERTIFICATE_PASSWORD=$APPLE_CERTIFICATE_PASSWORD"
+            echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY"
+          } >> "$GITHUB_ENV"
+          if [[ -n "$APPLE_API_KEY_P8" && -n "$APPLE_API_KEY" && -n "$APPLE_API_ISSUER" ]]; then
+            key="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+            printf '%s' "$APPLE_API_KEY_P8" > "$key"
+            chmod 600 "$key"
+            {
+              echo "APPLE_API_ISSUER=$APPLE_API_ISSUER"
+              echo "APPLE_API_KEY=$APPLE_API_KEY"
+              echo "APPLE_API_KEY_PATH=$key"
+            } >> "$GITHUB_ENV"
+          else
+            echo "::warning::Signing without notarisation (App Store Connect API key secrets missing)."
+          fi
+
+      - name: Configure updater signing (only if secrets are set)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if [[ -n "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
+            echo "TAURI_SIGNING_PRIVATE_KEY<<__VG_EOF__" >> "$GITHUB_ENV"
+            echo "$TAURI_SIGNING_PRIVATE_KEY" >> "$GITHUB_ENV"
+            echo "__VG_EOF__" >> "$GITHUB_ENV"
+            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" >> "$GITHUB_ENV"
+          fi
+
+      # Windows Authenticode: add your signer's credentials here as env vars and set
+      # bundle.windows.signCommand in tauri.conf.json (docs/RELEASING.md §6).
+
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: VibeLens
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v__VERSION__' }}
+          releaseName: "VibeLens v__VERSION__"
+          releaseBody: "VibeLens 0.1.0 Release Candidate 2. See VibeLens/RELEASE_NOTES_RC2.md for changes and verification details."
+          releaseDraft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          args: ${{ github.ref_type == 'tag' && contains(github.ref_name, '-') && matrix.name == 'Linux (x64)' && '--bundles deb,appimage' || matrix.args }}
+
+  checksums:
+    name: SHA-256 checksums
+    needs: build
+    runs-on: ubuntu-24.04
+    # Convenience only: if it fails, run `shasum -a 256 *` on the assets by hand (RELEASING.md §9).
+    continue-on-error: true
+    steps:
+      - name: Add SHA256SUMS.txt to the draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ "${{ github.ref_type }}" != "tag" ]]; then echo "Manual run: skip checksums"; exit 0; fi
+          mkdir assets && cd assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*'
+          rm -f SHA256SUMS.txt
+          sha256sum * > SHA256SUMS.txt
+          gh release upload "$TAG" SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber
+
+  publish-rc:
+    name: Publish release candidate
+    needs: [build, checksums]
+    if: github.ref_type == 'tag' && contains(github.ref_name, '-')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the completed prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease
