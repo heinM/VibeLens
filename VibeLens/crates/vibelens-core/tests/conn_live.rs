@@ -361,9 +361,9 @@ fn pg_profile_for(d: &Dsn) -> ConnectionProfile {
     p.auth = AuthMethod::Password {
         username: d.user.clone(),
     };
-    // The test server uses a self-signed certificate: encrypt, don't verify.
+    // The CI Postgres service uses the stock plaintext container configuration.
     p.tls = TlsConfig {
-        mode: TlsMode::Require,
+        mode: TlsMode::Disable,
         ca_cert_path: None,
         use_rds_bundle: false,
     };
