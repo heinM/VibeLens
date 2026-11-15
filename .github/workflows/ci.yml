@@ -56,6 +56,33 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 · Node 24
       - name: System deps (WebKitGTK for the Tauri shell)
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev
+      - name: Configure TLS for the Postgres service
+        shell: bash
+        run: |
+          set -euo pipefail
+          pg_container="$(docker ps --filter 'ancestor=postgres:17' --format '{{.ID}}' | head -n 1)"
+          test -n "$pg_container"
+          openssl req -new -x509 -days 1 -nodes \
+            -out "$RUNNER_TEMP/postgres-server.crt" \
+            -keyout "$RUNNER_TEMP/postgres-server.key" \
+            -subj '/CN=localhost'
+          docker cp "$RUNNER_TEMP/postgres-server.crt" "$pg_container:/var/lib/postgresql/server.crt"
+          docker cp "$RUNNER_TEMP/postgres-server.key" "$pg_container:/var/lib/postgresql/server.key"
+          docker exec "$pg_container" chown postgres:postgres /var/lib/postgresql/server.crt /var/lib/postgresql/server.key
+          docker exec "$pg_container" chmod 600 /var/lib/postgresql/server.key
+          docker exec -i --user postgres "$pg_container" sh -c 'cat >> "$PGDATA/postgresql.conf"' <<'EOF'
+          ssl = on
+          ssl_cert_file = '/var/lib/postgresql/server.crt'
+          ssl_key_file = '/var/lib/postgresql/server.key'
+          EOF
+          docker exec --user postgres "$pg_container" pg_ctl -D /var/lib/postgresql/data restart -m fast
+          for attempt in {1..20}; do
+            if docker exec "$pg_container" pg_isready -U postgres; then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
