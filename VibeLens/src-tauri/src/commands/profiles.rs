@@ -13,6 +13,8 @@ pub async fn list_profiles(state: State<'_, AppState>) -> CmdResult<Vec<Connecti
 /// `password` → keychain `profile:<id>:password` (Password auth, or a pasted access token).
 /// `ssh_secret` → keychain ssh-password or ssh-passphrase depending on the tunnel auth.
 /// `None` leaves an existing secret untouched; `Some("")` deletes it.
+// Each optional secret is a separate Tauri IPC field so edits can preserve unrelated secrets.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn save_profile(
     state: State<'_, AppState>,

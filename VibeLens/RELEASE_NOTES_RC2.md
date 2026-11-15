@@ -1,4 +1,4 @@
-# VibeLens 0.1.0-1 (Release Candidate 1)
+# VibeLens 0.1.0-2 (Release Candidate 2)
 
 This is a prerelease for hands-on evaluation. The version uses a numeric prerelease identifier so the Windows MSI bundle accepts it.
 
@@ -9,12 +9,13 @@ This is a prerelease for hands-on evaluation. The version uses a numeric prerele
 - Configure Portkey AI Gateway providers, including model catalog, provider, virtual key, and config routing.
 - Require Node.js 24 for development and CI; refresh frontend dependencies and retain the DOMPurify security override.
 - Harden provider configuration file permissions, reject credential-bearing extra headers, remove obsolete keychain entries after authentication changes, and default release logs to less detailed output.
+- Bundle SQLite 3.54.1 through `libsqlite3-sys` 0.39.1 to address RustSec-2026-0459 (CVE-2026-119375).
 
 ## Verification
 
 - Frontend: typecheck, 694 tests, and production Vite build pass on this machine.
 - Rust: formatting and compilation pass; all 382 core unit tests and the complete integration suite pass.
-- Dependency advisories: npm registry access is unavailable in this environment, and `cargo-audit` is not installed. CI has RustSec and npm audit jobs.
+- Dependency advisories: the RustSec finding from RC1 is patched in this candidate. npm registry access was unavailable locally; CI runs RustSec and npm audit.
 
 ## Known follow-up
 

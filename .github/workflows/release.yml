@@ -126,7 +126,7 @@ jobs:
           projectPath: VibeLens
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v__VERSION__' }}
           releaseName: "VibeLens v__VERSION__"
-          releaseBody: "VibeLens 0.1.0 Release Candidate 1. See VibeLens/RELEASE_NOTES_RC1.md for changes and verification details."
+          releaseBody: "VibeLens 0.1.0 Release Candidate 2. See VibeLens/RELEASE_NOTES_RC2.md for changes and verification details."
           releaseDraft: true
           prerelease: ${{ contains(github.ref_name, '-') }}
           args: ${{ matrix.args }}

@@ -3,10 +3,15 @@ resolver = "3"
 members = ["src-tauri", "crates/vibelens-core"]
 
 [workspace.package]
-version = "0.1.0-1"
+version = "0.1.0-2"
 edition = "2024"
 license-file = "../LICENCE.md"
 authors = ["Hein van der Merwe"]
+
+# SQLx 0.8.6 caps this driver below the RustSec-patched SQLite release. Keep its
+# 0.8.6 source with the dependency range raised to 0.39 until upstream publishes a fix.
+[patch.crates-io]
+sqlx-sqlite = { path = "vendor/sqlx-sqlite" }
 
 # Dependencies (DataFusion, Arrow, AWS SDK) are huge with full debug info: keep only line tables
 # for our crates and none for deps. Cuts target/ size and link time dramatically.
