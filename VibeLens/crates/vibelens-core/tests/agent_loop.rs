@@ -34,6 +34,8 @@ enum Reply {
     Status(u16, String),
     /// 200 text/event-stream: send `prefix`, then hold the connection open until the client leaves.
     Hang(String),
+    /// A 3xx with this `Location`.
+    Redirect(u16, String),
 }
 
 struct MockLlm {
@@ -143,6 +145,12 @@ async fn serve(
             let resp = format!(
                 "HTTP/1.1 {code} Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
+            );
+            sock.write_all(resp.as_bytes()).await?;
+        }
+        Some(Reply::Redirect(code, location)) => {
+            let resp = format!(
+                "HTTP/1.1 {code} Redirect\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
             );
             sock.write_all(resp.as_bytes()).await?;
         }
@@ -1276,6 +1284,61 @@ async fn tool_round_limit_stops_the_turn() {
     assert_eq!(h.llm.requests().len(), 17);
     // History stays well-formed after the limit.
     assert_tool_pairing(&h.llm.requests()[16].body);
+}
+
+/// Review finding M5. A redirect is answered by the address in the base URL; following it would
+/// hand the API key (a custom header survives a cross-host redirect) and, for 307 and 308, the
+/// whole conversation to wherever it points.
+#[tokio::test]
+async fn a_provider_redirect_is_not_followed_with_the_key_or_the_conversation() {
+    for code in [301, 302, 303, 307, 308] {
+        // Where the redirect points. It would answer happily; it must never hear from us.
+        let elsewhere = MockLlm::start(vec![Reply::Sse(anthropic_sse(
+            "from somewhere else",
+            &[],
+            "end_turn",
+            (1, 1),
+        ))])
+        .await;
+        let target = format!("{}/v1/messages?session=abc", elsewhere.base_url);
+        let h = Harness::anthropic(vec![Reply::Redirect(code, target)], vec![]).await;
+        let (_, mut rx) = h
+            .start(
+                "s1",
+                "anthropic",
+                "my private question",
+                AgentContext::default(),
+            )
+            .await;
+        let events = collect(&h, "s1", &mut rx, |_| None).await;
+
+        assert!(
+            elsewhere.requests().is_empty(),
+            "HTTP {code}: the redirect target received {:?}",
+            elsewhere.requests()
+        );
+        assert_eq!(h.llm.requests().len(), 1, "HTTP {code}: asked once");
+        assert_eq!(
+            shape(&events),
+            vec!["started anthropic/claude-test", "failed llm"],
+            "HTTP {code}"
+        );
+        match events.last().unwrap() {
+            AgentEvent::Failed { error } => {
+                let m = &error.message;
+                // Names where the redirect points (without its query string), so the base URL
+                // can be corrected.
+                assert!(
+                    m.contains(&code.to_string())
+                        && m.contains(&format!("{}/v1/messages", elsewhere.base_url)),
+                    "HTTP {code}: {m}"
+                );
+                assert!(m.contains("redirect") && m.contains("base URL"), "{m}");
+                assert!(!m.contains("session=abc") && !m.contains(KEY), "{m}");
+            }
+            _ => unreachable!(),
+        }
+    }
 }
 
 #[tokio::test]

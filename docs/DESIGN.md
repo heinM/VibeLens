@@ -123,7 +123,7 @@ On Linux (dev/CI) there is no keychain backend. The app falls back to an in-memo
 
 ## 6. Security model: what's enforced vs advisory
 
-**Enforced (Rust):** the read-only transaction for agent reads; the approval gate; the workspace path jail (no `..`, canonicalised under root, extension allowlist, 5 MiB cap); `aiDataAccess`; the prod write-guard (`confirm_required`); CSP; minimal capabilities; TLS verify-full by default; SSH host-key pinning.
+**Enforced (Rust):** the read-only transaction for agent reads; the approval gate; the workspace path jail (no `..`, canonicalised under root, extension allowlist, 5 MiB cap); `aiDataAccess`; the prod write-guard (`confirm_required`); CSP; minimal capabilities; TLS verify-full by default; SSH host-key pinning; no redirects for requests that carry a secret (the LLM client follows none, the Iceberg REST client only within the same host and port).
 
 **Advisory:** SQL classification. It fails closed: `ReadOnly` is returned only when sqlparser yields a Query, Explain (non-analyze), Show or Values AST with no known side-effecting function (`dblink*`, `pg_read_file`, `lo_*`, `pg_terminate_backend`, advisory locks, `set_config`, `nextval`, …). Anything unparseable goes to approval. But a user-defined `SECURITY DEFINER` function, or an extension we don't know about, can still do work inside READ ONLY. **Use a least-privilege role for anything the agent touches.** The README says so plainly.
 

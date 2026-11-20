@@ -62,6 +62,9 @@ pub async fn pgproxy_ready(health_url: &str) -> Result<()> {
             "PGProxy health URL must start with http:// or https://".into(),
         ));
     }
+    // Redirects are followed here (the library default): this is a bare GET with no credential,
+    // header or body of ours, so there is nothing a redirect could carry elsewhere. The clients
+    // that do send secrets (LLM providers, REST catalogs) do not follow them.
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()

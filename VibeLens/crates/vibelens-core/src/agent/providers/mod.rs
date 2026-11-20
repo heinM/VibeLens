@@ -232,7 +232,8 @@ impl ProviderClient {
         format!("{}{}", self.cfg.base_url.trim_end_matches('/'), path)
     }
 
-    /// POSTs `body` as JSON with `headers` plus the config's `extra_headers`.
+    /// POSTs `body` as JSON with `headers` plus the config's `extra_headers`. A 3xx answer is an
+    /// error (see [`redirect_error`](Self::redirect_error)); every other status is returned.
     pub(super) async fn post(
         &self,
         url: &str,
@@ -258,7 +259,32 @@ impl ProviderClient {
                 redact(&describe_reqwest_error(&e), self.key_str())
             ))
         })?;
+        if resp.status().is_redirection() {
+            return Err(self.redirect_error(url, &resp));
+        }
         Ok(resp)
+    }
+
+    /// The error for a 3xx answer. The HTTP client does not follow redirects (the key and the
+    /// conversation would go along), so the user is told where the endpoint pointed and can
+    /// decide whether that belongs in the base URL.
+    fn redirect_error(&self, requested: &str, resp: &reqwest::Response) -> CoreError {
+        let target = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|location| redirect_target(requested, location));
+        let to = match target {
+            Some(t) => format!(" to {}", redact(&t, self.key_str())),
+            None => String::new(),
+        };
+        CoreError::Llm(format!(
+            "{} answered with a redirect (HTTP {}){to}. VibeLens does not follow redirects, because \
+             your API key and the conversation would be sent to that address. If it is the right \
+             endpoint, set it as this provider's base URL",
+            self.cfg.label,
+            resp.status().as_u16()
+        ))
     }
 
     /// Reads a non-2xx response into an `Llm` error carrying the provider's own message.
@@ -317,6 +343,21 @@ fn describe_reqwest_error(e: &reqwest::Error) -> String {
         src = s.source();
     }
     msg
+}
+
+/// Where a `Location` header points, resolved against the URL that was requested, as
+/// `scheme://host[:port]/path`. Credentials, query and fragment are left out: this goes into an
+/// error message, and a redirect URL can carry tokens there.
+fn redirect_target(requested: &str, location: &str) -> Option<String> {
+    let mut target = url::Url::parse(requested)
+        .ok()?
+        .join(location.trim())
+        .ok()?;
+    let _ = target.set_username("");
+    let _ = target.set_password(None);
+    target.set_query(None);
+    target.set_fragment(None);
+    Some(target.to_string())
 }
 
 /// Pulls a human message out of a provider error body (Anthropic, OpenAI and Gemini shapes),
@@ -420,6 +461,29 @@ pub(crate) fn parse_tool_args(raw: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redirect_targets_are_shown_without_credentials_or_query() {
+        let from = "https://api.example.com/v1/messages";
+        assert_eq!(
+            redirect_target(from, "https://login.example.net/sso?token=abc#frag").as_deref(),
+            Some("https://login.example.net/sso")
+        );
+        assert_eq!(
+            redirect_target(from, "https://user:pw@other.example:8443/x").as_deref(),
+            Some("https://other.example:8443/x")
+        );
+        // Relative targets resolve against the request, as an HTTP client would.
+        assert_eq!(
+            redirect_target(from, "/login?next=/v1").as_deref(),
+            Some("https://api.example.com/login")
+        );
+        assert_eq!(
+            redirect_target(from, " messages/ ").as_deref(),
+            Some("https://api.example.com/v1/messages/")
+        );
+        assert_eq!(redirect_target("not a url", "/x"), None);
+    }
 
     #[test]
     fn redacts_keys() {

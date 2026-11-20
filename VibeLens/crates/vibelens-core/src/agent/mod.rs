@@ -71,9 +71,14 @@ impl AgentService {
         }
         // Idempotent: errors only mean a provider is already installed.
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        // Never follow a redirect. Every request carries the API key and the conversation, and
+        // a redirect would pass them on: custom headers such as `x-api-key` survive a redirect
+        // to another host, and a 307/308 re-sends the body. `ProviderClient::post` reports the
+        // 3xx with its target instead.
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(20))
             .user_agent(concat!("VibeLens/", env!("CARGO_PKG_VERSION")))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| CoreError::Llm(format!("could not initialise the HTTP client: {e}")))?;
         *guard = Some(client.clone());

@@ -251,6 +251,68 @@ pub(crate) fn rest_props(
     Ok(p)
 }
 
+/// Whether a redirect from `from` to `to` stays with the server the request was meant for: the
+/// same scheme, host and port, or the same host upgraded from plain HTTP to HTTPS on the default
+/// ports. Anything else is another party.
+fn same_endpoint(from: &reqwest012::Url, to: &reqwest012::Url) -> bool {
+    if from.host_str() != to.host_str() {
+        return false;
+    }
+    let same_origin =
+        from.scheme() == to.scheme() && from.port_or_known_default() == to.port_or_known_default();
+    let tls_upgrade = from.scheme() == "http"
+        && to.scheme() == "https"
+        && from.port().is_none()
+        && to.port().is_none();
+    same_origin || tls_upgrade
+}
+
+/// Why a REST catalog request was not redirected.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the catalog redirected the request to {0}, which is another address. VibeLens does not \
+     follow that, because the catalog token or client secret would be sent there. If it is the \
+     right endpoint, use it as the catalog URI"
+)]
+struct RedirectElsewhere(String);
+
+/// Longest chain of same-endpoint redirects that is followed.
+const MAX_REDIRECTS: usize = 5;
+
+/// The HTTP client every REST catalog request goes through.
+///
+/// It follows a redirect only within the endpoint it was talking to ([`same_endpoint`]). The
+/// requests carry the bearer token, the profile's extra headers and, for OAuth2, the client
+/// secret in a form body; the HTTP library would drop only `Authorization` on the way to another
+/// host and would re-send the body on a 307 or 308.
+fn rest_http_client() -> Result<reqwest012::Client> {
+    let policy = reqwest012::redirect::Policy::custom(|attempt| {
+        let from_same = attempt
+            .previous()
+            .last()
+            .is_some_and(|from| same_endpoint(from, attempt.url()));
+        if !from_same {
+            // Shown without credentials, query or fragment: redirect URLs can carry tokens.
+            let mut to = attempt.url().clone();
+            let _ = to.set_username("");
+            let _ = to.set_password(None);
+            to.set_query(None);
+            to.set_fragment(None);
+            attempt.error(RedirectElsewhere(to.to_string()))
+        } else if attempt.previous().len() > MAX_REDIRECTS {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    });
+    reqwest012::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(60))
+        .redirect(policy)
+        .build()
+        .map_err(|e| CoreError::Other(format!("HTTP client: {e}")))
+}
+
 /// Maps an iceberg error to the right [`CoreError`] variant.
 pub(crate) fn to_core(e: IceError) -> CoreError {
     // A CoreError we wrapped ourselves (credential refresh) keeps its class.
@@ -262,6 +324,11 @@ pub(crate) fn to_core(e: IceError) -> CoreError {
                 CoreError::Aws(m) => CoreError::Aws(m.clone()),
                 other => CoreError::Other(other.to_string()),
             };
+        }
+        // Our own refusal to follow a redirect sits two levels down, below what the catalog
+        // crate prints ("error following redirect for url …"), and it is the part that helps.
+        if let Some(refused) = s.downcast_ref::<RedirectElsewhere>() {
+            return CoreError::Database(refused.to_string());
         }
         src = s.source();
     }
@@ -543,13 +610,8 @@ impl CatalogFactory for ProfileFactory {
                 // Explicit storage settings go in last: the REST crate applies the user's props after
                 // the server's, so these win (pinned by tests/iceberg_rest.rs).
                 props.extend(storage);
-                let client = reqwest012::Client::builder()
-                    .connect_timeout(Duration::from_secs(15))
-                    .timeout(Duration::from_secs(60))
-                    .build()
-                    .map_err(|e| CoreError::Other(format!("HTTP client: {e}")))?;
                 let cat = iceberg_catalog_rest::RestCatalogBuilder::default()
-                    .with_client(client)
+                    .with_client(rest_http_client()?)
                     .with_storage_factory(storage_factory())
                     .load(name, props)
                     .await
@@ -1573,5 +1635,173 @@ mod tests {
         let tables = f.cat.list_tables(&ns).await.unwrap();
         assert!(tables.is_empty());
         assert_eq!(f.factory.builds.load(Ordering::SeqCst), 2);
+    }
+
+    // ---- Redirects (review finding M5, for the REST catalog's HTTP client) ----------------
+
+    /// A one-purpose HTTP server: records each request's head and answers what `reply` says.
+    async fn tiny_http(
+        reply: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) -> (String, Arc<StdMutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let (log, reply) = (seen.clone(), Arc::new(reply));
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let (log, reply) = (log.clone(), reply.clone());
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 2048];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf).to_string();
+                    let answer = reply(&head);
+                    log.lock().unwrap().push(head);
+                    let _ = sock.write_all(answer.as_bytes()).await;
+                });
+            }
+        });
+        (base, seen)
+    }
+
+    fn redirect_to(location: &str) -> String {
+        format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        )
+    }
+
+    const OK_EMPTY: &str = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
+
+    /// The REST catalog sends its token, its extra headers and (for OAuth2) the client secret in
+    /// a form body. None of that may follow a redirect to another host.
+    #[tokio::test]
+    async fn rest_client_does_not_follow_a_redirect_to_another_host() {
+        let (elsewhere, elsewhere_seen) = tiny_http(|_| OK_EMPTY.to_string()).await;
+        let target = format!("{elsewhere}/v1/oauth/tokens");
+        let (catalog, catalog_seen) = tiny_http(move |_| redirect_to(&target)).await;
+
+        let result = rest_http_client()
+            .unwrap()
+            .post(format!("{catalog}/v1/oauth/tokens"))
+            .header("x-catalog-token", "s3cr3t-header")
+            .body("grant_type=client_credentials&client_secret=s3cr3t-body")
+            .send()
+            .await;
+
+        assert_eq!(catalog_seen.lock().unwrap().len(), 1);
+        assert!(
+            elsewhere_seen.lock().unwrap().is_empty(),
+            "the redirect target received: {:?}",
+            elsewhere_seen.lock().unwrap()
+        );
+        let err = result.expect_err("a redirect to another host is an error, not a silent hop");
+        let text = format!("{err:#} {:?}", std::error::Error::source(&err));
+        assert!(
+            text.contains("redirect") && text.contains(&elsewhere),
+            "{text}"
+        );
+        assert!(!text.contains("s3cr3t"), "{text}");
+    }
+
+    /// The same through the real REST catalog client, to see what the user is told.
+    #[tokio::test]
+    async fn rest_catalog_reports_a_redirect_to_another_host_and_sends_nothing_there() {
+        let (elsewhere, elsewhere_seen) = tiny_http(|_| OK_EMPTY.to_string()).await;
+        let target = format!("{elsewhere}/login?next=/v1/config");
+        let (catalog, _) = tiny_http(move |_| redirect_to(&target)).await;
+
+        let mut headers = BTreeMap::new();
+        headers.insert("X-Tenant".to_string(), "acme".to_string());
+        let props = rest_props(
+            &catalog,
+            None,
+            &RestAuth::Bearer,
+            Some("s3cr3t-token"),
+            &headers,
+        )
+        .unwrap();
+        let built = iceberg_catalog_rest::RestCatalogBuilder::default()
+            .with_client(rest_http_client().unwrap())
+            .with_storage_factory(storage_factory())
+            .load("t", props)
+            .await;
+        let err = match built {
+            Err(e) => e,
+            Ok(cat) => cat
+                .list_namespaces(None)
+                .await
+                .expect_err("the catalog only ever redirects"),
+        };
+        let shown = to_core(err).to_string();
+        assert!(
+            elsewhere_seen.lock().unwrap().is_empty(),
+            "the redirect target received: {:?}",
+            elsewhere_seen.lock().unwrap()
+        );
+        assert!(
+            shown.contains("another address") && shown.contains(&format!("{elsewhere}/login")),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains("s3cr3t") && !shown.contains("next="),
+            "{shown}"
+        );
+    }
+
+    /// Redirects within the catalog's own address keep working (a trailing slash, a moved path).
+    #[tokio::test]
+    async fn rest_client_still_follows_a_redirect_on_the_same_host_and_port() {
+        let (catalog, seen) = tiny_http(|head| {
+            if head.starts_with("GET /v1/config ") {
+                redirect_to("/v1/config/")
+            } else {
+                OK_EMPTY.to_string()
+            }
+        })
+        .await;
+        let resp = rest_http_client()
+            .unwrap()
+            .get(format!("{catalog}/v1/config"))
+            .header("x-catalog-token", "s3cr3t-header")
+            .send()
+            .await
+            .expect("same-origin redirect is followed");
+        assert_eq!(resp.status().as_u16(), 200);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(seen[1].starts_with("GET /v1/config/ "), "{}", seen[1]);
+    }
+
+    #[test]
+    fn redirects_are_followed_only_to_the_same_endpoint() {
+        let u = |s: &str| reqwest012::Url::parse(s).unwrap();
+        let same = |a: &str, b: &str| same_endpoint(&u(a), &u(b));
+        assert!(same(
+            "https://cat.example/v1/config",
+            "https://cat.example/v1/config/"
+        ));
+        assert!(same("https://cat.example/a", "https://cat.example:443/b"));
+        assert!(same("http://localhost:8181/a", "http://localhost:8181/b"));
+        // The same host, upgraded to TLS on the default ports.
+        assert!(same("http://cat.example/a", "https://cat.example/a"));
+
+        assert!(!same("https://cat.example/a", "https://login.example/a"));
+        assert!(!same(
+            "https://cat.example/a",
+            "https://cat.example.evil.test/a"
+        ));
+        assert!(!same("https://cat.example/a", "https://cat.example:8443/a"));
+        assert!(
+            !same("https://cat.example/a", "http://cat.example/a"),
+            "never downgrade"
+        );
+        assert!(!same("http://localhost:8181/a", "https://localhost:8181/a"));
+        assert!(!same("http://localhost:8181/a", "http://localhost:9999/a"));
     }
 }
