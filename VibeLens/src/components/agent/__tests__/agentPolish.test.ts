@@ -87,6 +87,15 @@ describe("last result chip", () => {
     expect(text).toContain("select id, note from t");
   });
 
+  it("describes a value that was cut when it was read, with only a short start", () => {
+    const cut = { $truncated: { kind: "text", bytes: 52_428_800, preview: "y".repeat(900_000) } };
+    const text = formatLastResult(snap(1, { rows: [[cut, { $truncated: { kind: "bytes", bytes: 9, preview: "3q2+" } }]] }));
+    expect(text).toContain("<52,428,800 bytes of text, cut; starts:");
+    expect(text).toContain("<9 bytes of binary data, cut>");
+    expect(text).not.toContain("$truncated");
+    expect(text).not.toContain("y".repeat(200));
+  });
+
   it("describes bytes and long values without dumping them", () => {
     const s = snap(1, { rows: [[{ $bytes: "AAEC", len: 3 }, "x".repeat(500)]] });
     const text = formatLastResult(s);

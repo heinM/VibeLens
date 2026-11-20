@@ -336,6 +336,7 @@ npm run typecheck && npm test   # frontend
 - **No SSM Session Manager port forwarding yet**; it's the top V1.1 item.
 - Identity Center sign-in uses the **device-code** grant. Authorization code + PKCE (the AWS CLI's current default) is planned.
 - Results are capped at `maxRows` (100k by default) rather than using server-side cursors.
+- A single value over 1 MiB (Postgres, local Iceberg engine) is shown cut, with its real size. It cannot be edited, and copies and exports carry a note instead of it. To read more of it, select a part with SQL (`substr`, `->>`). There is no "load full value" yet.
 - Linux builds run but have no keychain backend; secrets are kept in memory only, and the app shows a warning.
 - **Windows** builds compile in CI but haven't had a manual test pass yet. Treat the first Windows release as a beta.
 - **Iceberg, local engine:**

@@ -12,7 +12,7 @@
 //  * The only free-form SQL is the user's "raw WHERE" text, which `validateRawWhere` fences in (no `;`,
 //    balanced quotes / parentheses / comments) and which is only ever used in read-only SELECTs.
 import type { Cell } from "../../ipc/types";
-import { hasInexactNumber, isBytesCell, NUMERIC_STRING, type BytesCell } from "../grid/cellFormat";
+import { findTruncated, formatBytes, hasInexactNumber, isBytesCell, isTruncatedCell, NUMERIC_STRING, type BytesCell } from "../grid/cellFormat";
 
 export class SqlGenError extends Error {
   constructor(message: string) {
@@ -182,9 +182,30 @@ function castType(type: string): string {
   return t.replace(/^(character|char)(?=$|\[)/i, "bpchar").replace(/^bit(?=$|\[)/i, "varbit");
 }
 
-/** SQL for one cell value, typed by the column's `dataType`. Throws `SqlGenError` for values that cannot be that type. */
+/**
+ * Why `cell` cannot be edited, filtered on or written into SQL: it is (or contains) a value that was
+ * too large to load in full, so only its start is known here. `null` for every ordinary value.
+ */
+export function uneditableReason(cell: Cell | undefined): string | null {
+  const cut = findTruncated(cell);
+  if (!cut) return null;
+  return `This value was too large to load in full (${formatBytes(cut.$truncated.bytes)}): only its start is known here, so it cannot be edited, filtered on or written into SQL. Use a SQL statement of your own for it.`;
+}
+
+/** Throws when `cell` is a cut value. `column` makes the message say where. */
+function refuseTruncated(cell: Cell | undefined, column?: string): void {
+  const reason = uneditableReason(cell);
+  if (reason) throw new SqlGenError(column ? `Column ${column}: ${reason}` : reason);
+}
+
+/**
+ * SQL for one cell value, typed by the column's `dataType`. Throws `SqlGenError` for values that
+ * cannot be that type, and for a value that was cut when it was read: writing its start (or its
+ * marker) would replace the real value with something else.
+ */
 export function sqlLiteral(cell: Cell | undefined, dataType: string, opts: LiteralOptions = {}): string {
   if (cell === null || cell === undefined) return "NULL";
+  refuseTruncated(cell);
   const cat = typeCategory(dataType);
   const type = dataType.trim();
   const cast = opts.cast !== false && isSafeTypeName(type) ? `::${castType(type)}` : "";
@@ -229,6 +250,8 @@ export function sqlLiteral(cell: Cell | undefined, dataType: string, opts: Liter
 /** The text shown in an editor / filter box for a cell value. */
 export function cellToEditText(cell: Cell | undefined): string {
   if (cell === null || cell === undefined) return "";
+  // Never the start of a cut value: text that can be edited and saved must be the whole value.
+  if (isTruncatedCell(cell)) return "";
   if (typeof cell === "string") return cell;
   if (typeof cell === "number" || typeof cell === "boolean") return String(cell);
   if (isBytesCell(cell)) return `\\x${bytesToHex(cell)}`;
@@ -642,6 +665,7 @@ function whereByKey(t: TableTarget, pk: Readonly<Record<string, Cell>>): string 
   return names
     .map((n) => {
       const v = pk[n];
+      refuseTruncated(v, n);
       return v === null || v === undefined ? `${quoteIdent(n)} IS NULL` : `${quoteIdent(n)} = ${sqlLiteral(v, colType(t, n))}`;
     })
     .join(" AND ");
@@ -650,13 +674,14 @@ function whereByKey(t: TableTarget, pk: Readonly<Record<string, Cell>>): string 
 export function buildUpdate(t: TableTarget, pk: Readonly<Record<string, Cell>>, set: Readonly<Record<string, Cell>>): string {
   const names = Object.keys(set);
   if (names.length === 0) throw new SqlGenError("Nothing to update.");
-  const assigns = names.map((n) => `${quoteIdent(n)} = ${sqlLiteral(set[n], colType(t, n))}`);
+  const assigns = names.map((n) => (refuseTruncated(set[n], n), `${quoteIdent(n)} = ${sqlLiteral(set[n], colType(t, n))}`));
   return `UPDATE ${qualifiedName(t.schema, t.name)} SET ${assigns.join(", ")} WHERE ${whereByKey(t, pk)};`;
 }
 
 export function buildInsert(t: TableTarget, values: Readonly<Record<string, Cell>>): string {
   const names = Object.keys(values);
   if (names.length === 0) return `INSERT INTO ${qualifiedName(t.schema, t.name)} DEFAULT VALUES;`;
+  for (const n of names) refuseTruncated(values[n], n);
   return `INSERT INTO ${qualifiedName(t.schema, t.name)} (${names.map(quoteIdent).join(", ")}) VALUES (${names.map((n) => sqlLiteral(values[n], colType(t, n))).join(", ")});`;
 }
 

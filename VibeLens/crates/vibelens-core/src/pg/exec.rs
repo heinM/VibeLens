@@ -382,6 +382,7 @@ async fn run_prepared(
     .await?;
     let page_size = opts.page_size.max(1);
     let mut page: Vec<Vec<Cell>> = Vec::with_capacity(page_size.min(1024));
+    let mut page_bytes = 0usize;
     let mut row_count = 0usize;
     let mut truncated = false;
     while let Some(row) = stream.try_next().await? {
@@ -396,9 +397,12 @@ async fn run_prepared(
         for i in 0..row.len() {
             cells.push(row.try_get::<usize, CellValue>(i)?.0);
         }
+        page_bytes += cells.iter().map(cell_weight).sum::<usize>();
         page.push(cells);
         row_count += 1;
-        if page.len() >= page_size {
+        // A page of large cells goes out early, so no single message grows without limit.
+        if page.len() >= page_size || page_bytes >= PAGE_BYTE_BUDGET {
+            page_bytes = 0;
             emit(
                 tx,
                 QueryEvent::Rows {
@@ -445,6 +449,15 @@ async fn run_prepared(
     Ok(truncated)
 }
 
+/// A text value from the simple-query protocol, under the same size limit as decoded values.
+fn text_cell(s: &str) -> Cell {
+    if s.len() > MAX_CELL_BYTES {
+        truncated_cell(TruncatedKind::Text, s.len(), s.as_bytes())
+    } else {
+        Value::String(s.to_owned())
+    }
+}
+
 /// Fallback for text that cannot be prepared (several commands in one string). Values are text.
 /// Only the last result set that has columns is reported.
 async fn run_simple(
@@ -483,10 +496,7 @@ async fn run_simple(
                 }
                 rows.push(
                     (0..r.len())
-                        .map(|i| {
-                            r.get(i)
-                                .map_or(Value::Null, |s| Value::String(s.to_owned()))
-                        })
+                        .map(|i| r.get(i).map_or(Value::Null, text_cell))
                         .collect(),
                 );
             }
@@ -505,14 +515,30 @@ async fn run_simple(
             },
         )
         .await?;
-        let mut it = rows.into_iter().peekable();
-        while it.peek().is_some() {
-            let chunk: Vec<_> = it.by_ref().take(opts.page_size.max(1)).collect();
+        let page_size = opts.page_size.max(1);
+        let mut page: Vec<Vec<Cell>> = Vec::new();
+        let mut page_bytes = 0usize;
+        for row in rows {
+            page_bytes += row.iter().map(cell_weight).sum::<usize>();
+            page.push(row);
+            if page.len() >= page_size || page_bytes >= PAGE_BYTE_BUDGET {
+                page_bytes = 0;
+                emit(
+                    tx,
+                    QueryEvent::Rows {
+                        statement_index: idx,
+                        rows: std::mem::take(&mut page),
+                    },
+                )
+                .await?;
+            }
+        }
+        if !page.is_empty() {
             emit(
                 tx,
                 QueryEvent::Rows {
                     statement_index: idx,
-                    rows: chunk,
+                    rows: page,
                 },
             )
             .await?;

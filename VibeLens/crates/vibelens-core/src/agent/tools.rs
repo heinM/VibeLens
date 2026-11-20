@@ -503,6 +503,25 @@ pub(super) fn frame_result(body: &str) -> String {
 
 fn shorten_cell(v: &Value, depth: usize) -> Value {
     match v {
+        // A value that was too large to read in full: say so in words, with the start of it
+        // when that is text. The marker's own shape would mean nothing to the model.
+        v if crate::model::is_truncated_cell(v) => {
+            let t = &v["$truncated"];
+            let kind = t["kind"].as_str().unwrap_or("other");
+            let bytes = t["bytes"].as_u64().unwrap_or(0);
+            let head: String = match kind {
+                "text" | "json" => t["preview"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(MAX_CELL_CHARS)
+                    .collect(),
+                _ => String::new(),
+            };
+            Value::String(format!(
+                "{head}…[value too large to read in full: {bytes} bytes of {kind}; only its start is shown]"
+            ))
+        }
         Value::String(s) if s.chars().count() > MAX_CELL_CHARS => {
             let head: String = s.chars().take(MAX_CELL_CHARS).collect();
             Value::String(format!(
@@ -1327,6 +1346,37 @@ mod tests {
         let v = shorten_cell(&json!("z".repeat(5000)), 0);
         let s = v.as_str().unwrap();
         assert!(s.chars().count() < 600 && s.contains("+4500 chars"));
+    }
+
+    /// A value that was cut when it was read (review finding H1) reaches the model as words,
+    /// not as the marker object and not as megabytes of preview.
+    #[test]
+    fn values_cut_at_read_time_are_described_to_the_model() {
+        use crate::model::{TruncatedKind, truncated_cell};
+        let text = truncated_cell(
+            TruncatedKind::Text,
+            50_000_000,
+            "q".repeat(900_000).as_bytes(),
+        );
+        let s = shorten_cell(&text, 0);
+        let s = s.as_str().unwrap();
+        assert!(
+            s.starts_with("qqq") && s.chars().count() < 700,
+            "{}",
+            s.len()
+        );
+        assert!(
+            s.contains("50000000 bytes of text") && s.contains("too large"),
+            "{s}"
+        );
+
+        let bytes = truncated_cell(TruncatedKind::Bytes, 9_000_000, &[1, 2, 3]);
+        let s = shorten_cell(&bytes, 0);
+        let s = s.as_str().unwrap();
+        assert!(
+            s.starts_with('…') && s.contains("9000000 bytes of bytes"),
+            "{s}"
+        );
     }
 
     #[test]

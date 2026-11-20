@@ -1024,6 +1024,116 @@ async fn page_size_zero_is_treated_as_one_and_empty_results_have_columns_only() 
     assert_finished(&evs);
 }
 
+// ---- oversized values (review finding H1) ------------------------------------------------------
+
+/// One row with three values far over the limit and one small one, through both result paths.
+#[tokio::test]
+async fn oversized_values_arrive_cut_and_marked_not_whole() {
+    let d = require_pg!();
+    let h = connect_single(&d).await;
+    const LIMIT: usize = vibelens_core::model::MAX_CELL_BYTES;
+    let sql = "SELECT repeat('x', 3000000) AS t, \
+               decode(repeat('ab', 1500000), 'hex') AS b, \
+               ('{\"k\":\"' || repeat('y', 2000000) || '\"}')::jsonb AS j, \
+               repeat('z', 10) AS small";
+
+    let streamed: Vec<Vec<Value>> = run(&h, sql, ExecOptions::default())
+        .await
+        .into_iter()
+        .filter_map(|e| match e {
+            QueryEvent::Rows { rows, .. } => Some(rows),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let collected = h
+        .execute_collect(sql, ExecOptions::default())
+        .await
+        .unwrap()
+        .rows;
+
+    for (path, rows) in [("stream", streamed), ("collect", collected)] {
+        assert_eq!(rows.len(), 1, "{path}");
+        let row = &rows[0];
+        let shape = |c: &Value| {
+            let t = &c["$truncated"];
+            (
+                t["kind"].as_str().map(str::to_owned),
+                t["bytes"].as_u64(),
+                t["preview"].as_str().map(str::len),
+            )
+        };
+        assert_eq!(
+            shape(&row[0]),
+            (Some("text".into()), Some(3_000_000), Some(LIMIT)),
+            "{path}: text"
+        );
+        // base64 of LIMIT bytes
+        assert_eq!(
+            shape(&row[1]),
+            (
+                Some("bytes".into()),
+                Some(1_500_000),
+                Some(LIMIT.div_ceil(3) * 4)
+            ),
+            "{path}: bytea"
+        );
+        assert_eq!(
+            shape(&row[2]),
+            // jsonb prints `{"k": "yyy…"}`, with a space after the colon: 9 bytes around the 2 MB.
+            (Some("json".into()), Some(2_000_009), Some(LIMIT)),
+            "{path}: jsonb"
+        );
+        assert_eq!(row[3], json!("zzzzzzzzzz"), "{path}: small value");
+        let sent: usize = row.iter().map(|c| c.to_string().len()).sum();
+        assert!(
+            sent < 4 * LIMIT,
+            "{path}: {sent} bytes of JSON for one row of 6.5 MB"
+        );
+    }
+}
+
+/// Twenty rows of 600 KB each are 12 MB: they must not travel as one page just because twenty
+/// is fewer than `page_size`.
+#[tokio::test]
+async fn a_page_of_large_cells_is_sent_before_it_reaches_page_size() {
+    let d = require_pg!();
+    let h = connect_single(&d).await;
+    let evs = run(
+        &h,
+        "SELECT repeat('x', 600000) FROM generate_series(1, 20)",
+        ExecOptions {
+            page_size: 500,
+            ..Default::default()
+        },
+    )
+    .await;
+    let pages = row_pages(&evs);
+    assert_eq!(pages.iter().sum::<usize>(), 20, "{pages:?}");
+    let budget = vibelens_core::model::PAGE_BYTE_BUDGET;
+    for e in &evs {
+        if let QueryEvent::Rows { rows, .. } = e {
+            let bytes: usize = rows.iter().flatten().map(|c| c.to_string().len()).sum();
+            assert!(
+                bytes <= budget + 700_000,
+                "a page of {} rows weighs {bytes} bytes: {pages:?}",
+                rows.len()
+            );
+        }
+    }
+    // Small rows still fill whole pages.
+    let evs = run(
+        &h,
+        "SELECT g FROM generate_series(1, 1200) g",
+        ExecOptions {
+            page_size: 500,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(row_pages(&evs), [500, 500, 200]);
+}
+
 #[tokio::test]
 async fn max_rows_truncates_without_draining_the_stream() {
     let d = require_pg!();

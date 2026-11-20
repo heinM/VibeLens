@@ -131,3 +131,30 @@ describe("CSV formula injection", () => {
     expect(toCsv([{ name: "a", typeName: "text" }], [["=1+1"]], { formulaSafe: false })).toBe("a\r\n=1+1\r\n");
   });
 });
+
+// Review finding H1: an export must not present the start of a cut value as the value.
+describe("exporting values that were cut when they were read", () => {
+  const START = "start-of-the-value";
+  const cut = { $truncated: { kind: "text", bytes: 52_428_800, preview: START } };
+  const cols2 = [
+    { name: "id", typeName: "int8" },
+    { name: "body", typeName: "text" },
+  ];
+  const rows2: Cell[][] = [["1", cut]];
+  const NOTE = "‹value not loaded in full: 52,428,800 bytes of text›";
+
+  it("CSV, JSON and Markdown carry a note in place of the value", () => {
+    // The note contains a comma (52,428,800), so the field is quoted.
+    expect(toCsv(cols2, rows2)).toBe(`id,body\r\n1,"${NOTE}"\r\n`);
+    expect(JSON.parse(toJson(cols2, rows2))).toEqual([{ id: "1", body: NOTE }]);
+    expect(toMarkdownTable(cols2, rows2)).toContain(`| 1 | ${NOTE} |`);
+    for (const out of [toCsv(cols2, rows2), toJson(cols2, rows2), toMarkdownTable(cols2, rows2)]) expect(out).not.toContain(START);
+  });
+
+  it("SQL INSERTs are refused: a script that loads a placeholder would be wrong data", () => {
+    expect(() => toSqlInserts(cols2, rows2, { schema: "public", name: "docs" })).toThrow(/too large to load in full/);
+    expect(() => toSqlInserts(cols2, rows2, { schema: "public", name: "docs" })).toThrow(/body/);
+    // Rows without a cut value still export.
+    expect(toSqlInserts(cols2, [["1", "fine"]], { name: "docs" })).toContain("(1, 'fine')");
+  });
+});

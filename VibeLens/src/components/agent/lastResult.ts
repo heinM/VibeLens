@@ -3,6 +3,7 @@
 // allows row data to leave the machine.
 import { create } from "zustand";
 import type { AiDataAccess, Cell, ColumnMeta } from "../../ipc/types";
+import { isTruncatedCell } from "../grid/cellFormat";
 
 export const LAST_RESULT_ROWS = 20;
 const CELL_MAX = 80;
@@ -58,6 +59,14 @@ export function attachBlockedReason(access: AiDataAccess | null | undefined): st
 
 function cellText(c: Cell): string {
   if (c === null) return "NULL";
+  if (isTruncatedCell(c)) {
+    // Too large to load in full: describe it, with a short start when that is text.
+    const t = c.$truncated;
+    const what = t.kind === "bytes" ? "binary data" : t.kind === "json" ? "JSON" : t.kind === "text" ? "text" : "data";
+    const size = `${t.bytes.toLocaleString("en-US")} bytes of ${what}, cut`;
+    const start = t.kind === "text" || t.kind === "json" ? t.preview.slice(0, 60).replace(/\s+/g, " ").replace(/\|/g, "\\|") : "";
+    return start ? `<${size}; starts: ${start}…>` : `<${size}>`;
+  }
   if (typeof c === "object" && !Array.isArray(c) && "$bytes" in c) return `<${(c as { len: number }).len} bytes>`;
   const s = typeof c === "string" ? c : typeof c === "object" ? JSON.stringify(c) : String(c);
   const flat = s.replace(/\s+/g, " ").replace(/\|/g, "\\|");

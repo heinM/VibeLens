@@ -8,7 +8,7 @@ import { Button, Dialog } from "../ui";
 import { MOD } from "../ui/platform";
 import { hasInexactNumber, isBytesCell } from "../grid/cellFormat";
 import { showToast } from "../grid/toast";
-import { cellToEditText, parseEditedText, typeCategory } from "./sqlGen";
+import { cellToEditText, parseEditedText, typeCategory, uneditableReason } from "./sqlGen";
 
 export type Move = "none" | "right" | "left";
 
@@ -31,6 +31,9 @@ export type EditorMode = { mode: "inline" } | { mode: "dialog" } | { mode: "bloc
 /** Decide how a cell is edited. */
 export function editorModeFor(c: ColumnInfo, value: Cell): EditorMode {
   if (isGeneratedColumn(c)) return { mode: "blocked", reason: `${c.name} is a generated column and cannot be edited.` };
+  // A value that was cut when it was read: an editor would start from its first part and save that.
+  const cut = uneditableReason(value);
+  if (cut) return { mode: "blocked", reason: cut };
   const cat = typeCategory(c.dataType);
   if ((cat === "json" || cat === "jsonb" || cat === "array") && hasInexactNumber(value)) {
     return { mode: "blocked", reason: "This value holds numbers too large or precise to edit here without rounding them. Update it with SQL." };

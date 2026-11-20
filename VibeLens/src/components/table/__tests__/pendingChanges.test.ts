@@ -152,3 +152,19 @@ describe("pending changes", () => {
     expect(missingRequired(cols, removeInsert(p, "a").inserts)).toEqual([]);
   });
 });
+
+// Review finding H1.
+describe("values that were cut when they were read", () => {
+  const cut = { $truncated: { kind: "text", bytes: 52_428_800, preview: "start-of-the-value" } };
+
+  it("stop the apply script instead of being written back", () => {
+    // A duplicated row carries the original row's cells, including one that was cut.
+    const p = addInsert(EMPTY_PENDING, "new-1", { id: "7", status: cut });
+    expect(() => buildApplyScript(target, p)).toThrow(/status.*too large to load in full|too large to load in full/);
+    // An edit to another column of the same row is fine: the cut cell is not part of the UPDATE.
+    const k = rowKeyOf(["id"], { id: "1" });
+    const edit = setCell(EMPTY_PENDING, k, { id: "1" }, "total", "5", "4");
+    expect(buildApplyScript(target, edit).statements).toHaveLength(1);
+    expect(buildApplyScript(target, edit).sql).not.toContain("start-of-the-value");
+  });
+});

@@ -281,8 +281,19 @@ export interface ColumnMeta {
   typeOid: number;
 }
 
-/** int8/numeric/money arrive as strings; bytea as {$bytes, len}; json as embedded JSON. */
-export type Cell = null | boolean | number | string | { $bytes: string; len: number } | unknown[] | Record<string, unknown>;
+/**
+ * A value over 1 MiB (`MAX_CELL_BYTES` in `model/query.rs`) is not loaded in full: its cell is this
+ * marker. `bytes` is the size of the whole value; `preview` is its start (text for `text` and `json`,
+ * where the JSON is cut and so not parseable; base64 for `bytes`; empty for `other`). The marker is
+ * not the value: never write it back, compare with it in SQL, or copy or export it as if complete.
+ * Use `isTruncatedCell` / `containsTruncated` from `components/grid/cellFormat`.
+ */
+export interface TruncatedCell {
+  $truncated: { kind: "text" | "bytes" | "json" | "other"; bytes: number; preview: string };
+}
+
+/** int8/numeric/money arrive as strings; bytea as {$bytes, len}; json as embedded JSON; an oversized value as a `TruncatedCell`. */
+export type Cell = null | boolean | number | string | { $bytes: string; len: number } | TruncatedCell | unknown[] | Record<string, unknown>;
 
 export type QueryEvent =
   | { type: "started"; queryId: string; statementCount: number }

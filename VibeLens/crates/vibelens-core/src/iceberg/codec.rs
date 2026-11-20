@@ -17,6 +17,7 @@
 //! | `Map` | array of `{"key", "value"}` objects (keys need not be strings) |
 //! | `Dictionary`, `RunEndEncoded` | the decoded value |
 //! | `Null` / null slot | `null` |
+//! | a string or binary over `MAX_CELL_BYTES` | `{"$truncated": …}` marker with its size and first part (see `model::Cell`) |
 
 use std::str::FromStr;
 
@@ -36,7 +37,7 @@ use datafusion::arrow::datatypes::{
 use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
 use serde_json::{Map, Number, Value};
 
-use crate::model::{Cell, ColumnMeta};
+use crate::model::{Cell, ColumnMeta, MAX_CELL_BYTES, TruncatedKind, truncated_cell};
 
 /// Nested values deeper than this fall back to Arrow's display text (guards the recursion).
 const MAX_DEPTH: usize = 48;
@@ -198,14 +199,14 @@ fn cell(array: &dyn Array, i: usize, field: Option<&Field>, depth: usize) -> Cel
         DataType::Utf8 => array
             .as_any()
             .downcast_ref::<GenericStringArray<i32>>()
-            .map(|a| Value::String(a.value(i).to_string()))
+            .map(|a| text_cell(a.value(i)))
             .unwrap_or(Value::Null),
         DataType::LargeUtf8 => array
             .as_any()
             .downcast_ref::<GenericStringArray<i64>>()
-            .map(|a| Value::String(a.value(i).to_string()))
+            .map(|a| text_cell(a.value(i)))
             .unwrap_or(Value::Null),
-        DataType::Utf8View => Value::String(array.as_string_view().value(i).to_string()),
+        DataType::Utf8View => text_cell(array.as_string_view().value(i)),
         DataType::Binary => array
             .as_any()
             .downcast_ref::<GenericBinaryArray<i32>>()
@@ -352,7 +353,20 @@ fn non_finite(v: f64) -> String {
     }
 }
 
+/// A string, or the truncation marker (see [`Cell`]) when it is over [`MAX_CELL_BYTES`]. Inside
+/// a list, struct or map the marker sits where the value would have been.
+fn text_cell(s: &str) -> Value {
+    if s.len() > MAX_CELL_BYTES {
+        truncated_cell(TruncatedKind::Text, s.len(), s.as_bytes())
+    } else {
+        Value::String(s.to_string())
+    }
+}
+
 fn bytes_cell(raw: &[u8]) -> Value {
+    if raw.len() > MAX_CELL_BYTES {
+        return truncated_cell(TruncatedKind::Bytes, raw.len(), raw);
+    }
     let mut m = Map::new();
     m.insert(
         "$bytes".into(),
@@ -542,6 +556,55 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    // ---- oversized values (review finding H1) ------------------------------------------------
+
+    #[test]
+    fn oversized_strings_and_binaries_are_cut_and_marked() {
+        use crate::model::{MAX_CELL_BYTES, is_truncated_cell};
+        use datafusion::arrow::array::{LargeBinaryArray, StringViewArray};
+
+        let big = "s".repeat(MAX_CELL_BYTES + 1);
+        let at_limit = "s".repeat(MAX_CELL_BYTES);
+        let check_text = |c: Cell| {
+            assert!(is_truncated_cell(&c), "expected a marker");
+            let t = &c["$truncated"];
+            assert_eq!(t["kind"], "text");
+            assert_eq!(t["bytes"], json!(MAX_CELL_BYTES + 1));
+            assert_eq!(t["preview"].as_str().unwrap().len(), MAX_CELL_BYTES);
+        };
+        let a = StringArray::from(vec![big.as_str(), at_limit.as_str()]);
+        check_text(cell_at(&a, 0, None));
+        assert_eq!(
+            cell_at(&a, 1, None),
+            json!(at_limit),
+            "the limit itself is fine"
+        );
+        check_text(cell_at(
+            &LargeStringArray::from(vec![big.as_str()]),
+            0,
+            None,
+        ));
+        check_text(cell_at(&StringViewArray::from(vec![big.as_str()]), 0, None));
+
+        let raw = vec![7u8; 2 * MAX_CELL_BYTES];
+        let check_bytes = |c: Cell| {
+            assert!(is_truncated_cell(&c), "expected a marker");
+            let t = &c["$truncated"];
+            assert_eq!(t["kind"], "bytes");
+            assert_eq!(t["bytes"], json!(2 * MAX_CELL_BYTES));
+            assert!(c.get("$bytes").is_none());
+        };
+        check_bytes(cell_at(&BinaryArray::from(vec![raw.as_slice()]), 0, None));
+        check_bytes(cell_at(
+            &LargeBinaryArray::from(vec![raw.as_slice()]),
+            0,
+            None,
+        ));
+        // A small binary keeps its shape.
+        let c = cell_at(&BinaryArray::from(vec![&[1u8, 2, 3][..]]), 0, None);
+        assert_eq!(c["len"], json!(3));
+    }
 
     fn one(array: ArrayRef) -> Value {
         cell_at(array.as_ref(), 0, None)

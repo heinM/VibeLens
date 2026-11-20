@@ -47,7 +47,7 @@ use tokio_util::sync::CancellationToken;
 use super::catalog::{ManagedCatalog, to_core};
 use super::codec;
 use crate::error::{CoreError, ErrorPayload, Result};
-use crate::model::{ExecOptions, QueryEvent, QueryResult};
+use crate::model::{ExecOptions, PAGE_BYTE_BUDGET, QueryEvent, QueryResult, cell_weight};
 use crate::sql::{StatementClass, classify};
 
 /// Memory DataFusion may use for sorts/joins/aggregates before it errors or spills (it would otherwise be unbounded).
@@ -750,6 +750,7 @@ impl LocalEngine {
 
         let page_size = opts.page_size.max(1);
         let mut page: Vec<Vec<crate::model::Cell>> = Vec::new();
+        let mut page_bytes = 0usize;
         let mut row_count = 0usize;
         let mut truncated = false;
         let mut affected: Option<u64> = None;
@@ -771,9 +772,12 @@ impl LocalEngine {
             if take > 0 {
                 let sliced = batch.slice(0, take);
                 for row in codec::batch_to_rows(&sliced) {
+                    page_bytes += row.iter().map(cell_weight).sum::<usize>();
                     page.push(row);
                     row_count += 1;
-                    if page.len() >= page_size {
+                    // A page of large cells goes out early (same rule as the Postgres engine).
+                    if page.len() >= page_size || page_bytes >= PAGE_BYTE_BUDGET {
+                        page_bytes = 0;
                         let rows = std::mem::take(&mut page);
                         tx.send(QueryEvent::Rows {
                             statement_index: idx,
