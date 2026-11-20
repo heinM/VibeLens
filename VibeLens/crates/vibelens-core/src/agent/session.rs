@@ -8,7 +8,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use super::diff::unified_diff;
+use super::diff::{DiffPreview, count_hidden_chars, grouped, unified_diff, visible};
 use super::policy::{Assessment, ProfileFacts, approval_target, assess};
 use super::prompt::build_system_prompt;
 use super::providers::{LlmRequest, LlmResponse, ProviderClient};
@@ -16,7 +16,7 @@ use super::redact::model_error_text;
 use super::tools::{ToolCall, ToolOutput, frame_result, run as run_tool, tool_specs};
 use crate::error::{CoreError, ErrorPayload};
 use crate::model::*;
-use crate::ports::ToolBackend;
+use crate::ports::{FileVersion, ToolBackend};
 
 /// At most this many rounds of tool calls per turn.
 pub(super) const MAX_STEPS: usize = 16;
@@ -445,26 +445,75 @@ impl TurnRunner {
         let mut plan = assess(&call, facts.as_ref(), valkey_write);
         let mut preview = plan.preview.clone();
 
-        // write_file: build the diff against what is on disk now.
+        // write_file: the diff is built against what is on disk now, and that version goes with
+        // the call to execution, which writes only if the file is still the one shown here.
+        let mut write_baseline: Option<FileVersion> = None;
         if let ToolCall::WriteFile { path, contents } = &call {
-            match self.backend.read_file(path).await {
-                Ok(old) => preview = Some(unified_diff(path, Some(&old), contents)),
-                Err(CoreError::NotFound(_)) => preview = Some(unified_diff(path, None, contents)),
-                Err(CoreError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                    preview = Some(unified_diff(path, None, contents))
+            let existing = match self.backend.read_file(path).await {
+                Ok(old) => Ok(Some(old)),
+                Err(CoreError::NotFound(_)) => Ok(None),
+                Err(CoreError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e),
+            };
+            match existing {
+                Ok(old) => {
+                    let diff = unified_diff(path, old.as_deref(), contents);
+                    write_baseline = Some(FileVersion::of(old.as_deref()));
+                    if let Some(note) = write_notes(&diff, contents) {
+                        plan.reason =
+                            Some(format!("{} {note}", plan.reason.take().unwrap_or_default()));
+                    }
+                    preview = Some(diff.text);
                 }
-                // The workspace jail / extension allow-list speaking: refuse before asking the user.
-                Err(e @ (CoreError::Invalid(_) | CoreError::PolicyDenied(_))) => {
+                Err(e) => {
+                    let reason = match &e {
+                        // The workspace jail / extension allow-list speaking.
+                        CoreError::Invalid(_) | CoreError::PolicyDenied(_) => {
+                            format!("cannot write '{}': {e}", visible(path))
+                        }
+                        // There is a file (or something) there that cannot be read, so no true
+                        // diff exists. Showing it as a new file would have the user approve
+                        // "create" for what is in fact a replacement.
+                        _ => format!(
+                            "cannot write '{}': what is at that path now could not be read ({e}), so the user cannot be shown what would change. Nothing was written. Use another path, or tell the user what went wrong.",
+                            visible(path)
+                        ),
+                    };
+                    // Refuse before asking the user.
                     plan = Assessment {
                         risk: ToolRisk::Denied,
-                        reason: Some(format!("cannot write '{path}': {e}")),
+                        reason: Some(reason),
                         preview: None,
                         allow_write: false,
                         redact_values: false,
                     };
+                    preview = None;
                 }
-                Err(_) => preview = Some(unified_diff(path, None, contents)),
             }
+        } else if let Some(text) = preview.take() {
+            // A statement or command shown before it runs: the same rule as for a diff. What is
+            // run is the call's own text; only what is displayed changes.
+            // The note goes first: the reason ends with the model's `purpose`, which is free
+            // text and need not end a sentence.
+            let hidden = count_hidden_chars(&text);
+            if hidden > 0 {
+                plan.reason = Some(format!(
+                    "{} {}",
+                    hidden_chars_note("The text below", hidden, "below"),
+                    plan.reason.take().unwrap_or_default()
+                ));
+            }
+            preview = Some(visible(&text).into_owned());
+        }
+
+        // The reason is read by the user and carries text the model wrote (a purpose, a command
+        // line), so it follows the same rule as the preview. A refusal keeps its own text: it
+        // goes back to the model.
+        if plan.risk == ToolRisk::NeedsApproval
+            && let Some(reason) = plan.reason.as_mut()
+            && count_hidden_chars(reason) > 0
+        {
+            *reason = visible(reason).into_owned();
         }
 
         self.emit(AgentEvent::ToolCallProposed {
@@ -552,7 +601,7 @@ impl TurnRunner {
         let result = tokio::select! {
             biased;
             _ = self.cancel.cancelled() => return CallOutcome::Cancelled,
-            r = tokio::time::timeout(TOOL_TIMEOUT, run_tool(&call, self.backend.as_ref(), &plan)) => {
+            r = tokio::time::timeout(TOOL_TIMEOUT, run_tool(&call, self.backend.as_ref(), &plan, write_baseline.as_ref())) => {
                 r.unwrap_or_else(|_| Err(CoreError::Timeout(format!("{name} did not finish within {} seconds", TOOL_TIMEOUT.as_secs()))))
             }
         };
@@ -601,6 +650,40 @@ impl TurnRunner {
             }
         }
     }
+}
+
+/// The sentence the approval card adds when text holds characters that are shown by code point.
+fn hidden_chars_note(subject: &str, n: usize, place: &str) -> String {
+    if n == 1 {
+        format!(
+            "{subject} has 1 control, invisible or direction-changing character; it is shown as <U+…> {place}."
+        )
+    } else {
+        format!(
+            "{subject} has {} control, invisible or direction-changing characters; each is shown as <U+…> {place}.",
+            grouped(n)
+        )
+    }
+}
+
+/// What the user has to know about a `write_file` diff that the diff alone does not say: how
+/// much of it is not on screen, and that the new content holds characters they cannot see.
+fn write_notes(diff: &DiffPreview, contents: &str) -> Option<String> {
+    let mut notes = Vec::new();
+    if diff.hidden_lines > 0 {
+        notes.push(format!(
+            "The diff is too long to show in full: {} of its lines {} not shown ({} added, {} removed). Approving writes the whole file, including that part.",
+            grouped(diff.hidden_lines),
+            if diff.hidden_lines == 1 { "is" } else { "are" },
+            grouped(diff.hidden_added),
+            grouped(diff.hidden_removed),
+        ));
+    }
+    let hidden = count_hidden_chars(contents);
+    if hidden > 0 {
+        notes.push(hidden_chars_note("The new content", hidden, "in the diff"));
+    }
+    (!notes.is_empty()).then(|| notes.join(" "))
 }
 
 #[cfg(test)]

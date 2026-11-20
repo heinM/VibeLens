@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use vibelens_core::agent::AgentService;
 use vibelens_core::error::{CoreError, Result};
 use vibelens_core::model::*;
-use vibelens_core::ports::{SecretVault, ToolBackend};
+use vibelens_core::ports::{FileVersion, SecretVault, ToolBackend};
 
 // ---------------------------------------------------------------------------------------------
 // Mock LLM server (same shape as tests/agent_loop.rs; integration tests are separate crates)
@@ -498,7 +498,7 @@ impl ToolBackend for FakeBackend {
     async fn read_file(&self, path: &str) -> Result<String> {
         Err(CoreError::NotFound(format!("file {path}")))
     }
-    async fn write_file(&self, _: &str, _: &str) -> Result<()> {
+    async fn write_file(&self, _: &str, _: &str, _: &FileVersion) -> Result<()> {
         Ok(())
     }
 }

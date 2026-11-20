@@ -21,7 +21,7 @@ use vibelens_core::connections::{AppToolBackend, ConnectionManager};
 use vibelens_core::error::{CoreError, Result};
 use vibelens_core::model::*;
 use vibelens_core::ports::{
-    CredentialSource, ProfileStore, ToolBackend, TunnelHandle, TunnelProvider,
+    CredentialSource, FileVersion, ProfileStore, ToolBackend, TunnelHandle, TunnelProvider,
 };
 use vibelens_core::workspace::WorkspaceFs;
 
@@ -794,7 +794,9 @@ async fn conn_backend_profile_lookup_delegates_to_the_store() {
 async fn conn_backend_workspace_calls_go_through_the_jail() {
     let h = harness();
     let (_d, be) = backend(&h);
-    be.write_file("notes/todo.md", "- ship it").await.unwrap();
+    be.write_file("notes/todo.md", "- ship it", &FileVersion::Absent)
+        .await
+        .unwrap();
     assert_eq!(be.read_file("notes/todo.md").await.unwrap(), "- ship it");
     let files = be.list_files().await.unwrap();
     assert_eq!(files.len(), 1);
@@ -805,11 +807,11 @@ async fn conn_backend_workspace_calls_go_through_the_jail() {
         Err(CoreError::Invalid(_))
     ));
     assert!(matches!(
-        be.write_file("/tmp/x.sql", "x").await,
+        be.write_file("/tmp/x.sql", "x", &FileVersion::Absent).await,
         Err(CoreError::Invalid(_))
     ));
     assert!(matches!(
-        be.write_file("run.sh", "x").await,
+        be.write_file("run.sh", "x", &FileVersion::Absent).await,
         Err(CoreError::Invalid(_))
     ));
 }

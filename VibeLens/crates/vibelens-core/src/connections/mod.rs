@@ -37,8 +37,8 @@ use crate::iceberg::{IcebergDeps, IcebergHandle};
 use crate::model::*;
 use crate::pg::{PgConnectParams, PgHandle};
 use crate::ports::{
-    CredentialFn, CredentialSource, ProfileStore, SecretVault, ToolBackend, TunnelHandle,
-    TunnelProvider,
+    CredentialFn, CredentialSource, FileVersion, ProfileStore, SecretVault, ToolBackend,
+    TunnelHandle, TunnelProvider,
 };
 use crate::valkey::{ValkeyConnectParams, ValkeyHandle};
 use crate::workspace::WorkspaceFs;
@@ -1330,8 +1330,10 @@ impl ToolBackend for AppToolBackend {
         self.workspace.read(path).await
     }
 
-    async fn write_file(&self, path: &str, contents: &str) -> Result<()> {
-        self.workspace.write(path, contents).await
+    async fn write_file(&self, path: &str, contents: &str, expected: &FileVersion) -> Result<()> {
+        self.workspace
+            .write_if_unchanged(path, contents, expected)
+            .await
     }
 }
 

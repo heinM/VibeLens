@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use vibelens_core::agent::AgentService;
 use vibelens_core::error::{CoreError, Result};
 use vibelens_core::model::*;
-use vibelens_core::ports::{SecretVault, ToolBackend};
+use vibelens_core::ports::{FileVersion, SecretVault, ToolBackend};
 
 // ---------------------------------------------------------------------------------------------
 // Mock LLM server
@@ -325,6 +325,10 @@ struct FakeBackend {
     valkey_calls: Mutex<Vec<Vec<String>>>,
     /// The `db` each `valkey_command` was run on, in call order.
     valkey_dbs: Mutex<Vec<u8>>,
+    /// Paths that exist but cannot be read (`read_file` fails with a permission error).
+    unreadable: Mutex<std::collections::BTreeSet<String>>,
+    /// The `expected` version of every `write_file` call, in call order.
+    write_expectations: Mutex<Vec<FileVersion>>,
 }
 
 fn fake_error(kind: &str, msg: &str) -> CoreError {
@@ -500,6 +504,12 @@ impl ToolBackend for FakeBackend {
             .collect())
     }
     async fn read_file(&self, path: &str) -> Result<String> {
+        if self.unreadable.lock().unwrap().contains(path) {
+            return Err(CoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Permission denied (os error 13)",
+            )));
+        }
         self.files
             .lock()
             .unwrap()
@@ -507,11 +517,19 @@ impl ToolBackend for FakeBackend {
             .cloned()
             .ok_or_else(|| CoreError::NotFound(format!("file {path}")))
     }
-    async fn write_file(&self, path: &str, contents: &str) -> Result<()> {
-        self.files
+    /// Like the real workspace: writes only when the file is still at `expected`.
+    async fn write_file(&self, path: &str, contents: &str, expected: &FileVersion) -> Result<()> {
+        let mut files = self.files.lock().unwrap();
+        self.write_expectations
             .lock()
             .unwrap()
-            .insert(path.into(), contents.into());
+            .push(expected.clone());
+        if FileVersion::of(files.get(path).map(String::as_str)) != *expected {
+            return Err(CoreError::Other(format!(
+                "{path} changed after the diff was shown; nothing was written"
+            )));
+        }
+        files.insert(path.into(), contents.into());
         Ok(())
     }
 }
@@ -2157,6 +2175,311 @@ fn one_call_replies(id: &str, tool: &str, input: Value) -> Vec<Reply> {
         Reply::Sse(anthropic_sse("", &[(id, tool, input)], "tool_use", (1, 1))),
         Reply::Sse(anthropic_sse("done", &[], "end_turn", (1, 1))),
     ]
+}
+
+// ---------------------------------------------------------------------------------------------
+// The write_file approval covers what is written (review finding M4)
+// ---------------------------------------------------------------------------------------------
+
+async fn write_file_harness(path: &str, contents: &str) -> Harness {
+    Harness::anthropic(
+        one_call_replies(
+            "w",
+            "write_file",
+            json!({"path": path, "contents": contents}),
+        ),
+        vec![profile(
+            "p1",
+            EngineKind::Postgres,
+            Environment::Dev,
+            AiDataAccess::Results,
+        )],
+    )
+    .await
+}
+
+/// (ok, summary) of the single `ToolFinished` event.
+fn finished(events: &[AgentEvent]) -> (bool, String) {
+    events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolFinished { ok, summary, .. } => Some((*ok, summary.clone())),
+            _ => None,
+        })
+        .expect("a ToolFinished event")
+}
+
+/// An existing file that could not be read was put up for approval as a brand-new file: the
+/// user approved "create q.sql" and an existing file was replaced. Now there is nothing to
+/// approve, and the model is told why.
+#[tokio::test]
+async fn write_file_is_refused_when_the_existing_file_cannot_be_read() {
+    let h = write_file_harness("q.sql", "select 3;\n").await;
+    h.backend
+        .files
+        .lock()
+        .unwrap()
+        .insert("q.sql".into(), "select 1;\n".into());
+    h.backend.unreadable.lock().unwrap().insert("q.sql".into());
+
+    let (events, result) = run_one_call(&h, true).await;
+    let asked: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ApprovalRequired { .. }))
+        .collect();
+    assert!(
+        asked.is_empty(),
+        "there is no true diff to show, so nothing may be put up for approval: {asked:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCallProposed {
+                risk: ToolRisk::Denied,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+    assert!(
+        result.contains("q.sql")
+            && result.contains("could not be read")
+            && result.contains("Nothing was written"),
+        "the model is told what happened: {result}"
+    );
+    assert!(result.contains("Permission denied"), "{result}");
+    assert_eq!(h.backend.files.lock().unwrap()["q.sql"], "select 1;\n");
+    assert!(h.backend.write_expectations.lock().unwrap().is_empty());
+}
+
+/// The approval can wait for any length of time. What is written afterwards must be a change
+/// to the file the user was shown, not to whatever is there by then.
+#[tokio::test]
+async fn write_file_writes_nothing_if_the_file_changed_while_approval_was_pending() {
+    const SHOWN: &str = "select 1;\nselect 2;\n";
+    const EDITED: &str = "select 1;\nselect 2;\n-- an hour of the user's own work\n";
+    // (the file when the diff is built, the file when the user approves, a name for the case)
+    let cases: [(Option<&str>, Option<&str>, &str); 3] = [
+        (Some(SHOWN), Some(EDITED), "edited"),
+        (None, Some(EDITED), "created"),
+        (Some(SHOWN), None, "deleted"),
+    ];
+    for (before, during, words) in cases {
+        let h = write_file_harness("q.sql", "select 1;\nselect 3;\n").await;
+        if let Some(text) = before {
+            h.backend
+                .files
+                .lock()
+                .unwrap()
+                .insert("q.sql".into(), text.into());
+        }
+        let (_, mut rx) = h.start("s1", "anthropic", "go", ctx("p1")).await;
+        let events = collect(&h, "s1", &mut rx, |e| {
+            let AgentEvent::ApprovalRequired { preview, .. } = e else {
+                return None;
+            };
+            let preview = preview.as_deref().unwrap();
+            assert_eq!(
+                preview.contains("--- /dev/null"),
+                before.is_none(),
+                "{preview}"
+            );
+            // The file changes while the card is on screen.
+            let mut files = h.backend.files.lock().unwrap();
+            match during {
+                Some(text) => files.insert("q.sql".into(), text.into()),
+                None => files.remove("q.sql"),
+            };
+            Some(ApprovalDecision::Approve)
+        })
+        .await;
+
+        assert_eq!(
+            h.backend
+                .files
+                .lock()
+                .unwrap()
+                .get("q.sql")
+                .map(String::as_str),
+            during,
+            "case {words:?}: the file as it was at approval time must be left alone"
+        );
+        assert_eq!(
+            *h.backend.write_expectations.lock().unwrap(),
+            vec![FileVersion::of(before)],
+            "case {words:?}: the write carries the file as it was shown"
+        );
+        let (ok, summary) = finished(&events);
+        assert!(!ok, "case {words:?}: {summary}");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::FileWritten { .. })),
+            "case {words:?}: nothing was written, so nothing is opened in the editor"
+        );
+        let reqs = h.llm.requests();
+        let result = &tool_results(&reqs.last().unwrap().body)[0];
+        assert_eq!(result["is_error"], true, "case {words:?}: {result}");
+        // The backend's refusal reaches the model as it is (the real wording, per case, is the
+        // workspace's: tests/conn_workspace.rs).
+        let text = result["content"].as_str().unwrap();
+        assert!(
+            text.contains("q.sql changed after the diff was shown; nothing was written"),
+            "case {words:?}: {text}"
+        );
+    }
+}
+
+/// Nothing changed in between: the write goes ahead, for an existing and for a new file.
+#[tokio::test]
+async fn write_file_goes_ahead_when_the_file_is_still_as_shown() {
+    for before in [Some("select 1;\nselect 2;\n"), None] {
+        let h = write_file_harness("q.sql", "select 1;\nselect 3;\n").await;
+        if let Some(text) = before {
+            h.backend
+                .files
+                .lock()
+                .unwrap()
+                .insert("q.sql".into(), text.into());
+        }
+        let (events, _) = run_one_call(&h, true).await;
+        assert_eq!(finished(&events), (true, "wrote q.sql".to_string()));
+        assert_eq!(
+            h.backend.files.lock().unwrap()["q.sql"],
+            "select 1;\nselect 3;\n"
+        );
+        assert_eq!(
+            *h.backend.write_expectations.lock().unwrap(),
+            vec![FileVersion::of(before)]
+        );
+    }
+}
+
+/// The preview stops after 600 lines. The card must say so in the sentence the user reads,
+/// with the size of what is not shown, because approving writes all of it.
+#[tokio::test]
+async fn write_file_approval_says_how_much_of_a_long_diff_is_not_shown() {
+    let contents: String = (0..5000).map(|i| format!("select {i};\n")).collect();
+    let h = write_file_harness("big.sql", &contents).await;
+    let (events, _) = run_one_call(&h, true).await;
+    let (reason, preview, _) = approval_of(&events);
+    assert!(
+        reason.contains("4,400") && reason.contains("not shown"),
+        "5000 added lines, 600 shown: {reason}"
+    );
+    let preview = preview.unwrap();
+    assert!(preview.contains("+select 599;\n") && !preview.contains("+select 600;"));
+    assert!(
+        preview.lines().last().unwrap().contains("4,400"),
+        "{:?}",
+        preview.lines().last()
+    );
+    assert_eq!(h.backend.files.lock().unwrap()["big.sql"], contents);
+
+    // A short diff carries no such sentence.
+    let h = write_file_harness("small.sql", "select 1;\n").await;
+    let (events, _) = run_one_call(&h, true).await;
+    let (reason, _, _) = approval_of(&events);
+    assert!(!reason.contains("not shown"), "{reason}");
+}
+
+/// A right-to-left override makes text read differently from what it is; an escape sequence
+/// can erase a line in a terminal. The card shows such characters by code point and says how
+/// many there are. The file is still written exactly as proposed.
+#[tokio::test]
+async fn write_file_approval_shows_control_and_direction_changing_characters() {
+    let contents = "select 1; -- \u{202E}redro siht ni daer\n\u{1b}[2Kdrop table t;\n";
+    let h = write_file_harness("q.sql", contents).await;
+    let (events, _) = run_one_call(&h, true).await;
+    let (reason, preview, _) = approval_of(&events);
+    let preview = preview.unwrap();
+    assert!(
+        preview.contains("+select 1; -- <U+202E>redro siht ni daer\n")
+            && preview.contains("+<U+001B>[2Kdrop table t;\n"),
+        "{preview:?}"
+    );
+    assert!(
+        !preview.contains('\u{202E}') && !preview.contains('\u{1b}'),
+        "{preview:?}"
+    );
+    assert!(
+        reason.contains("2 control, invisible or direction-changing characters")
+            && reason.contains("<U+"),
+        "{reason}"
+    );
+    assert_eq!(h.backend.files.lock().unwrap()["q.sql"], contents);
+
+    // Ordinary text carries no such sentence.
+    let h = write_file_harness("plain.sql", "select 'naïve café', 1;\r\n\tfrom t;\r\n").await;
+    let (events, _) = run_one_call(&h, true).await;
+    let (reason, preview, _) = approval_of(&events);
+    assert!(!reason.contains("<U+"), "{reason}");
+    assert!(preview.unwrap().contains("+select 'naïve café', 1;\r\n"));
+}
+
+/// The same holds for the statement shown before a write runs: what is displayed is what the
+/// database receives, with nothing reordered or hidden by the renderer.
+#[tokio::test]
+async fn sql_approval_preview_shows_control_and_direction_changing_characters() {
+    const SQL: &str = "delete from t where note = '\u{202E}1 = 1 ro' -- \u{200B}";
+    let h = Harness::anthropic(
+        one_call_replies(
+            "t1",
+            "run_sql",
+            json!({"profile_id":"p1","sql":SQL,"purpose":"tidy up"}),
+        ),
+        vec![profile(
+            "p1",
+            EngineKind::Postgres,
+            Environment::Dev,
+            AiDataAccess::Results,
+        )],
+    )
+    .await;
+    let (events, _) = run_one_call(&h, true).await;
+    let (reason, preview, _) = approval_of(&events);
+    assert_eq!(
+        preview.as_deref(),
+        Some("delete from t where note = '<U+202E>1 = 1 ro' -- <U+200B>")
+    );
+    assert!(reason.ends_with("Purpose: tidy up"), "{reason}");
+    assert!(
+        reason.contains("2 control, invisible or direction-changing characters"),
+        "{reason}"
+    );
+    assert_eq!(
+        h.backend.sql_calls.lock().unwrap()[0].sql,
+        SQL,
+        "execution gets the statement itself"
+    );
+
+    // A Valkey command is quoted in the reason as well as shown below it: both follow the rule.
+    let h = Harness::anthropic(
+        one_call_replies(
+            "t1",
+            "valkey_command",
+            json!({"profile_id":"v1","argv":["DEL","user:\u{202E}1"]}),
+        ),
+        vec![profile(
+            "v1",
+            EngineKind::Valkey,
+            Environment::Dev,
+            AiDataAccess::Results,
+        )],
+    )
+    .await;
+    let (events, _) = run_one_call(&h, true).await;
+    let (reason, preview, _) = approval_of(&events);
+    assert_eq!(preview.as_deref(), Some("DEL user:<U+202E>1"));
+    assert!(
+        reason.contains("DEL user:<U+202E>1") && !reason.contains('\u{202E}'),
+        "{reason:?}"
+    );
+    assert_eq!(
+        h.backend.valkey_calls.lock().unwrap()[0],
+        vec!["DEL".to_string(), "user:\u{202E}1".to_string()],
+        "execution gets the command itself"
+    );
 }
 
 fn finished_summary(events: &[AgentEvent]) -> String {

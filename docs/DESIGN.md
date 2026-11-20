@@ -99,9 +99,11 @@
 | `valkey_get` | follows `aiDataAccess` | |
 | `valkey_command` | read → follows policy, write → **approval** | Write detection comes from `COMMAND INFO`. |
 | `list_files` / `read_file` | safe | Inside the workspace jail. |
-| `write_file` | **approval** (always) | Preview is a unified diff. |
+| `write_file` | **approval** (always) | Preview is a unified diff against the file on disk. The write carries that version (`FileVersion`, SHA-256) and is refused if the file has changed, appeared or gone by the time it is approved. If what is at the path cannot be read, the call is denied: there is no diff to show. A diff over 600 lines is cut, and the reason says how many lines are not shown. |
 
 **Loop**: at most 16 tool steps per turn, then stop. Tool results go back to the model as *data* (tagged, truncated to about 24 KB). Under `schemaOnly`, row data never leaves the machine. Prompt injection in DB content can make the agent *request* any tool call. Writes and side effects hit the approval gate **only if they're recognised**. `READ ONLY` does not stop `dblink`, `pg_read_file`, `lo_*` or advisory locks, so those functions are classified as needing approval. Classification fails closed (§6).
+
+**What the approval shows**: the reason and the preview (a statement, a command or a `write_file` diff) are made in Rust. Control characters, invisible characters and direction controls (the right-to-left override and its relatives) are written as their code point, `<U+202E>`, and the reason says how many there are, so the text on the card cannot read differently from what runs or is written. Execution always gets the call's own text. This covers the card only: tool output, chat text and the editor render characters as they are.
 
 **Approval**: the loop emits `approvalRequired`, then parks on a `oneshot` keyed by `(session_id, call_id)`. `agent_resolve_approval` wakes it. Cancelling the turn rejects all pending approvals. The event carries a `target` (connection name, environment, and the Postgres database or Valkey db number), which the card shows in a fixed header apart from the reason. The model chooses the database, so Rust resolves it once with the rule the connection manager uses (`effective_database`), shows that name and hands the same name to execution. The model's `purpose` is flattened to one line and capped at 200 characters.
 

@@ -26,6 +26,7 @@ use chrono::{DateTime, Utc};
 
 use crate::error::{CoreError, Result};
 use crate::model::WorkspaceFile;
+use crate::ports::FileVersion;
 use crate::profiles::atomic_write;
 
 pub const ALLOWED_EXTENSIONS: &[&str] = &["sql", "valkey", "redis", "md", "txt", "json"];
@@ -129,6 +130,32 @@ impl WorkspaceFs {
 
     /// Atomic write (tmp + fsync + rename). Creates parent dirs inside the root.
     pub async fn write(&self, rel: &str, contents: &str) -> Result<()> {
+        self.write_checked(rel, contents, None).await
+    }
+
+    /// Like [`write`](Self::write), but only if the file is still at `expected`: the version
+    /// somebody was shown before agreeing to this write. If the file has changed, appeared or
+    /// gone since, nothing is written and the error says which.
+    ///
+    /// The check and the rename are two steps, so a change in the instant between them is
+    /// still overwritten. What this closes is the wait before it: the approval has no time
+    /// limit, and the file on disk used to be replaced whatever had happened to it meanwhile.
+    pub async fn write_if_unchanged(
+        &self,
+        rel: &str,
+        contents: &str,
+        expected: &FileVersion,
+    ) -> Result<()> {
+        self.write_checked(rel, contents, Some(expected.clone()))
+            .await
+    }
+
+    async fn write_checked(
+        &self,
+        rel: &str,
+        contents: &str,
+        expected: Option<FileVersion>,
+    ) -> Result<()> {
         if contents.len() as u64 > MAX_FILE_BYTES {
             return Err(CoreError::Invalid(format!(
                 "file would be {} bytes; the limit is {MAX_FILE_BYTES}",
@@ -137,15 +164,63 @@ impl WorkspaceFs {
         }
         let path = self.resolve(rel)?;
         let bytes = contents.as_bytes().to_vec();
+        let shown = rel.to_string();
         tokio::task::spawn_blocking(move || {
             if path.is_dir() {
                 return Err(CoreError::Invalid("path is a directory".into()));
+            }
+            if let Some(expected) = expected {
+                let now = version_on_disk(&path)?;
+                if now != expected {
+                    return Err(changed_since_shown(&shown, &expected, &now));
+                }
             }
             atomic_write(&path, &bytes, false)
         })
         .await
         .map_err(|e| CoreError::Other(format!("workspace task failed: {e}")))?
     }
+}
+
+/// What is at `path` now. Reads at most one byte more than a workspace file may hold: a file
+/// that has grown past the limit is a different file whatever the rest of it says.
+fn version_on_disk(path: &Path) -> Result<FileVersion> {
+    use sha2::Digest as _;
+    use std::io::Read;
+
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FileVersion::Absent),
+        Err(e) => return Err(e.into()),
+    };
+    let mut hasher = sha2::Sha256::new();
+    let mut limited = file.take(MAX_FILE_BYTES + 1);
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = limited.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(FileVersion::Sha256(hasher.finalize().into()))
+}
+
+/// The refusal of [`WorkspaceFs::write_if_unchanged`], worded for whoever has to act on it
+/// (the agent's model reads it and can read the file again).
+fn changed_since_shown(shown: &str, expected: &FileVersion, now: &FileVersion) -> CoreError {
+    let what = match (expected, now) {
+        (FileVersion::Absent, _) => {
+            "did not exist when this change was shown for approval, and it exists now"
+        }
+        (_, FileVersion::Absent) => {
+            "has been deleted or moved since this change was shown for approval"
+        }
+        _ => "has changed since this change was shown for approval",
+    };
+    CoreError::Other(format!(
+        "{shown} {what}. Nothing was written. Read the file again and propose the change against what it holds now."
+    ))
 }
 
 /// Syntactic checks. Returns the normal components (no `.`/empty segments) on success.

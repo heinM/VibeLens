@@ -283,9 +283,11 @@ pub(super) fn assess(
             return Assessment::safe();
         }
         ToolCall::WriteFile { path, .. } => {
+            // The diff, and what it leaves out, are added where the file is read (session.rs).
             return Assessment::approval(
                 format!(
-                    "The agent wants to create or overwrite '{path}' in your workspace. Review the diff before approving."
+                    "The agent wants to create or overwrite '{}' in your workspace. Review the diff before approving.",
+                    super::diff::visible(path)
                 ),
                 None,
             );

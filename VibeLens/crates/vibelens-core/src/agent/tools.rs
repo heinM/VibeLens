@@ -12,7 +12,7 @@ use crate::error::{CoreError, Result};
 use crate::model::{
     CommandOutcome, ConnectionProfile, EngineKind, QueryResult, SchemaMetadata, TableDescription,
 };
-use crate::ports::ToolBackend;
+use crate::ports::{FileVersion, ToolBackend};
 
 /// Tool results sent to the model are cut at this many bytes.
 pub(super) const MAX_TOOL_RESULT_BYTES: usize = 24 * 1024;
@@ -809,6 +809,7 @@ pub(super) async fn run(
     call: &ToolCall,
     backend: &dyn ToolBackend,
     plan: &Assessment,
+    write_baseline: Option<&FileVersion>,
 ) -> Result<ToolOutput> {
     match call {
         ToolCall::ListConnections => {
@@ -1020,7 +1021,12 @@ pub(super) async fn run(
             Ok(out(text, format!("read {path} ({n} bytes)")))
         }
         ToolCall::WriteFile { path, contents } => {
-            backend.write_file(path, contents).await?;
+            // The file as the user saw it in the diff. The backend writes only if it is still
+            // that; without a baseline no diff was approved, and nothing is written.
+            let shown = write_baseline.ok_or_else(|| {
+                CoreError::Other("write_file reached execution without an approved diff".into())
+            })?;
+            backend.write_file(path, contents, shown).await?;
             Ok(ToolOutput {
                 body: format!(
                     "Wrote {} bytes to {path}. The file is now open in the user's editor for review.",

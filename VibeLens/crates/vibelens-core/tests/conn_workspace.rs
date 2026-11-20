@@ -4,6 +4,7 @@ use std::fs;
 
 use tempfile::tempdir;
 use vibelens_core::error::CoreError;
+use vibelens_core::ports::FileVersion;
 use vibelens_core::workspace::{ALLOWED_EXTENSIONS, MAX_FILE_BYTES, WorkspaceFs};
 
 fn ws() -> (tempfile::TempDir, WorkspaceFs) {
@@ -399,4 +400,142 @@ async fn conn_non_ascii_names_work() {
         w.list().await.unwrap()[0].path,
         "rapporte/übersicht-日本語.sql"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Writing only what was approved (review finding M4)
+// ---------------------------------------------------------------------------------------------
+
+/// The agent's write carries the file as it was when the diff was shown. If the file is no
+/// longer that, nothing is written: the user approved a change to something else.
+#[tokio::test]
+async fn conn_a_conditional_write_refuses_a_file_that_changed_since() {
+    let (_d, w) = ws();
+    w.write("q.sql", "select 1;\n").await.unwrap();
+    let shown = FileVersion::of(Some("select 1;\n"));
+
+    // Somebody edits the file while the approval is waiting.
+    w.write("q.sql", "select 1;\n-- my own work\n")
+        .await
+        .unwrap();
+    let err = w
+        .write_if_unchanged("q.sql", "select 2;\n", &shown)
+        .await
+        .expect_err("the file is not what was shown");
+    assert!(err.to_string().contains("changed"), "{err}");
+    assert!(err.to_string().contains("q.sql"), "{err}");
+    assert_eq!(
+        w.read("q.sql").await.unwrap(),
+        "select 1;\n-- my own work\n",
+        "the newer content is still there"
+    );
+}
+
+#[tokio::test]
+async fn conn_a_conditional_write_refuses_a_file_that_appeared_or_went_away() {
+    let (_d, w) = ws();
+    // Shown as a new file, but one exists by the time of the write.
+    w.write("new.sql", "-- written by the user meanwhile\n")
+        .await
+        .unwrap();
+    let err = w
+        .write_if_unchanged("new.sql", "select 2;\n", &FileVersion::Absent)
+        .await
+        .expect_err("the file was shown as new");
+    assert!(err.to_string().contains("did not exist"), "{err}");
+    assert_eq!(
+        w.read("new.sql").await.unwrap(),
+        "-- written by the user meanwhile\n"
+    );
+
+    // Shown as a change to a file that has since been removed.
+    w.write("gone.sql", "select 1;\n").await.unwrap();
+    let shown = FileVersion::of(Some("select 1;\n"));
+    fs::remove_file(w.root().join("gone.sql")).unwrap();
+    let err = w
+        .write_if_unchanged("gone.sql", "select 2;\n", &shown)
+        .await
+        .expect_err("the file is gone");
+    assert!(err.to_string().contains("deleted or moved"), "{err}");
+    assert!(!w.root().join("gone.sql").exists(), "nothing was written");
+}
+
+#[tokio::test]
+async fn conn_a_conditional_write_goes_ahead_when_nothing_changed() {
+    let (_d, w) = ws();
+    // A new file, in a folder that does not exist yet.
+    w.write_if_unchanged("notes/a.md", "# a\n", &FileVersion::Absent)
+        .await
+        .unwrap();
+    assert_eq!(w.read("notes/a.md").await.unwrap(), "# a\n");
+    // An existing file, still as shown.
+    w.write_if_unchanged("notes/a.md", "# b\n", &FileVersion::of(Some("# a\n")))
+        .await
+        .unwrap();
+    assert_eq!(w.read("notes/a.md").await.unwrap(), "# b\n");
+    // The same rules as any write: the jail, the extension list, the size cap.
+    assert!(is_invalid(
+        w.write_if_unchanged("../x.sql", "x", &FileVersion::Absent)
+            .await
+    ));
+    assert!(is_invalid(
+        w.write_if_unchanged("run.sh", "x", &FileVersion::Absent)
+            .await
+    ));
+    let big = "x".repeat(MAX_FILE_BYTES as usize + 1);
+    assert!(is_invalid(
+        w.write_if_unchanged("big.sql", &big, &FileVersion::Absent)
+            .await
+    ));
+}
+
+/// A file that turned into something unreadable as text is "changed", not an I/O puzzle.
+#[tokio::test]
+async fn conn_a_conditional_write_treats_new_binary_content_as_a_change() {
+    let (_d, w) = ws();
+    w.write("q.sql", "select 1;\n").await.unwrap();
+    let shown = FileVersion::of(Some("select 1;\n"));
+    fs::write(w.root().join("q.sql"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+    let err = w
+        .write_if_unchanged("q.sql", "select 2;\n", &shown)
+        .await
+        .expect_err("the file is not what was shown");
+    assert!(err.to_string().contains("changed"), "{err}");
+    assert_eq!(
+        fs::read(w.root().join("q.sql")).unwrap(),
+        [0xff, 0xfe, 0x00, 0x01]
+    );
+}
+
+/// The agent refuses a `write_file` when the file is there but cannot be read. That rests on
+/// this: such a file is an error, not "no file", and a conditional write does not replace it.
+#[cfg(unix)]
+#[tokio::test]
+async fn conn_an_unreadable_file_is_an_error_not_a_missing_file_and_is_not_replaced() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_d, w) = ws();
+    w.write("locked.sql", "select 1;\n").await.unwrap();
+    let path = w.root().join("locked.sql");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&path).is_ok() {
+        eprintln!("skipping: this user can read a file with no permissions (root)");
+        return;
+    }
+
+    let err = w.read("locked.sql").await.unwrap_err();
+    assert!(
+        matches!(&err, CoreError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+        "{err:?}"
+    );
+    for shown in [FileVersion::Absent, FileVersion::of(Some("select 1;\n"))] {
+        let err = w
+            .write_if_unchanged("locked.sql", "select 2;\n", &shown)
+            .await
+            .expect_err("its content cannot be compared, so it is not replaced");
+        assert!(matches!(err, CoreError::Io(_)), "{err:?}");
+    }
+
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "select 1;\n");
 }
