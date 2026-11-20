@@ -10,6 +10,10 @@ Two targets:
 Creates namespace `shop` with:
   orders   (partitioned by day(placed_at), 3 snapshots: 2 appends + 1 overwrite) for time travel
   customers (unpartitioned), events (bucket(8, customer_id) + identity(kind), nested struct/list/map)
+and namespace `history`, two tables whose history is not a straight line, for time travel by
+timestamp (the snapshot that was current then is not always the newest one from before then):
+  rolled_back  100 rows, +50, rolled back to the first snapshot, +10 on top of it  -> 110 rows
+  branched     100 rows, +50 on branch `audit` only, +10 on main                   -> 110 rows
 Requires: pip install "pyiceberg[sql-sqlite,pyarrow,s3fs,pyiceberg-core]==0.12.0"
 (pyiceberg 0.11+ needs pyiceberg-core for the bucket transform used by shop.events)
 """
@@ -17,6 +21,7 @@ import argparse
 import datetime as dt
 import decimal
 import random
+import time
 
 import pyarrow as pa
 from pyiceberg.catalog import load_catalog
@@ -152,7 +157,39 @@ def main():
         "attrs": [[("ref", f"r{i}"), ("utm", "mail")] for i in range(n)],
     }, schema=events.schema().as_arrow()))
 
-    for t in ("shop.customers", "shop.orders", "shop.events"):
+    # Two histories that are not a straight line. The pauses put the commits (and the rollback,
+    # which makes no snapshot) some milliseconds apart, so a test can name a time between them.
+    try:
+        cat.create_namespace("history", {"comment": "Tables whose history is not a straight line"})
+    except NamespaceAlreadyExistsError:
+        pass
+    id_schema = Schema(NestedField(1, "id", LongType(), required=True))
+
+    def ids(table, start, n):
+        return pa.table({"id": pa.array(range(start, start + n), pa.int64())}, schema=table.schema().as_arrow())
+
+    def pause():
+        time.sleep(0.05)
+
+    rolled_back = recreate(cat, "history.rolled_back", id_schema)
+    rolled_back.append(ids(rolled_back, 1, 100))                 # snapshot 1: 100 rows
+    first = rolled_back.current_snapshot().snapshot_id
+    pause()
+    rolled_back.append(ids(rolled_back, 101, 50))                # snapshot 2: 150 rows
+    pause()
+    rolled_back.manage_snapshots().rollback_to_snapshot(first).commit()  # back at snapshot 1
+    pause()
+    rolled_back.append(ids(rolled_back, 1001, 10))               # snapshot 3, on top of 1: 110 rows
+
+    branched = recreate(cat, "history.branched", id_schema)
+    branched.append(ids(branched, 1, 100))                       # snapshot 1 (main): 100 rows
+    branched.manage_snapshots().create_branch(branched.current_snapshot().snapshot_id, "audit").commit()
+    pause()
+    branched.append(ids(branched, 101, 50), branch="audit")      # snapshot 2 (audit only): 150 rows
+    pause()
+    branched.append(ids(branched, 1001, 10))                     # snapshot 3 (main), on top of 1: 110 rows
+
+    for t in ("shop.customers", "shop.orders", "shop.events", "history.rolled_back", "history.branched"):
         tbl = cat.load_table(t)
         print(f"✓ {t}: {len(tbl.snapshots())} snapshot(s), current {tbl.current_snapshot().snapshot_id}")
 

@@ -11,7 +11,10 @@
 //! * [`LazyCatalog`] / [`LazySchema`] resolve `ns.table` on demand (async `SchemaProvider::table`),
 //!   loading fresh metadata per query. Nested namespaces are addressed as `"a.b".table`.
 //! * `ns."table@<snapshot-id | branch | tag | 2026-10-01T00:00:00Z>"` is time travel;
-//!   `ns."table$snapshots"` / `"table$manifests"` are the metadata tables.
+//!   `ns."table$snapshots"` / `"table$manifests"` are the metadata tables. A timestamp selects
+//!   the snapshot that was the table's current one at that time, read from the snapshot log
+//!   ([`snapshot_as_of`]): not a snapshot of another branch, a staged one, or one the table had
+//!   been rolled back from by then.
 //! * [`LiveTable`] reads through `IcebergStaticTableProvider` and, for `INSERT`, builds the real
 //!   write path through `iceberg-datafusion` against a [`ScopedCatalog`] that exposes exactly one
 //!   table (so only that table is loaded).
@@ -36,6 +39,7 @@ use datafusion::prelude::{SQLOptions, SessionConfig, SessionContext};
 use futures_util::{StreamExt, TryStreamExt};
 use iceberg::arrow::{arrow_schema_to_schema_auto_assign_ids, schema_to_arrow_schema};
 use iceberg::inspect::MetadataTableType;
+use iceberg::spec::TableMetadata;
 use iceberg::table::Table;
 use iceberg::{
     Catalog, ErrorKind, Namespace, NamespaceIdent, TableCommit, TableCreation, TableIdent,
@@ -91,15 +95,20 @@ fn parse_table_name(name: &str) -> (&str, Selector) {
 
 /// Resolves a time-travel selector to a snapshot id of `table`.
 fn resolve_snapshot(table: &Table, selector: &str) -> std::result::Result<i64, String> {
-    let md = table.metadata();
+    resolve_selector(table.metadata(), table.identifier().name(), selector)
+}
+
+/// [`resolve_snapshot`] on the table's metadata alone. `name` is the table's name, for messages.
+fn resolve_selector(
+    md: &TableMetadata,
+    name: &str,
+    selector: &str,
+) -> std::result::Result<i64, String> {
     if let Ok(id) = selector.parse::<i64>() {
         return if md.snapshot_by_id(id).is_some() {
             Ok(id)
         } else {
-            Err(format!(
-                "snapshot {id} does not exist in table {}",
-                table.identifier().name()
-            ))
+            Err(format!("snapshot {id} does not exist in table {name}"))
         };
     }
     if let Some(r) = super::meta::refs_of(md)
@@ -109,23 +118,64 @@ fn resolve_snapshot(table: &Table, selector: &str) -> std::result::Result<i64, S
         return r.snapshot_id.parse::<i64>().map_err(|e| e.to_string());
     }
     if let Ok(ts) = DateTime::parse_from_rfc3339(selector) {
-        let ms = ts.timestamp_millis();
-        return md
-            .snapshots()
-            .filter(|s| s.timestamp_ms() <= ms)
-            .max_by_key(|s| (s.timestamp_ms(), s.sequence_number()))
-            .map(|s| s.snapshot_id())
-            .ok_or_else(|| {
-                format!(
-                    "table {} has no snapshot at or before {selector}",
-                    table.identifier().name()
-                )
-            });
+        return snapshot_as_of(md, name, selector, ts.timestamp_millis());
     }
     Err(format!(
-        "'{selector}' is neither a snapshot id, a branch/tag of {}, nor an RFC 3339 timestamp",
-        table.identifier().name()
+        "'{selector}' is neither a snapshot id, a branch/tag of {name}, nor an RFC 3339 timestamp"
     ))
+}
+
+/// The snapshot that was the table's current one at `ms` (milliseconds since the epoch).
+///
+/// That is a question about the table's history, not about its snapshots: the newest snapshot
+/// from before `ms` may never have been current (it was written to another branch, or staged
+/// and not published), or may have stopped being current before `ms` (the table was rolled
+/// back). The snapshot log records each change of the current snapshot, so the answer is its
+/// last entry at or before `ms`, which is how Spark and Trino resolve `TIMESTAMP AS OF`.
+///
+/// A table whose writer keeps no log is read as the current snapshot and its ancestors. That
+/// cannot show a rollback, but it leaves out other branches and staged snapshots.
+fn snapshot_as_of(
+    md: &TableMetadata,
+    name: &str,
+    selector: &str,
+    ms: i64,
+) -> std::result::Result<i64, String> {
+    let none = || format!("table {name} has no snapshot at or before {selector}");
+    let log = md.history();
+    if !log.is_empty() {
+        // The log is in commit order; with equal timestamps the later entry wins.
+        let entry = log
+            .iter()
+            .rev()
+            .find(|e| e.timestamp_ms <= ms)
+            .ok_or_else(none)?;
+        return if md.snapshot_by_id(entry.snapshot_id).is_some() {
+            Ok(entry.snapshot_id)
+        } else {
+            Err(format!(
+                "table {name} was at snapshot {} at {selector}, and that snapshot has been expired",
+                entry.snapshot_id
+            ))
+        };
+    }
+    // A parent chain is at most as long as the list of snapshots; the bound stops a loop in
+    // metadata that is not well formed.
+    let mut steps = md.snapshots().count();
+    let mut cursor = md.current_snapshot();
+    while let Some(snapshot) = cursor {
+        if snapshot.timestamp_ms() <= ms {
+            return Ok(snapshot.snapshot_id());
+        }
+        if steps == 0 {
+            break;
+        }
+        steps -= 1;
+        cursor = snapshot
+            .parent_snapshot_id()
+            .and_then(|parent| md.snapshot_by_id(parent));
+    }
+    Err(none())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -921,6 +971,182 @@ mod tests {
             ("orders", Selector::Meta("snapshots".into()))
         );
         assert_eq!(parse_table_name("@weird"), ("@weird", Selector::Current));
+    }
+
+    // ---- time travel by timestamp (review finding M8) ------------------------------------
+
+    /// 2023-11-14T22:13:20Z. Test times are seconds after it.
+    const T0: i64 = 1_700_000_000_000;
+
+    /// RFC 3339 for `seconds` after [`T0`].
+    fn at(seconds: i64) -> String {
+        DateTime::from_timestamp_millis(T0 + seconds * 1000)
+            .unwrap()
+            .to_rfc3339()
+    }
+
+    /// Table metadata with these snapshots `(id, parent, committed at second)`, this snapshot
+    /// log `(second, id)`, current snapshot and extra refs `(name, id, "branch" | "tag")`.
+    fn table_metadata(
+        snapshots: &[(i64, Option<i64>, i64)],
+        log: &[(i64, i64)],
+        current: i64,
+        refs: &[(&str, i64, &str)],
+    ) -> TableMetadata {
+        use serde_json::json;
+        let snapshots: Vec<_> = snapshots
+            .iter()
+            .enumerate()
+            .map(|(seq, (id, parent, second))| {
+                let mut s = json!({
+                    "snapshot-id": id,
+                    "timestamp-ms": T0 + second * 1000,
+                    "sequence-number": seq + 1,
+                    "summary": {"operation": "append"},
+                    "manifest-list": format!("s3://bucket/t/metadata/snap-{id}.avro"),
+                    "schema-id": 0,
+                });
+                if let Some(p) = parent {
+                    s["parent-snapshot-id"] = json!(p);
+                }
+                s
+            })
+            .collect();
+        let log: Vec<_> = log
+            .iter()
+            .map(|(second, id)| json!({"snapshot-id": id, "timestamp-ms": T0 + second * 1000}))
+            .collect();
+        let mut all_refs = serde_json::Map::new();
+        all_refs.insert(
+            "main".into(),
+            json!({"snapshot-id": current, "type": "branch"}),
+        );
+        for (name, id, kind) in refs {
+            all_refs.insert((*name).into(), json!({"snapshot-id": id, "type": kind}));
+        }
+        let doc = json!({
+            "format-version": 2,
+            "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+            "location": "s3://bucket/t",
+            "last-sequence-number": snapshots.len(),
+            "last-updated-ms": T0 + 10_000_000,
+            "last-column-id": 1,
+            "current-schema-id": 0,
+            "schemas": [{"type": "struct", "schema-id": 0, "fields": [
+                {"id": 1, "name": "x", "required": true, "type": "long"}
+            ]}],
+            "default-spec-id": 0,
+            "partition-specs": [{"spec-id": 0, "fields": []}],
+            "last-partition-id": 999,
+            "default-sort-order-id": 0,
+            "sort-orders": [{"order-id": 0, "fields": []}],
+            "current-snapshot-id": current,
+            "snapshots": snapshots,
+            "snapshot-log": log,
+            "refs": all_refs,
+            "metadata-log": [],
+        });
+        serde_json::from_value(doc).expect("valid table metadata")
+    }
+
+    fn as_of(md: &TableMetadata, seconds: i64) -> std::result::Result<i64, String> {
+        resolve_selector(md, "orders", &at(seconds))
+    }
+
+    #[test]
+    fn a_timestamp_selects_the_snapshot_that_was_current_then() {
+        let md = table_metadata(
+            &[(1, None, 100), (2, Some(1), 200), (3, Some(2), 300)],
+            &[(100, 1), (200, 2), (300, 3)],
+            3,
+            &[],
+        );
+        assert_eq!(as_of(&md, 100), Ok(1), "the instant of the commit counts");
+        assert_eq!(as_of(&md, 150), Ok(1));
+        assert_eq!(as_of(&md, 250), Ok(2));
+        assert_eq!(as_of(&md, 100_000), Ok(3));
+        let e = as_of(&md, 99).unwrap_err();
+        assert!(
+            e.contains("orders") && e.contains("no snapshot at or before"),
+            "{e}"
+        );
+    }
+
+    /// Snapshot 2 was committed, then the table was rolled back to 1, then 3 was committed on
+    /// top of 1. Between the rollback and 3 the table was at 1, although 2 is the newest
+    /// snapshot from before that time. Before the rollback it was at 2, although 2 is not an
+    /// ancestor of what is current now.
+    #[test]
+    fn a_timestamp_after_a_rollback_selects_what_the_table_was_rolled_back_to() {
+        let md = table_metadata(
+            &[(1, None, 100), (2, Some(1), 200), (3, Some(1), 400)],
+            &[(100, 1), (200, 2), (300, 1), (400, 3)],
+            3,
+            &[],
+        );
+        assert_eq!(as_of(&md, 350), Ok(1), "rolled back to 1 at 300");
+        assert_eq!(as_of(&md, 300), Ok(1));
+        assert_eq!(as_of(&md, 250), Ok(2), "2 was current until the rollback");
+        assert_eq!(as_of(&md, 150), Ok(1));
+        assert_eq!(as_of(&md, 450), Ok(3));
+    }
+
+    /// Snapshot 2 was written to the branch `audit` and was never current on the table.
+    #[test]
+    fn a_timestamp_never_selects_a_snapshot_of_another_branch() {
+        let md = table_metadata(
+            &[(1, None, 100), (2, Some(1), 200), (3, Some(1), 300)],
+            &[(100, 1), (300, 3)],
+            3,
+            &[("audit", 2, "branch")],
+        );
+        assert_eq!(as_of(&md, 250), Ok(1));
+        assert_eq!(as_of(&md, 350), Ok(3));
+        // The branch is still reachable by its name, and the snapshot by its id.
+        assert_eq!(resolve_selector(&md, "orders", "audit"), Ok(2));
+        assert_eq!(resolve_selector(&md, "orders", "2"), Ok(2));
+    }
+
+    /// Snapshot 2 was staged (write-audit-publish) and never published: no ref points at it.
+    #[test]
+    fn a_timestamp_never_selects_a_snapshot_that_was_staged_and_not_published() {
+        let md = table_metadata(&[(1, None, 100), (2, Some(1), 200)], &[(100, 1)], 1, &[]);
+        assert_eq!(as_of(&md, 250), Ok(1));
+    }
+
+    /// The log can outlive a snapshot it names. Naming another snapshot instead would be a guess.
+    #[test]
+    fn a_timestamp_that_falls_on_an_expired_snapshot_is_an_error() {
+        let md = table_metadata(
+            &[(2, None, 200), (3, Some(2), 300)],
+            &[(100, 1), (200, 2), (300, 3)],
+            3,
+            &[],
+        );
+        let e = as_of(&md, 150).unwrap_err();
+        assert!(e.contains("snapshot 1") && e.contains("expired"), "{e}");
+        assert_eq!(as_of(&md, 250), Ok(2));
+    }
+
+    /// Some writers keep no snapshot log. Then the history is the current snapshot and its
+    /// ancestors: 3 and 1 here, not 2.
+    #[test]
+    fn without_a_snapshot_log_a_timestamp_selects_among_the_ancestors_of_the_current_snapshot() {
+        let md = table_metadata(
+            &[(1, None, 100), (2, Some(1), 200), (3, Some(1), 300)],
+            &[],
+            3,
+            &[("audit", 2, "branch")],
+        );
+        assert!(md.history().is_empty());
+        assert_eq!(as_of(&md, 250), Ok(1));
+        assert_eq!(as_of(&md, 300), Ok(3));
+        assert_eq!(as_of(&md, 150), Ok(1));
+        assert!(
+            as_of(&md, 50)
+                .unwrap_err()
+                .contains("no snapshot at or before")
+        );
     }
 
     #[test]
