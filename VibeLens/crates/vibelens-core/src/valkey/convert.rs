@@ -214,22 +214,61 @@ pub(super) fn parse_key_type(s: &str) -> KeyType {
 // SCAN cursors
 // ----------------------------------------------------------------------------------------
 
-/// Decoded scan position. `node` is always 0 outside cluster mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Decoded scan position: a node's own `SCAN` cursor and, in cluster mode after the first
+/// page, the node it belongs to.
+///
+/// A cluster scan reads one primary after another, so the cursor has to say which one it is
+/// on. It names the node by address, not by its place in the list of primaries: that list is
+/// fetched again for every page, and after a failover the same place holds another node, on
+/// which the old node's cursor means nothing. It also carries a fingerprint of the primaries
+/// the scan started with, because once that set changes, "the nodes already read" and "the
+/// nodes still to read" are no longer the same nodes. Either mismatch ends the scan with an
+/// error; it is never papered over.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ScanCursor {
-    pub node: usize,
+    /// `None` outside cluster mode, and at the start of a cluster scan.
+    pub node: Option<ScanNode>,
     pub cursor: u64,
 }
 
-impl ScanCursor {
-    pub const START: ScanCursor = ScanCursor { node: 0, cursor: 0 };
+/// The primary a cluster scan is on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ScanNode {
+    pub host: String,
+    pub port: u16,
+    /// [`topology_fingerprint`] of the primaries when this position was handed out.
+    pub topology: String,
+}
 
-    /// Standalone: the plain decimal cursor. Cluster: `"<nodeIndex>:<nodeCursor>"`.
-    pub fn encode(self, cluster: bool) -> String {
-        if cluster {
-            format!("{}:{}", self.node, self.cursor)
-        } else {
-            self.cursor.to_string()
+/// A short, stable name for a set of primaries (as sorted by `parse_primaries`).
+pub(super) fn topology_fingerprint(primaries: &[(String, u16)]) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    for (host, port) in primaries {
+        hasher.update(host.as_bytes());
+        hasher.update([0]);
+        hasher.update(port.to_be_bytes());
+    }
+    hasher.finalize()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+impl ScanCursor {
+    pub const START: ScanCursor = ScanCursor {
+        node: None,
+        cursor: 0,
+    };
+
+    /// Standalone: the plain decimal cursor. Cluster: `"<nodeCursor>@<host>:<port>#<topology>"`,
+    /// or `"0"` at the start. The UI treats the string as opaque and hands it back.
+    pub fn encode(&self, cluster: bool) -> String {
+        match &self.node {
+            Some(n) if cluster => {
+                format!("{}@{}:{}#{}", self.cursor, n.host, n.port, n.topology)
+            }
+            _ => self.cursor.to_string(),
         }
     }
 
@@ -241,18 +280,27 @@ impl ScanCursor {
             return Ok(Self::START);
         }
         let bad = || CoreError::Invalid(format!("invalid scan cursor {s:?}"));
-        if cluster {
-            let (node, cur) = s.split_once(':').ok_or_else(bad)?;
-            Ok(ScanCursor {
-                node: node.parse().map_err(|_| bad())?,
-                cursor: cur.parse().map_err(|_| bad())?,
-            })
-        } else {
-            Ok(ScanCursor {
-                node: 0,
+        if !cluster {
+            return Ok(ScanCursor {
+                node: None,
                 cursor: s.parse().map_err(|_| bad())?,
-            })
+            });
         }
+        // The host may hold colons (IPv6), so the address is split from the right.
+        let (cursor, rest) = s.split_once('@').ok_or_else(bad)?;
+        let (address, topology) = rest.rsplit_once('#').ok_or_else(bad)?;
+        let (host, port) = address.rsplit_once(':').ok_or_else(bad)?;
+        if host.is_empty() || topology.is_empty() {
+            return Err(bad());
+        }
+        Ok(ScanCursor {
+            node: Some(ScanNode {
+                host: host.to_owned(),
+                port: port.parse().map_err(|_| bad())?,
+                topology: topology.to_owned(),
+            }),
+            cursor: cursor.parse().map_err(|_| bad())?,
+        })
     }
 }
 
@@ -458,7 +506,7 @@ mod tests {
     #[test]
     fn cursor_roundtrip_standalone() {
         let c = ScanCursor {
-            node: 0,
+            node: None,
             cursor: 18446744073709551615,
         };
         assert_eq!(c.encode(false), "18446744073709551615");
@@ -470,16 +518,41 @@ mod tests {
         assert_eq!(ScanCursor::decode("", false).unwrap(), ScanCursor::START);
     }
 
+    fn on(host: &str, port: u16, cursor: u64) -> ScanCursor {
+        ScanCursor {
+            node: Some(ScanNode {
+                host: host.into(),
+                port,
+                topology: "0123456789abcdef".into(),
+            }),
+            cursor,
+        }
+    }
+
     #[test]
     fn cursor_roundtrip_cluster() {
-        let c = ScanCursor {
-            node: 2,
-            cursor: 4711,
-        };
-        assert_eq!(c.encode(true), "2:4711");
-        assert_eq!(ScanCursor::decode("2:4711", true).unwrap(), c);
+        let c = on("10.0.0.2", 6379, 4711);
+        assert_eq!(c.encode(true), "4711@10.0.0.2:6379#0123456789abcdef");
+        assert_eq!(
+            ScanCursor::decode("4711@10.0.0.2:6379#0123456789abcdef", true).unwrap(),
+            c
+        );
+        // A later node at its own cursor 0 is a position, not the start.
+        let next = on("10.0.0.3", 6379, 0);
+        assert_eq!(next.encode(true), "0@10.0.0.3:6379#0123456789abcdef");
+        assert_eq!(ScanCursor::decode(&next.encode(true), true).unwrap(), next);
+        // Host names and IPv6 addresses (which hold colons) survive.
+        for host in ["cache-0001.example.internal", "::1", "fe80::1"] {
+            let c = on(host, 7101, 9);
+            assert_eq!(
+                ScanCursor::decode(&c.encode(true), true).unwrap(),
+                c,
+                "{host}"
+            );
+        }
         assert_eq!(ScanCursor::decode("0", true).unwrap(), ScanCursor::START);
-        assert_eq!(ScanCursor::decode("0:0", true).unwrap(), ScanCursor::START);
+        assert_eq!(ScanCursor::decode("", true).unwrap(), ScanCursor::START);
+        assert_eq!(ScanCursor::START.encode(true), "0");
     }
 
     #[test]
@@ -490,14 +563,49 @@ mod tests {
                 "{bad}"
             );
         }
-        for bad in ["5", "a:1", "1:b", "1:2:3", ":"] {
+        for bad in [
+            "5",
+            "a:1",
+            "1:2",
+            "1:2:3",
+            ":",
+            "@",
+            "4711@10.0.0.2:6379",
+            "4711@10.0.0.2#abc",
+            "4711@:6379#abc",
+            "4711@10.0.0.2:port#abc",
+            "4711@10.0.0.2:6379#",
+            "x@10.0.0.2:6379#abc",
+            "@10.0.0.2:6379#abc",
+        ] {
             assert!(
                 matches!(ScanCursor::decode(bad, true), Err(CoreError::Invalid(_))),
                 "{bad}"
             );
         }
         // a cluster cursor is not a valid standalone cursor, and vice versa
-        assert!(ScanCursor::decode("1:2", false).is_err());
+        assert!(ScanCursor::decode("4711@10.0.0.2:6379#abc", false).is_err());
+    }
+
+    #[test]
+    fn topology_fingerprints_tell_sets_of_primaries_apart() {
+        let nodes = |a: &[(&str, u16)]| -> Vec<(String, u16)> {
+            a.iter().map(|(h, p)| (h.to_string(), *p)).collect()
+        };
+        let base = topology_fingerprint(&nodes(&[("a", 1), ("b", 2)]));
+        assert_eq!(base, topology_fingerprint(&nodes(&[("a", 1), ("b", 2)])));
+        assert_eq!(base.len(), 16);
+        for other in [
+            nodes(&[("a", 1)]),
+            nodes(&[("a", 1), ("b", 3)]),
+            nodes(&[("a", 1), ("c", 2)]),
+            nodes(&[("a", 1), ("b", 2), ("c", 3)]),
+            // not just the concatenated text: ("ab", 1) is not ("a", ...) + ("b", ...)
+            nodes(&[("ab", 1)]),
+            nodes(&[]),
+        ] {
+            assert_ne!(base, topology_fingerprint(&other), "{other:?}");
+        }
     }
 
     #[test]

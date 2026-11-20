@@ -32,9 +32,16 @@
 //!
 //! ## Known limitations
 //! - Keys are addressed as `&str`; a non-UTF-8 key is shown lossily and cannot be fetched back.
-//! - Blocking commands (`BLPOP`, `XREAD BLOCK`) are classified as writes (need confirmation) and
-//!   would stall other callers of the same multiplexed connection until they return or time out.
 //! - `MULTI`/`WATCH`, pub/sub, `MONITOR`, `HELLO`, `AUTH`, `SELECT` are refused in `command()`.
+//! - So are blocking commands (`BLPOP`, `BZPOPMIN`, `XREAD BLOCK`, `WAIT` and the rest of
+//!   [`is_blocking_command`], the list the agent's policy uses too). One would hold up every
+//!   other caller of the same multiplexed connection, and after the reply timeout it would still
+//!   be waiting on the server, where it can take the next element for nobody. A command that
+//!   only carries the server's `blocking` flag and is not on that list (a module's, say) is
+//!   still run, after confirmation.
+//! - A cluster scan stops with "topology changed" when the primaries are no longer the ones it
+//!   started with (see [`ScanCursor`]). Slots that move between the same primaries during a
+//!   scan are not noticed; keys in them can be missed or seen twice, as with `SCAN` itself.
 
 mod cmdinfo;
 mod convert;
@@ -49,6 +56,7 @@ use std::time::Instant;
 use redis::cluster_routing::SingleNodeRoutingInfo;
 use redis::{Cmd, Value, cmd, pipe};
 
+pub(crate) use self::cmdinfo::is_blocking_command;
 use self::cmdinfo::{Classification, CommandMeta};
 use self::convert::*;
 use self::session::Session;
@@ -195,19 +203,18 @@ impl ValkeyHandle {
         let position = ScanCursor::decode(cursor, cluster)?;
         let count = count.clamp(1, 100_000);
 
-        let (route, node_count) = if cluster {
+        // Cluster: the primary this page reads, and the primaries as they are now.
+        let (route, index, primaries) = if cluster {
             let nodes = self.primaries().await?;
-            let (host, port) = nodes.get(position.node).cloned().ok_or_else(|| {
-                CoreError::Invalid(
-                    "the cluster topology changed since this scan started; restart the scan".into(),
-                )
-            })?;
+            let index = locate(&position, &nodes)?;
+            let (host, port) = nodes[index].clone();
             (
                 Some(SingleNodeRoutingInfo::ByAddress { host, port }),
-                nodes.len(),
+                index,
+                nodes,
             )
         } else {
-            (None, 1)
+            (None, 0, Vec::new())
         };
 
         let mut c = cmd("SCAN");
@@ -241,7 +248,7 @@ impl ValkeyHandle {
             })
             .collect();
 
-        let (next_position, done) = advance(position, next, node_count);
+        let (next_position, done) = advance(index, next, &primaries);
         Ok(ScanPage {
             keys,
             cursor: next_position.encode(cluster),
@@ -464,26 +471,46 @@ fn parse_scan_reply(reply: &Value) -> Result<(u64, Vec<Vec<u8>>)> {
     Ok((cursor, keys.iter().filter_map(value_bytes).collect()))
 }
 
-/// Where the scan goes after a page. A node cursor of 0 means that node is exhausted: move to
-/// the next primary, or finish after the last one. Standalone is the `node_count == 1` case.
-fn advance(current: ScanCursor, node_cursor: u64, node_count: usize) -> (ScanCursor, bool) {
-    if node_cursor != 0 {
-        return (
-            ScanCursor {
-                node: current.node,
-                cursor: node_cursor,
-            },
-            false,
-        );
+fn topology_changed() -> CoreError {
+    CoreError::Invalid(
+        "the cluster topology changed since this scan started; restart the scan".into(),
+    )
+}
+
+/// Which of `primaries` (the cluster's primaries as they are now) a scan page reads.
+///
+/// The start is the first primary. After that the position names its node and the topology it
+/// was handed out under: if the primaries are no longer that set, or the node is not among
+/// them, the scan cannot be continued truthfully and fails.
+fn locate(position: &ScanCursor, primaries: &[(String, u16)]) -> Result<usize> {
+    let Some(node) = &position.node else {
+        return Ok(0);
+    };
+    if node.topology != topology_fingerprint(primaries) {
+        return Err(topology_changed());
     }
-    if current.node + 1 < node_count {
-        (
-            ScanCursor {
-                node: current.node + 1,
-                cursor: 0,
-            },
-            false,
-        )
+    primaries
+        .iter()
+        .position(|(host, port)| *host == node.host && *port == node.port)
+        .ok_or_else(topology_changed)
+}
+
+/// Where the scan goes after a page from `primaries[index]` (no primaries: standalone). A node
+/// cursor of 0 means that node is exhausted: move to the next primary, or finish after the last.
+fn advance(index: usize, node_cursor: u64, primaries: &[(String, u16)]) -> (ScanCursor, bool) {
+    let on = |index: usize, cursor: u64| ScanCursor {
+        node: primaries.get(index).map(|(host, port)| ScanNode {
+            host: host.clone(),
+            port: *port,
+            topology: topology_fingerprint(primaries),
+        }),
+        cursor,
+    };
+    if node_cursor != 0 {
+        return (on(index, node_cursor), false);
+    }
+    if index + 1 < primaries.len() {
+        (on(index + 1, 0), false)
     } else {
         (ScanCursor::START, true)
     }
@@ -606,47 +633,128 @@ mod tests {
     }
 
     #[test]
-    fn advance_standalone() {
-        let start = ScanCursor::START;
-        assert_eq!(
-            advance(start, 42, 1),
-            (
-                ScanCursor {
-                    node: 0,
-                    cursor: 42
-                },
-                false
-            )
-        );
-        assert_eq!(
-            advance(
-                ScanCursor {
-                    node: 0,
-                    cursor: 42
-                },
-                0,
-                1
-            ),
-            (ScanCursor::START, true)
-        );
+    fn a_standalone_scan_follows_the_server_cursor_until_it_is_zero() {
+        let (c, done) = advance(0, 42, &[]);
+        assert!(!done);
+        assert_eq!(c.encode(false), "42");
+        assert_eq!(ScanCursor::decode("42", false).unwrap(), c);
+        assert_eq!(advance(0, 0, &[]), (ScanCursor::START, true));
+    }
+
+    // ---- cluster scans across topology changes (review finding M10) ----------------------
+
+    fn primaries(addrs: &[&str]) -> Vec<(String, u16)> {
+        let mut nodes: Vec<(String, u16)> = addrs
+            .iter()
+            .map(|a| {
+                let (host, port) = a.rsplit_once(':').unwrap();
+                (host.to_string(), port.parse().unwrap())
+            })
+            .collect();
+        // `parse_primaries` hands them over sorted.
+        nodes.sort();
+        nodes
+    }
+
+    /// The position a scan is at after a page from `nodes[index]` that ended with
+    /// `node_cursor`, as the next call gets it: encoded for the UI and decoded again.
+    fn resumed(nodes: &[(String, u16)], index: usize, node_cursor: u64) -> ScanCursor {
+        let (next, done) = advance(index, node_cursor, nodes);
+        assert!(!done);
+        ScanCursor::decode(&next.encode(true), true).unwrap()
+    }
+
+    fn is_topology_error(r: Result<usize>) -> bool {
+        matches!(r, Err(CoreError::Invalid(m)) if m.contains("topology changed") && m.contains("restart the scan"))
     }
 
     #[test]
-    fn advance_walks_every_cluster_node_then_finishes() {
-        // 3 primaries: node cursors run to 0 on each node in turn.
-        let n = 3;
-        let (c, done) = advance(ScanCursor { node: 0, cursor: 5 }, 9, n);
-        assert_eq!((c, done), (ScanCursor { node: 0, cursor: 9 }, false));
-        let (c, done) = advance(c, 0, n);
-        assert_eq!((c, done), (ScanCursor { node: 1, cursor: 0 }, false));
-        let (c, done) = advance(c, 0, n); // empty node: immediately exhausted
-        assert_eq!((c, done), (ScanCursor { node: 2, cursor: 0 }, false));
-        let (c, done) = advance(c, 7, n);
-        assert_eq!((c, done), (ScanCursor { node: 2, cursor: 7 }, false));
-        let (_, done) = advance(c, 0, n);
-        assert!(done);
-        // encoded form is what the UI sees
-        assert_eq!(ScanCursor { node: 1, cursor: 0 }.encode(true), "1:0");
+    fn a_cluster_scan_walks_every_primary_in_turn_then_finishes() {
+        let nodes = primaries(&["10.0.0.1:6379", "10.0.0.2:6379", "10.0.0.3:6379"]);
+        // The first call has no position yet: it starts at the first primary.
+        assert_eq!(locate(&ScanCursor::START, &nodes).unwrap(), 0);
+        // More to come from the first node: stay on it.
+        assert_eq!(locate(&resumed(&nodes, 0, 9), &nodes).unwrap(), 0);
+        // Its cursor ran to 0: on to the second, and from an empty second node to the third.
+        assert_eq!(locate(&resumed(&nodes, 0, 0), &nodes).unwrap(), 1);
+        assert_eq!(locate(&resumed(&nodes, 1, 0), &nodes).unwrap(), 2);
+        assert_eq!(locate(&resumed(&nodes, 2, 7), &nodes).unwrap(), 2);
+        // The last node is exhausted: done, and the cursor is the start again.
+        assert_eq!(advance(2, 0, &nodes), (ScanCursor::START, true));
+        // "0" is only ever the start: a position on a later node at node cursor 0 is not "0".
+        assert_ne!(advance(0, 0, &nodes).0.encode(true), "0");
+    }
+
+    /// A failover: the second primary was replaced by its replica, which has another address.
+    /// The cursor held an index, so the scan went on at the same index on a different node,
+    /// with a node cursor that meant nothing there.
+    #[test]
+    fn a_cluster_scan_fails_when_the_node_it_was_on_is_no_longer_a_primary() {
+        let before = primaries(&["10.0.0.1:6379", "10.0.0.2:6379", "10.0.0.3:6379"]);
+        let position = resumed(&before, 1, 4711);
+        let after = primaries(&["10.0.0.1:6379", "10.0.0.3:6379", "10.0.0.9:6379"]);
+        assert!(
+            is_topology_error(locate(&position, &after)),
+            "{:?}",
+            locate(&position, &after)
+        );
+        // Unchanged topology: the same node.
+        assert_eq!(locate(&position, &before).unwrap(), 1);
+    }
+
+    /// The node the scan is on is still a primary, but the set of primaries is not the one the
+    /// scan started with. The nodes already read and the nodes still to read are no longer
+    /// well defined (slots have moved), so keys would be skipped or repeated without a word.
+    #[test]
+    fn a_cluster_scan_fails_when_the_set_of_primaries_changed() {
+        let before = primaries(&["10.0.0.1:6379", "10.0.0.2:6379", "10.0.0.3:6379"]);
+        let position = resumed(&before, 1, 4711);
+        for after in [
+            // a primary was added that sorts before the current one
+            primaries(&[
+                "10.0.0.0:6379",
+                "10.0.0.1:6379",
+                "10.0.0.2:6379",
+                "10.0.0.3:6379",
+            ]),
+            // one was added after it
+            primaries(&[
+                "10.0.0.1:6379",
+                "10.0.0.2:6379",
+                "10.0.0.3:6379",
+                "10.0.0.4:6379",
+            ]),
+            // an earlier one went away
+            primaries(&["10.0.0.2:6379", "10.0.0.3:6379"]),
+            // the same hosts on other ports
+            primaries(&["10.0.0.1:6380", "10.0.0.2:6379", "10.0.0.3:6379"]),
+        ] {
+            assert!(
+                is_topology_error(locate(&position, &after)),
+                "{after:?}: {:?}",
+                locate(&position, &after)
+            );
+        }
+    }
+
+    #[test]
+    fn a_cluster_cursor_names_its_node_whatever_the_address_looks_like() {
+        for addr in [
+            "cache-0001.example.internal:6379",
+            "::1:7101",
+            "10.0.0.2:6379",
+        ] {
+            let nodes = primaries(&["a.example:1", addr]);
+            let index = nodes
+                .iter()
+                .position(|n| *n == primaries(&[addr])[0])
+                .unwrap();
+            assert_eq!(
+                locate(&resumed(&nodes, index, 4711), &nodes).unwrap(),
+                index,
+                "{addr}"
+            );
+        }
     }
 
     fn node(host: &str, port: i64) -> Value {

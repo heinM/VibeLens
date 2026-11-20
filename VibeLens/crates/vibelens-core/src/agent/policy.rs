@@ -183,7 +183,6 @@ fn prod_prefix(f: &ProfileFacts) -> String {
 /// Valkey commands that are never allowed from the agent, at any access level.
 fn valkey_blocked(argv: &[String]) -> Option<&'static str> {
     let cmd = argv.first()?.to_ascii_uppercase();
-    let has = |word: &str| argv.iter().skip(1).any(|a| a.eq_ignore_ascii_case(word));
     Some(match cmd.as_str() {
         "KEYS" => "KEYS blocks the server on large keyspaces; use valkey_scan instead",
         "CONFIG" | "ACL" | "DEBUG" | "MODULE" | "SLOWLOG" | "LATENCY" => {
@@ -198,9 +197,10 @@ fn valkey_blocked(argv: &[String]) -> Option<&'static str> {
         "SUBSCRIBE" | "PSUBSCRIBE" | "SSUBSCRIBE" | "MONITOR" | "SYNC" | "PSYNC" => {
             "streaming commands would hang the connection"
         }
-        "BLPOP" | "BRPOP" | "BRPOPLPUSH" | "BLMOVE" | "BLMPOP" | "BZPOPMIN" | "BZPOPMAX"
-        | "BZMPOP" | "WAIT" | "WAITAOF" => "blocking commands would hang the connection",
-        "XREAD" | "XREADGROUP" if has("BLOCK") => "blocking commands would hang the connection",
+        // The list is the Valkey module's: the console refuses the same commands.
+        _ if crate::valkey::is_blocking_command(argv) => {
+            "blocking commands would hang the connection"
+        }
         "SHUTDOWN" | "REPLICAOF" | "SLAVEOF" | "FAILOVER" | "MIGRATE" | "SAVE" | "BGSAVE"
         | "BGREWRITEAOF" => "server administration is not available to the agent",
         _ => return None,

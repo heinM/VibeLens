@@ -596,6 +596,63 @@ async fn command_requires_confirmation_for_writes() {
     flush(&h).await;
 }
 
+/// A blocking command must not reach the server (review finding M9). If it did, it would wait
+/// there on the connection every other query shares; and after the client stopped waiting it
+/// would still be there, ready to take the next element pushed to the list, for nobody.
+#[tokio::test]
+async fn blocking_commands_are_refused_before_they_reach_the_server() {
+    let (_g, env, h) = fixture!();
+    // A second connection, to push to the list and look at it from outside.
+    let outside = env.connect().await;
+
+    let t0 = std::time::Instant::now();
+    let outcome = h.command(DB_A, argv(&["BLPOP", "jobs", "0"]), true).await;
+    let waited = t0.elapsed();
+    run(&outside, DB_A, &["RPUSH", "jobs", "job-1"]).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let left = run(&outside, DB_A, &["LLEN", "jobs"]).await;
+
+    match &outcome {
+        Err(CoreError::Invalid(msg)) => assert!(
+            msg.contains("BLPOP") && msg.contains("shared") && msg.contains("LPOP"),
+            "{msg}"
+        ),
+        other => panic!(
+            "BLPOP should be refused. After {waited:?} it gave {other:?}; an element pushed afterwards left the list with {left} element(s)"
+        ),
+    }
+    assert!(waited < std::time::Duration::from_secs(2), "{waited:?}");
+    assert_eq!(left, json!(1), "nothing on the server took the element");
+
+    for blocked in [
+        &["brpop", "jobs", "1"][..],
+        &["BLMOVE", "jobs", "done", "LEFT", "RIGHT", "0"],
+        &["BLMPOP", "0", "1", "jobs", "LEFT"],
+        &["BZPOPMIN", "scores", "0"],
+        &["BZMPOP", "0", "1", "scores", "MIN"],
+        &["XREAD", "BLOCK", "0", "STREAMS", "events", "$"],
+        &["WAIT", "1", "0"],
+    ] {
+        let t0 = std::time::Instant::now();
+        // even with allow_write=true
+        match h.command(DB_A, argv(blocked), true).await {
+            Err(CoreError::Invalid(msg)) => assert!(msg.contains("shared"), "{blocked:?}: {msg}"),
+            other => panic!("{blocked:?} should be refused, got {other:?}"),
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "{blocked:?}"
+        );
+    }
+
+    // The forms that do not block still run, and the connection was never stalled.
+    assert_eq!(run(&h, DB_A, &["LPOP", "jobs"]).await, json!("job-1"));
+    run(&h, DB_A, &["XADD", "events", "*", "kind", "view"]).await;
+    let read = run(&h, DB_A, &["XREAD", "COUNT", "1", "STREAMS", "events", "0"]).await;
+    assert!(!read.is_null(), "{read}");
+    flush(&h).await;
+}
+
 #[tokio::test]
 async fn command_rejects_empty_and_blocked() {
     let (_g, _env, h) = fixture!();
