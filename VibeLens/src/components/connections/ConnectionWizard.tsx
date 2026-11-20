@@ -2,13 +2,15 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Brain, CheckCircle2, Cog, Cpu, Database, HardDrive, KeyRound, Library, Lock, Network, Trash2 } from "lucide-react";
 import { api, asError } from "../../ipc/commands";
-import type { ConnectionProfile, ErrorPayload, IcebergOptions, TestResult } from "../../ipc/types";
+import type { ConnectionProfile, ErrorPayload, IcebergOptions, PresentedHostKey, TestResult } from "../../ipc/types";
 import { cn } from "../../lib/cn";
 import { useUIStore } from "../../store/useUIStore";
 import { Button, ConfirmDialog, Dialog, EmptyState, EnvBadge, ErrorBox, Spinner } from "../ui";
 import { FocusScope } from "../ui/formKit";
 import { aiAccessMeta } from "./aiAccess";
 import { cleanProfile, icebergSecretArgs, initialDraft, missingIcebergSecrets, secretArgs, testPasswordArg, type Draft, type S3KeysEdit, type SecretEdit } from "./draft";
+import { HostKeyTrustDialog } from "./HostKeyDialog";
+import { isHostKeyFingerprint, withTrustedHostKey } from "./hostKey";
 import { catalogSummary, engineSummary, normalizeIceberg, storageSummary } from "./icebergForm";
 import { AdvancedSection } from "./sections/AdvancedSection";
 import { AiAccessSection } from "./sections/AiAccessSection";
@@ -97,8 +99,10 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
   const [saveError, setSaveError] = useState<ErrorPayload | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  /** The key an unpinned SSH host presented to the last Test, while the user is looking at it. */
+  const [keyToCheck, setKeyToCheck] = useState<PresentedHostKey | null>(null);
   const confirmingRef = useRef(false);
-  confirmingRef.current = confirmDelete;
+  confirmingRef.current = confirmDelete || keyToCheck !== null;
   const testSeq = useRef(0);
 
   const editing = existing != null;
@@ -155,7 +159,7 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
   );
 
   const onClose = useCallback(() => {
-    if (confirmingRef.current) return; // Esc belongs to the delete confirmation
+    if (confirmingRef.current) return; // Esc belongs to the dialog on top (delete confirmation, host key)
     closeWizard();
   }, [closeWizard]);
 
@@ -170,16 +174,30 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
     return true;
   };
 
-  const runTest = async () => {
+  /** `tested` replaces the draft's profile for this one run (state set in the same tick is not visible yet). */
+  const runTest = async (tested: ConnectionProfile = profile) => {
     if (!checkValid()) return;
     const seq = ++testSeq.current;
     setTest({ status: "running" });
     try {
-      const result = await api.testConnection(cleanProfile(profile), testPasswordArg(draft));
-      if (seq === testSeq.current) setTest({ status: "done", result });
+      const result = await api.testConnection(cleanProfile(tested), testPasswordArg(draft));
+      if (seq !== testSeq.current) return;
+      setTest({ status: "done", result });
+      // An unpinned SSH host: nothing was sent to it. Show its key instead of just failing.
+      if (result.hostKey && isHostKeyFingerprint(result.hostKey.fingerprint)) setKeyToCheck(result.hostKey);
     } catch (e) {
       if (seq === testSeq.current) setTest({ status: "error", error: asError(e) });
     }
+  };
+
+  /** Trusting a key during Test pins it on the draft only. It reaches the saved profile with Save. */
+  const trustTestedKey = () => {
+    const key = keyToCheck;
+    setKeyToCheck(null);
+    const next = key && withTrustedHostKey(profile, key);
+    if (!next) return;
+    patch(() => next);
+    void runTest(next);
   };
 
   const save = async () => {
@@ -270,7 +288,7 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
                   <Trash2 className="size-3.5" /> Delete
                 </Button>
               )}
-              <TestResultView state={test} />
+              <TestResultView state={test} onCheckKey={setKeyToCheck} />
             </div>
             <Button onClick={() => void runTest()} loading={test.status === "running"} disabled={busy}>
               Test connection
@@ -332,6 +350,7 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
           </div>
         </FocusScope>
       </Dialog>
+      <HostKeyTrustDialog hostKey={keyToCheck} connectionName={profile.name.trim() || null} trustLabel="Trust and test again" onTrust={trustTestedKey} onCancel={() => setKeyToCheck(null)} />
       <ConfirmDialog
         open={confirmDelete}
         title="Delete connection"
@@ -353,7 +372,7 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
   );
 }
 
-function TestResultView({ state }: { state: TestState }) {
+function TestResultView({ state, onCheckKey }: { state: TestState; onCheckKey: (key: PresentedHostKey) => void }) {
   if (state.status === "idle") return null;
   if (state.status === "running")
     return (
@@ -370,6 +389,16 @@ function TestResultView({ state }: { state: TestState }) {
         <span className="truncate">
           Connected in {r.latencyMs} ms{r.serverVersion ? ` · ${r.serverVersion}` : ""}
         </span>
+      </span>
+    );
+  const hostKey = r.hostKey;
+  if (hostKey)
+    return (
+      <span className="inline-flex min-w-0 items-center gap-2 text-xs text-warn" role="status">
+        <span className="truncate">The SSH host&rsquo;s key is not trusted yet. Nothing was sent to it.</span>
+        <Button size="sm" onClick={() => onCheckKey(hostKey)}>
+          Check host key
+        </Button>
       </span>
     );
   return (

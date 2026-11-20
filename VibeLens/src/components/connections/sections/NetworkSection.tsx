@@ -1,4 +1,4 @@
-import { useId } from "react";
+import { useId, useState } from "react";
 import { useSecretStatus } from "../useSecretStatus";
 import { Fingerprint } from "lucide-react";
 import type { SshAuth, TunnelConfig } from "../../../ipc/types";
@@ -6,6 +6,7 @@ import { cn } from "../../../lib/cn";
 import { Button, Input } from "../../ui";
 import { FormField, Notice, NumberField, SegmentedControl, Switch, invalidRing } from "../../ui/formKit";
 import { newSecret } from "../draft";
+import { parseHostKeyFingerprint } from "../hostKey";
 import { SecretField } from "../SecretField";
 import type { SectionProps } from "./types";
 
@@ -19,6 +20,19 @@ export function NetworkSection({ profile, original, editing, patch, draft, setSs
   const storedSsh = t?.auth.kind === "password" ? secrets.data?.hasSshPassword : secrets.data?.hasSshPassphrase;
   const hadSecret =
     editing && !!original?.tunnel && original.tunnel.auth.kind !== "agent" && original.tunnel.auth.kind === t?.auth.kind && (storedSsh ?? false);
+
+  // What is being typed into the pin field. It reaches the draft only once it is a fingerprint.
+  const [pinText, setPinText] = useState("");
+  const onPinText = (text: string) => {
+    const fingerprint = t ? parseHostKeyFingerprint(text) : null;
+    if (t && fingerprint) {
+      setPinText("");
+      setTunnel({ ...t, knownHostFingerprint: fingerprint });
+    } else {
+      setPinText(text);
+    }
+  };
+  const pinError = pinText.trim() ? "Not a host key fingerprint. It looks like SHA256: followed by 43 characters." : undefined;
 
   const setAuth = (kind: SshAuth["kind"]) => {
     if (!t || t.auth.kind === kind) return;
@@ -96,12 +110,29 @@ export function NetworkSection({ profile, original, editing, patch, draft, setSs
           )}
           {t.auth.kind === "password" && <SecretField label="SSH password" edit={draft.sshSecret} onChange={setSshSecret} hasStored={hadSecret} />}
 
-          <FormField label="Pinned host key" hint="VibeLens pins the server's host key the first time it connects and refuses to connect if it ever changes.">
+          <FormField
+            label="Pinned host key"
+            htmlFor={t.knownHostFingerprint ? undefined : `${uid}-pin`}
+            error={pinError ?? err("tunnel.knownHostFingerprint")}
+            hint="VibeLens connects only to a server that presents this key. Leave it empty to be shown the server's key the first time you connect or test, or paste its SHA256 fingerprint (ssh-keygen -lf prints it)."
+          >
             <div className="flex items-center gap-2">
-              <div className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md border border-border bg-panel-2/50 px-2.5 text-[12px]">
-                <Fingerprint className="size-3.5 shrink-0 text-muted" />
-                {t.knownHostFingerprint ? <span className="selectable truncate font-mono text-fg">{t.knownHostFingerprint}</span> : <span className="text-muted">Not pinned yet. Pinned on first connect.</span>}
-              </div>
+              {t.knownHostFingerprint ? (
+                <div className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md border border-border bg-panel-2/50 px-2.5 text-[12px]">
+                  <Fingerprint className="size-3.5 shrink-0 text-muted" />
+                  <span className="selectable truncate font-mono text-fg">{t.knownHostFingerprint}</span>
+                </div>
+              ) : (
+                <Input
+                  id={`${uid}-pin`}
+                  value={pinText}
+                  spellCheck={false}
+                  autoComplete="off"
+                  placeholder="Not pinned. Paste SHA256:… to pin it now."
+                  className={cn("min-w-0 flex-1 font-mono text-[12px]", pinError && invalidRing)}
+                  onChange={(e) => onPinText(e.target.value)}
+                />
+              )}
               <Button size="sm" disabled={!t.knownHostFingerprint} onClick={() => setTunnel({ ...t, knownHostFingerprint: null })}>
                 Forget
               </Button>

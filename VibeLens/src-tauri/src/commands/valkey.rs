@@ -73,10 +73,10 @@ pub async fn vk_command(
         && allow_write.unwrap_or(false)
         && !confirmed.unwrap_or(false)
     {
-        return Err(ErrorPayload {
-            code: "confirm_required".into(),
-            message: "Production write guard: confirm this write".into(),
-        });
+        return Err(ErrorPayload::new(
+            "confirm_required",
+            "Production write guard: confirm this write",
+        ));
     }
     let h = state.connections.valkey(&profile_id).await.map_err(err)?;
     h.command(db, argv, allow_write.unwrap_or(false))

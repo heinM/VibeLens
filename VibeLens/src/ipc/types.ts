@@ -39,8 +39,17 @@ export type TunnelConfig = {
   port: number;
   username: string;
   auth: SshAuth;
+  /** The pinned host key (`SHA256:<base64 without padding>`). Only this key is connected to; null until the user trusts or pastes one. */
   knownHostFingerprint: string | null;
 };
+
+/** The host key an SSH server presented when none was pinned for it. Nothing was sent to that server. */
+export interface PresentedHostKey {
+  host: string;
+  port: number;
+  /** `SHA256:<base64 without padding>`, what `ssh-keygen -lf` prints. */
+  fingerprint: string;
+}
 
 export type PgProxyMode = "blocking" | "nonBlocking" | "shunt";
 
@@ -246,12 +255,16 @@ export interface TestResult {
   serverVersion: string | null;
   latencyMs: number;
   message: string;
+  /** Set when the test stopped because the SSH host's key is not pinned. A test never stores it. */
+  hostKey: PresentedHostKey | null;
 }
 
 // ---------- errors ----------
 export interface ErrorPayload {
   code: string; // see CoreError::code(); plus "confirm_required" from the prod write-guard
   message: string;
+  /** With code "unknown_host_key": the key the server presented, for the trust dialog. */
+  hostKey?: PresentedHostKey | null;
 }
 
 // ---------- query ----------

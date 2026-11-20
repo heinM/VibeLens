@@ -21,7 +21,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
-use crate::model::ConnectionProfile;
+use crate::model::{ConnectionProfile, TunnelConfig, is_host_key_fingerprint};
 use crate::ports::ProfileStore;
 
 /// On-disk schema version written by this build.
@@ -32,6 +32,58 @@ struct ProfilesFile {
     version: u32,
     #[serde(default)]
     profiles: Vec<ConnectionProfile>,
+}
+
+/// Pins `fingerprint` as the SSH host key of the saved profile `profile_id`. This is the only
+/// place a pin is written on the user's behalf, and it is called only from the UI's "trust this
+/// key" action; connecting and testing never pin anything.
+///
+/// `host` and `port` are where the key was presented. The pin is written only when the saved
+/// tunnel still points at exactly that host and port (the same comparison `save_profile` makes
+/// when it carries a pin over) and has no pin yet. An existing, different pin is never
+/// replaced: removing one is the user's explicit Forget.
+pub fn trust_host_key(
+    store: &dyn ProfileStore,
+    profile_id: &str,
+    host: &str,
+    port: u16,
+    fingerprint: &str,
+) -> Result<ConnectionProfile> {
+    if !is_host_key_fingerprint(fingerprint) {
+        return Err(CoreError::Invalid(
+            "a host key fingerprint looks like SHA256: followed by 43 characters".into(),
+        ));
+    }
+    let mut profile = store.get(profile_id)?;
+    let Some(TunnelConfig::Ssh {
+        host: saved_host,
+        port: saved_port,
+        known_host_fingerprint,
+        ..
+    }) = profile.tunnel.as_mut()
+    else {
+        return Err(CoreError::Invalid(
+            "this connection has no SSH tunnel to pin a host key for".into(),
+        ));
+    };
+    if saved_host != host || *saved_port != port {
+        return Err(CoreError::Invalid(format!(
+            "that host key was presented by {host}:{port}, but this connection's SSH tunnel now \
+             points at {saved_host}:{saved_port}; connect again to see the right key"
+        )));
+    }
+    match known_host_fingerprint.as_deref().map(str::trim) {
+        Some(pinned) if pinned == fingerprint => return Ok(profile),
+        Some(pinned) if !pinned.is_empty() => {
+            return Err(CoreError::Invalid(format!(
+                "this connection already has a pinned host key ({pinned}); use Forget in its \
+                 SSH settings before trusting another"
+            )));
+        }
+        _ => {}
+    }
+    *known_host_fingerprint = Some(fingerprint.to_string());
+    store.upsert(profile)
 }
 
 /// [`ProfileStore`] backed by `profiles.json` in the app config directory.

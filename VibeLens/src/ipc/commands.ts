@@ -39,8 +39,16 @@ export const api = {
       s3SecretAccessKey: s3Keys?.secretAccessKey ?? null,
     }),
   deleteProfile: (id: string) => invoke<void>("delete_profile", { id }),
+  /** Never stores anything. An unpinned SSH host comes back as `ok: false` with `hostKey` set. */
   testConnection: (profile: T.ConnectionProfile, password?: string) =>
     invoke<T.TestResult>("test_connection", { profile, password: password ?? null }),
+  /**
+   * Pins the host key an SSH server presented, on the saved profile. Call it only from the user's
+   * "trust" action. Rust refuses when the profile's tunnel no longer points at that host and port,
+   * or already has a different pin.
+   */
+  trustHostKey: (profileId: string, key: T.PresentedHostKey) =>
+    invoke<T.ConnectionProfile>("trust_host_key", { profileId, host: key.host, port: key.port, fingerprint: key.fingerprint }),
 
   // import from other tools (no secrets are ever imported)
   importScan: () => invoke<T.ImportReport[]>("import_scan"),

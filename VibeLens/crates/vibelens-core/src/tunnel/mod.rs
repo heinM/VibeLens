@@ -2,11 +2,13 @@
 //!
 //! `russh` (pure-Rust, async) instead of `ssh2` (blocking libssh2 + vendored OpenSSL).
 //!
-//! **Host keys: TOFU.** If the profile carries a `known_host_fingerprint` it must equal
-//! `SHA256:<base64-nopad>` of the key the server presents, otherwise the connection fails with
-//! `CoreError::Tunnel("host key mismatch …")` before any credential is sent. If it is `None`, the
-//! key is accepted, and once authentication succeeds the fingerprint is reported through the
-//! [`FingerprintSink`] so the caller can pin it in the profile.
+//! **Host keys: pinned, never trusted silently.** The profile's `known_host_fingerprint` must
+//! equal `SHA256:<base64-nopad>` of the key the server presents, otherwise the connection fails
+//! with `CoreError::Tunnel("host key mismatch …")`. With no pin the connection stops at the same
+//! point with [`CoreError::UnknownHostKey`], which carries the fingerprint the server presented
+//! so the user can check it and pin it (`profiles::trust_host_key`). Either way the key
+//! exchange is rejected, so the server gets no authentication request: no user name, no key
+//! offer, no password. This module never writes a pin.
 //!
 //! **Auth:** ssh-agent (`SSH_AUTH_SOCK` on unix, the OpenSSH named pipe on Windows), a private key
 //! file (optional passphrase from the vault) or a password from the vault (with a
@@ -29,11 +31,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{CoreError, Result};
-use crate::model::{SshAuth, TunnelConfig, vault_keys};
+use crate::model::{PresentedHostKey, SshAuth, TunnelConfig, vault_keys};
 use crate::ports::{SecretVault, TunnelHandle, TunnelProvider};
-
-/// Callback used to persist a newly-learned host-key fingerprint back into the profile.
-pub type FingerprintSink = Arc<dyn Fn(&str, &str) -> Result<()> + Send + Sync>;
 
 /// Time allowed for TCP connect + SSH key exchange.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -50,16 +49,11 @@ const WINDOWS_AGENT_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
 
 pub struct SshTunnelProvider {
     vault: Arc<dyn SecretVault>,
-    on_new_fingerprint: FingerprintSink,
 }
 
 impl SshTunnelProvider {
-    /// `on_new_fingerprint(profile_id, "SHA256:...")` is called on first connect (TOFU).
-    pub fn new(vault: Arc<dyn SecretVault>, on_new_fingerprint: FingerprintSink) -> Arc<Self> {
-        Arc::new(Self {
-            vault,
-            on_new_fingerprint,
-        })
+    pub fn new(vault: Arc<dyn SecretVault>) -> Arc<Self> {
+        Arc::new(Self { vault })
     }
 }
 
@@ -76,7 +70,8 @@ fn fingerprint_of(key: &PublicKeyOrCertificate) -> String {
     }
 }
 
-/// Client-side event handler: pins/records the host key.
+/// Client-side event handler: accepts the pinned host key and no other, and records what the
+/// server presented.
 struct HostKeyHandler {
     pinned: Option<String>,
     /// Fingerprint the server presented, readable after the handshake (also after a rejection).
@@ -91,10 +86,9 @@ impl client::Handler for HostKeyHandler {
         server_public_key: &PublicKeyOrCertificate,
     ) -> std::result::Result<bool, Self::Error> {
         let fp = fingerprint_of(server_public_key);
-        let accept = match &self.pinned {
-            Some(pinned) => *pinned == fp,
-            None => true, // TOFU: caller records it after auth succeeds.
-        };
+        // No pin is a refusal too: the key exchange fails here, which ends the connection
+        // before the authentication protocol starts. `open` turns it into `UnknownHostKey`.
+        let accept = self.pinned.as_deref() == Some(fp.as_str());
         *self.seen.lock().unwrap_or_else(|p| p.into_inner()) = Some(fp);
         Ok(accept)
     }
@@ -142,7 +136,8 @@ impl TunnelProvider for SshTunnelProvider {
             ..Default::default()
         });
 
-        // 1. Connect + key exchange. The host key is checked here, before any credential is sent.
+        // 1. Connect + key exchange. The host key is checked here, and only a key equal to the
+        //    pin lets the exchange complete. Nothing below runs for an unpinned or changed key.
         let handler = HostKeyHandler {
             pinned: pinned.clone(),
             seen: seen.clone(),
@@ -195,21 +190,7 @@ impl TunnelProvider for SshTunnelProvider {
             Ok(Ok(())) => {}
         }
 
-        // 3. TOFU: remember the key now that the server has accepted our credentials.
-        if pinned.is_none() {
-            let presented = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
-            if let Some(fp) = presented {
-                if let Err(e) = (self.on_new_fingerprint)(profile_id, &fp) {
-                    // Not fatal: e.g. the profile hasn't been saved yet (wizard "Test"). The next
-                    // connect will simply trust-on-first-use again.
-                    tracing::warn!(profile_id, error = %e, "could not persist SSH host key fingerprint");
-                } else {
-                    tracing::info!(profile_id, fingerprint = %fp, "pinned SSH host key (trust on first use)");
-                }
-            }
-        }
-
-        // 4. Local listener + accept loop.
+        // 3. Local listener + accept loop.
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .map_err(|e| {
@@ -238,14 +219,22 @@ fn connect_error(
     pinned: Option<&str>,
     presented: Option<&str>,
 ) -> CoreError {
-    if let (Some(pinned), Some(presented)) = (pinned, presented)
-        && pinned != presented
-    {
-        return CoreError::Tunnel(format!(
-            "host key mismatch for {host}:{port}: expected {pinned} but the server presented {presented}. \
-             If the server was legitimately re-keyed, clear the saved host key fingerprint in the connection's SSH \
-             settings; otherwise this could be a man-in-the-middle attack"
-        ));
+    match (pinned, presented) {
+        (Some(pinned), Some(presented)) if pinned != presented => {
+            return CoreError::Tunnel(format!(
+                "host key mismatch for {host}:{port}: expected {pinned} but the server presented {presented}. \
+                 If the server was legitimately re-keyed, clear the saved host key fingerprint in the connection's SSH \
+                 settings; otherwise this could be a man-in-the-middle attack"
+            ));
+        }
+        (None, Some(presented)) => {
+            return CoreError::UnknownHostKey(PresentedHostKey {
+                host: host.to_string(),
+                port,
+                fingerprint: presented.to_string(),
+            });
+        }
+        _ => {}
     }
     match err {
         russh::Error::IO(io) => {
@@ -612,6 +601,67 @@ mod tests {
         assert!(msg.contains("host key mismatch"), "{msg}");
         assert!(msg.contains("SHA256:aaa") && msg.contains("SHA256:bbb"));
         assert_eq!(e.code(), "tunnel");
+    }
+
+    #[test]
+    fn conn_unpinned_host_is_reported_with_the_key_it_presented() {
+        let e = connect_error(
+            russh::Error::UnknownKey,
+            "bastion",
+            2222,
+            None,
+            Some("SHA256:bbb"),
+        );
+        assert_eq!(e.code(), "unknown_host_key");
+        match &e {
+            CoreError::UnknownHostKey(key) => assert_eq!(
+                (key.host.as_str(), key.port, key.fingerprint.as_str()),
+                ("bastion", 2222, "SHA256:bbb")
+            ),
+            other => panic!("{other:?}"),
+        }
+        let payload = crate::error::ErrorPayload::from(&e);
+        assert_eq!(payload.host_key.unwrap().fingerprint, "SHA256:bbb");
+        assert!(e.to_string().contains("bastion:2222") && e.to_string().contains("SHA256:bbb"));
+
+        // Before the server has presented a key there is nothing to trust: an ordinary failure.
+        let e = connect_error(russh::Error::Disconnect, "bastion", 22, None, None);
+        assert_eq!(e.code(), "tunnel");
+    }
+
+    #[tokio::test]
+    async fn conn_only_the_pinned_key_passes_the_host_key_check() {
+        use russh::client::Handler;
+        use russh::keys::PublicKey;
+        use russh::keys::ssh_key::public::{Ed25519PublicKey, KeyData};
+
+        // Any 32 bytes encode as an Ed25519 public key; the check only compares fingerprints.
+        let public = PublicKeyOrCertificate::PublicKey {
+            key: PublicKey::new(KeyData::Ed25519(Ed25519PublicKey([7; 32])), ""),
+            hash_alg: None,
+        };
+        let fp = fingerprint_of(&public);
+        assert!(crate::model::is_host_key_fingerprint(&fp), "{fp}");
+        for (pinned, accepted) in [
+            (Some(fp.clone()), true),
+            (None, false),
+            (
+                Some("SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()),
+                false,
+            ),
+        ] {
+            let seen = Arc::new(Mutex::new(None));
+            let mut h = HostKeyHandler {
+                pinned: pinned.clone(),
+                seen: seen.clone(),
+            };
+            assert_eq!(
+                h.check_server_key(&public).await.unwrap(),
+                accepted,
+                "{pinned:?}"
+            );
+            assert_eq!(seen.lock().unwrap().as_deref(), Some(fp.as_str()));
+        }
     }
 
     #[test]

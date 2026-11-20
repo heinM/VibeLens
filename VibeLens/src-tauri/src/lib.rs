@@ -56,6 +56,7 @@ pub fn run() {
             commands::profiles::save_profile,
             commands::profiles::delete_profile,
             commands::profiles::test_connection,
+            commands::profiles::trust_host_key,
             commands::profiles::profile_secret_status,
             commands::connections::connect,
             commands::connections::disconnect,

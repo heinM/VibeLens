@@ -179,9 +179,33 @@ pub enum TunnelConfig {
         port: u16,
         username: String,
         auth: SshAuth,
-        /// SHA256 host-key fingerprint pinned on first successful connect (TOFU). `None` until first connect.
+        /// The pinned host key, as `SHA256:<base64 without padding>`. Only this key is connected
+        /// to. `None` until the user has checked and trusted the key the server presents (or
+        /// pasted it); until then no connection gets as far as authentication.
         known_host_fingerprint: Option<String>,
     },
+}
+
+/// The host key an SSH server presented when no key was pinned for it. Nothing was sent to that
+/// server; the user decides whether this is the key to pin.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PresentedHostKey {
+    pub host: String,
+    pub port: u16,
+    /// `SHA256:<base64 without padding>`, what `ssh-keygen -lf` prints.
+    pub fingerprint: String,
+}
+
+/// Whether `s` has the shape of an OpenSSH SHA-256 key fingerprint: `SHA256:` followed by the
+/// 43 unpadded base64 characters of a 32-byte digest.
+pub fn is_host_key_fingerprint(s: &str) -> bool {
+    s.strip_prefix("SHA256:").is_some_and(|b64| {
+        b64.len() == 43
+            && b64
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+    })
 }
 
 /// How a capitec/pg-proxy (PGProxy) in front of the database is configured (its `PROXY_MODE`).
@@ -412,6 +436,9 @@ pub struct TestResult {
     pub server_version: Option<String>,
     pub latency_ms: u64,
     pub message: String,
+    /// Set when the test stopped because the SSH host's key is not pinned: the key the server
+    /// presented, for the user to check. A test never stores it.
+    pub host_key: Option<PresentedHostKey>,
 }
 
 /// Keychain entry names. Service name is always [`vault_keys::SERVICE`].

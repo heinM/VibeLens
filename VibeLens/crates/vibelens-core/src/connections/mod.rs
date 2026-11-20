@@ -389,6 +389,9 @@ impl ConnectionManager {
     ///
     /// Connection-level failures (unreachable, bad password, TLS, tunnel…) come back as
     /// `Ok(TestResult { ok: false, message })`; only invalid input is an `Err`.
+    ///
+    /// A test writes nothing: when the SSH host's key is not pinned it reports the key the
+    /// server presented in `host_key` and leaves pinning to the caller.
     pub async fn test(
         &self,
         profile: &ConnectionProfile,
@@ -432,6 +435,7 @@ impl ConnectionManager {
                 },
                 server_version: version,
                 latency_ms,
+                host_key: None,
             }),
             Err(e @ (CoreError::Invalid(_) | CoreError::Cancelled)) => Err(e),
             Err(e) => Ok(TestResult {
@@ -439,6 +443,10 @@ impl ConnectionManager {
                 server_version: None,
                 latency_ms,
                 message: e.to_string(),
+                host_key: match e {
+                    CoreError::UnknownHostKey(key) => Some(key),
+                    _ => None,
+                },
             }),
         }
     }
@@ -985,7 +993,8 @@ fn require_engine(profile: &ConnectionProfile, wanted: EngineKind) -> Result<()>
 
 /// Serialised form of everything that affects *how we connect*. Cached handles are reused only
 /// while this is unchanged. Cosmetic fields, the idle timeouts (the reaper reads the live
-/// profile) and the TOFU-pinned host key (written back by the tunnel itself) are excluded.
+/// profile) and the pinned SSH host key are excluded: a live tunnel was checked against the pin
+/// it was opened with, and the next one is checked against whatever is pinned then.
 fn connection_signature(profile: &ConnectionProfile) -> String {
     let mut p = profile.clone();
     p.name.clear();

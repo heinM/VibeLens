@@ -27,8 +27,9 @@ pub async fn save_profile(
     forget_host_key: Option<bool>,
 ) -> CmdResult<ConnectionProfile> {
     let mut profile = profile;
-    // The pin is written by the tunnel behind the UI's back, so a form opened before the first
-    // connect still says "not pinned". Only an explicit Forget may clear it.
+    // A pin can be stored (`trust_host_key`, from the connect dialog) while the form is open, so
+    // a form opened before that still says "not pinned". Only an explicit Forget may clear it.
+    // Same host-and-port comparison as `profiles::trust_host_key`: a pin belongs to one endpoint.
     if !forget_host_key.unwrap_or(false)
         && let Some(TunnelConfig::Ssh {
             host,
@@ -133,6 +134,28 @@ pub async fn test_connection(
 ) -> CmdResult<TestResult> {
     let pw = password.filter(|p| !p.is_empty()).map(SecretString::from);
     state.connections.test(&profile, pw).await.map_err(err)
+}
+
+/// Pins the host key an SSH server presented, after the user has checked it in the trust dialog.
+/// `host` and `port` say where it was presented; a profile whose tunnel points elsewhere by now,
+/// or that already has a different pin, is left alone. Nothing else in the app writes a pin:
+/// not connecting, not `test_connection`, and no agent tool.
+#[tauri::command]
+pub async fn trust_host_key(
+    state: State<'_, AppState>,
+    profile_id: String,
+    host: String,
+    port: u16,
+    fingerprint: String,
+) -> CmdResult<ConnectionProfile> {
+    vibelens_core::profiles::trust_host_key(
+        state.profiles.as_ref(),
+        &profile_id,
+        &host,
+        port,
+        &fingerprint,
+    )
+    .map_err(err)
 }
 
 #[derive(serde::Serialize)]

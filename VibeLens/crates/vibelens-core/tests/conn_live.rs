@@ -8,7 +8,6 @@
 mod conn_common;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -21,7 +20,7 @@ use vibelens_core::model::*;
 use vibelens_core::ports::{
     CredentialSource, ProfileStore, ToolBackend, TunnelHandle, TunnelProvider,
 };
-use vibelens_core::profiles::JsonProfileStore;
+use vibelens_core::profiles::{JsonProfileStore, trust_host_key};
 use vibelens_core::tunnel::SshTunnelProvider;
 use vibelens_core::vault::MemoryVault;
 use vibelens_core::workspace::WorkspaceFs;
@@ -540,41 +539,118 @@ fn ssh_profile(
     p
 }
 
+/// The sshd-backed tests share one port, so they take turns.
+static SSHD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The pin stored for a saved profile's SSH tunnel.
+fn stored_pin(store: &JsonProfileStore, id: &str) -> Option<String> {
+    match store.get(id).unwrap().tunnel {
+        Some(TunnelConfig::Ssh {
+            known_host_fingerprint,
+            ..
+        }) => known_host_fingerprint,
+        None => panic!("profile has no tunnel"),
+    }
+}
+
+/// Review finding M2. Pressing Test (while editing, the draft carries the saved profile's id)
+/// must leave the saved profile's pinned host key exactly as it was.
 #[tokio::test]
-async fn conn_valkey_over_a_real_ssh_tunnel_with_tofu_persistence_pinning_and_recovery() {
+async fn conn_test_never_writes_a_host_key_to_the_saved_profile() {
     let Some((host, port)) = valkey_target() else {
         eprintln!("VG_TEST_VALKEY not set; skipping");
         return;
     };
+    let _one_sshd = SSHD.lock().await;
     let Some(sshd) = Sshd::start() else { return };
 
-    // Exactly the wiring src-tauri/state.rs uses: TOFU writes the fingerprint back into the profile.
-    let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(JsonProfileStore::new(dir.path().to_path_buf()).unwrap());
-    let sink_calls = Arc::new(AtomicUsize::new(0));
-    let (sink_store, sink_count) = (store.clone(), sink_calls.clone());
-    let provider = SshTunnelProvider::new(
-        Arc::new(MemoryVault::new()),
-        Arc::new(move |profile_id: &str, fingerprint: &str| {
-            sink_count.fetch_add(1, Ordering::SeqCst);
-            let mut p = sink_store.get(profile_id)?;
-            if let Some(TunnelConfig::Ssh {
-                known_host_fingerprint,
-                ..
-            }) = p.tunnel.as_mut()
-            {
-                *known_host_fingerprint = Some(fingerprint.to_string());
-            }
-            sink_store.upsert(p).map(|_| ())
-        }),
-    );
+    // The wiring src-tauri/state.rs uses.
     let l = live(
         StaticCreds {
             username: None,
             password: None,
         },
-        provider,
-        Some((dir, store)),
+        SshTunnelProvider::new(Arc::new(MemoryVault::new())),
+        None,
+    );
+
+    // Saved without a pin; the form's draft is the same profile.
+    let saved = l
+        .profiles
+        .upsert(ssh_profile(&sshd, sshd.port(), &host, port, None))
+        .unwrap();
+    let r = l.mgr.test(&saved, None).await.unwrap();
+    assert_eq!(
+        stored_pin(&l.profiles, &saved.id),
+        None,
+        "Test pinned a host key on the saved profile"
+    );
+    // It reports the key the server presented instead, for the user to check.
+    assert!(!r.ok && r.server_version.is_none(), "{r:?}");
+    assert_eq!(
+        r.host_key,
+        Some(PresentedHostKey {
+            host: "127.0.0.1".into(),
+            port: sshd.port(),
+            fingerprint: sshd.host_fp(),
+        })
+    );
+    assert!(r.message.contains(&sshd.host_fp()), "{}", r.message);
+
+    // With that key on the draft (the wizard's "trust"), the test goes through, and still
+    // writes nothing.
+    let mut trusted = saved.clone();
+    if let Some(TunnelConfig::Ssh {
+        known_host_fingerprint,
+        ..
+    }) = trusted.tunnel.as_mut()
+    {
+        *known_host_fingerprint = r.host_key.map(|k| k.fingerprint);
+    }
+    let r = l.mgr.test(&trusted, None).await.unwrap();
+    assert!(r.ok && r.host_key.is_none(), "{r:?}");
+    assert_eq!(stored_pin(&l.profiles, &saved.id), None);
+
+    // Saved with a pin; the user pressed Forget (not yet saved) and then Test.
+    let mut pinned = saved.clone();
+    if let Some(TunnelConfig::Ssh {
+        known_host_fingerprint,
+        ..
+    }) = pinned.tunnel.as_mut()
+    {
+        *known_host_fingerprint = Some(sshd.other_fp());
+    }
+    let pinned = l.profiles.upsert(pinned).unwrap();
+    let r = l.mgr.test(&saved, None).await.unwrap();
+    assert!(!r.ok && r.host_key.is_some(), "{r:?}");
+    assert_eq!(
+        stored_pin(&l.profiles, &pinned.id),
+        Some(sshd.other_fp()),
+        "Test replaced the saved pin before Save"
+    );
+    assert!(
+        l.mgr.status().is_empty(),
+        "Test leaves no connection behind"
+    );
+}
+
+#[tokio::test]
+async fn conn_valkey_over_a_real_ssh_tunnel_with_explicit_trust_pinning_and_recovery() {
+    let Some((host, port)) = valkey_target() else {
+        eprintln!("VG_TEST_VALKEY not set; skipping");
+        return;
+    };
+    let _one_sshd = SSHD.lock().await;
+    let Some(sshd) = Sshd::start() else { return };
+
+    // The wiring src-tauri/state.rs uses: the tunnel provider can read secrets and nothing else.
+    let l = live(
+        StaticCreds {
+            username: None,
+            password: None,
+        },
+        SshTunnelProvider::new(Arc::new(MemoryVault::new())),
+        None,
     );
 
     // Bastion reached through a proxy we can "cut" later. The redis host is the *bastion-side* address.
@@ -584,26 +660,54 @@ async fn conn_valkey_over_a_real_ssh_tunnel_with_tofu_persistence_pinning_and_re
         .upsert(ssh_profile(&sshd, proxy.addr.port(), &host, port, None))
         .unwrap();
 
+    // No pin yet: connecting stops with the key the server presented, pins nothing, and the
+    // agent's tools (which connect lazily) fail the same way.
+    let err = l.mgr.connect(&p.id).await.expect_err("unknown host key");
+    let presented = match &err {
+        CoreError::UnknownHostKey(key) => key.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        presented,
+        PresentedHostKey {
+            host: "127.0.0.1".into(),
+            port: proxy.addr.port(),
+            fingerprint: sshd.host_fp(),
+        }
+    );
+    let status = l.mgr.status().into_iter().next().unwrap();
+    assert_eq!(status.state, ConnectionState::Error);
+    assert!(status.detail.unwrap().contains(&sshd.host_fp()));
+    let err = l
+        .backend
+        .valkey_command(&p.id, 0, argv(&["PING"]), false)
+        .await
+        .expect_err("the agent cannot connect either");
+    assert_eq!(err.code(), "unknown_host_key");
+    assert_eq!(
+        stored_pin(&l.profiles, &p.id),
+        None,
+        "connecting never pins"
+    );
+
+    // The user's explicit trust is the only thing that pins.
+    trust_host_key(
+        &*l.profiles,
+        &p.id,
+        &presented.host,
+        presented.port,
+        &presented.fingerprint,
+    )
+    .unwrap();
+    assert_eq!(stored_pin(&l.profiles, &p.id), Some(sshd.host_fp()));
+
     let st = l.mgr.connect(&p.id).await.expect("connect over ssh");
     assert!(
         st.tunneled && st.state == ConnectionState::Connected,
         "{st:?}"
     );
-    // The TOFU fingerprint was persisted through the sink into the real profile store.
-    let stored = l.profiles.get(&p.id).unwrap();
-    match stored.tunnel.as_ref().unwrap() {
-        TunnelConfig::Ssh {
-            known_host_fingerprint,
-            ..
-        } => assert_eq!(
-            known_host_fingerprint.as_deref(),
-            Some(sshd.host_fp().as_str())
-        ),
-    }
-    assert_eq!(sink_calls.load(Ordering::SeqCst), 1);
 
-    // Traffic really flows through the tunnel, and the sink-triggered profile update did not
-    // invalidate the connection we just made.
+    // Traffic really flows through the tunnel.
     let first = l.mgr.valkey(&p.id).await.unwrap();
     assert!(Arc::ptr_eq(&first, &l.mgr.valkey(&p.id).await.unwrap()));
     let pong = l
@@ -614,7 +718,7 @@ async fn conn_valkey_over_a_real_ssh_tunnel_with_tofu_persistence_pinning_and_re
     assert!(matches!(pong, CommandOutcome::Ok { .. }), "{pong:?}");
 
     // Network blip: the SSH session dies, the tunnel handle notices, the next use reconnects
-    // (second connect is pinned, so no further TOFU).
+    // against the pinned key.
     proxy.cut_connections();
     tokio::time::sleep(Duration::from_millis(2500)).await;
     let second = l
@@ -629,11 +733,6 @@ async fn conn_valkey_over_a_real_ssh_tunnel_with_tofu_persistence_pinning_and_re
         .await
         .unwrap();
     assert!(matches!(pong, CommandOutcome::Ok { .. }));
-    assert_eq!(
-        sink_calls.load(Ordering::SeqCst),
-        1,
-        "pinned after the first connect"
-    );
 
     // A changed host key is refused and surfaced as the profile's error status.
     l.mgr.disconnect(&p.id).await.unwrap();

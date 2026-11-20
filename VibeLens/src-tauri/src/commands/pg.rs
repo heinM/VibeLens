@@ -82,10 +82,10 @@ pub async fn pg_execute(
         && !confirmed.unwrap_or(false)
         && let Some(reason) = prod_guard_reason(&sql, opts.read_only)
     {
-        return Err(ErrorPayload {
-            code: "confirm_required".into(),
-            message: format!("Production write guard: {reason}"),
-        });
+        return Err(ErrorPayload::new(
+            "confirm_required",
+            format!("Production write guard: {reason}"),
+        ));
     }
 
     let handle = state

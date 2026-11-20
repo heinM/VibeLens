@@ -1,5 +1,6 @@
 import type { AwsTarget, ConnectionProfile, IcebergOptions } from "../../ipc/types";
 import { REGION_RE, SECRET_ARN_RE, awsTargetError } from "./awsHelpers";
+import { isHostKeyFingerprint } from "./hostKey";
 import { S3_TABLES_ARN_RE, headerRowError, headerRows, httpUrlError, isAwsCatalog, isS3Url, sqlFlavour } from "./icebergForm";
 
 export type SectionId = "general" | "auth" | "network" | "tls" | "ai" | "advanced" | "catalog" | "storage" | "queryEngine";
@@ -159,6 +160,8 @@ export function validateProfile(p: ConnectionProfile, others: ConnectionProfile[
     if (!intIn(t.port, 1, 65535)) e["tunnel.port"] = "Port must be 1-65535.";
     if (!t.username.trim()) e["tunnel.username"] = "SSH username is required.";
     if (t.auth.kind === "privateKey" && !t.auth.path.trim()) e["tunnel.keyPath"] = "Path to the private key file is required.";
+    if (t.knownHostFingerprint != null && !isHostKeyFingerprint(t.knownHostFingerprint))
+      e["tunnel.knownHostFingerprint"] = "A host key fingerprint looks like SHA256: followed by 43 characters.";
   }
 
   if (p.tls.mode !== "disable" && p.tls.caCertPath && /^\s*$/.test(p.tls.caCertPath)) e["tls.caCertPath"] = "Path is blank.";

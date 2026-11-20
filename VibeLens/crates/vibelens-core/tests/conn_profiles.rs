@@ -9,7 +9,7 @@ use tempfile::tempdir;
 use vibelens_core::error::CoreError;
 use vibelens_core::model::*;
 use vibelens_core::ports::ProfileStore;
-use vibelens_core::profiles::JsonProfileStore;
+use vibelens_core::profiles::{JsonProfileStore, trust_host_key};
 
 fn store(dir: &std::path::Path) -> JsonProfileStore {
     JsonProfileStore::new(dir.to_path_buf()).unwrap()
@@ -313,4 +313,138 @@ fn conn_concurrent_upserts_keep_every_profile() {
     }
     assert_eq!(s.list().unwrap().len(), 8);
     assert_eq!(store(dir.path()).list().unwrap().len(), 8);
+}
+
+// ---- Pinning an SSH host key (review finding M2) -------------------------------------------
+
+const FP_A: &str = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const FP_B: &str = "SHA256:n0Tar3alK3yButTheRightShape0123456789+/abcd";
+
+fn tunneled(name: &str, host: &str, port: u16, pin: Option<&str>) -> ConnectionProfile {
+    ConnectionProfile {
+        tunnel: Some(TunnelConfig::Ssh {
+            host: host.into(),
+            port,
+            username: "ops".into(),
+            auth: SshAuth::Agent,
+            known_host_fingerprint: pin.map(String::from),
+        }),
+        ..pg_profile(name)
+    }
+}
+
+fn pin_of(s: &JsonProfileStore, id: &str) -> Option<String> {
+    match s.get(id).unwrap().tunnel {
+        Some(TunnelConfig::Ssh {
+            known_host_fingerprint,
+            ..
+        }) => known_host_fingerprint,
+        None => None,
+    }
+}
+
+#[test]
+fn conn_trusting_a_host_key_pins_it_on_the_matching_unpinned_tunnel() {
+    let dir = tempdir().unwrap();
+    let s = store(dir.path());
+    let p = s
+        .upsert(tunneled("a", "bastion.example", 22, None))
+        .unwrap();
+    let saved = trust_host_key(&s, &p.id, "bastion.example", 22, FP_A).unwrap();
+    assert_eq!(pin_of(&s, &p.id).as_deref(), Some(FP_A));
+    assert_eq!(saved, s.get(&p.id).unwrap());
+    // Everything else about the profile is untouched.
+    assert_eq!(
+        ConnectionProfile {
+            tunnel: p.tunnel.clone(),
+            updated_at: p.updated_at,
+            ..saved
+        },
+        p
+    );
+    // Trusting the same key again is harmless.
+    trust_host_key(&s, &p.id, "bastion.example", 22, FP_A).unwrap();
+    assert_eq!(pin_of(&s, &p.id).as_deref(), Some(FP_A));
+    // A blank stored pin counts as no pin.
+    let q = s
+        .upsert(tunneled("b", "bastion.example", 22, Some("  ")))
+        .unwrap();
+    trust_host_key(&s, &q.id, "bastion.example", 22, FP_B).unwrap();
+    assert_eq!(pin_of(&s, &q.id).as_deref(), Some(FP_B));
+}
+
+/// The key was presented by one host and port. If the saved profile points somewhere else by
+/// now (the user edited the form, or the answer arrives late), it is not that host's key.
+#[test]
+fn conn_a_host_key_is_not_pinned_on_a_tunnel_with_another_host_or_port() {
+    let dir = tempdir().unwrap();
+    let s = store(dir.path());
+    let p = s
+        .upsert(tunneled("a", "bastion.example", 22, None))
+        .unwrap();
+    for (host, port) in [
+        ("other.example", 22),
+        ("bastion.example", 2222),
+        ("BASTION.example", 22),
+        ("", 22),
+    ] {
+        let e = trust_host_key(&s, &p.id, host, port, FP_A)
+            .expect_err("a key from another host or port must not be pinned");
+        assert!(matches!(e, CoreError::Invalid(_)), "{host}:{port}: {e:?}");
+        assert_eq!(pin_of(&s, &p.id), None, "{host}:{port}");
+    }
+    assert_eq!(s.get(&p.id).unwrap(), p, "nothing was written");
+}
+
+/// An existing pin is only ever removed by the user's Forget. Trusting never replaces one.
+#[test]
+fn conn_a_host_key_never_replaces_a_different_pin() {
+    let dir = tempdir().unwrap();
+    let s = store(dir.path());
+    let p = s
+        .upsert(tunneled("a", "bastion.example", 22, Some(FP_A)))
+        .unwrap();
+    let e = trust_host_key(&s, &p.id, "bastion.example", 22, FP_B)
+        .expect_err("a pinned profile keeps its pin");
+    assert!(matches!(e, CoreError::Invalid(_)), "{e:?}");
+    assert_eq!(pin_of(&s, &p.id).as_deref(), Some(FP_A));
+    assert_eq!(s.get(&p.id).unwrap(), p, "nothing was written");
+}
+
+#[test]
+fn conn_trusting_a_host_key_needs_a_saved_tunnel_and_a_real_fingerprint() {
+    let dir = tempdir().unwrap();
+    let s = store(dir.path());
+    assert!(matches!(
+        trust_host_key(&s, "missing", "bastion.example", 22, FP_A),
+        Err(CoreError::NotFound(_))
+    ));
+    let direct = s.upsert(pg_profile("no tunnel")).unwrap();
+    assert!(matches!(
+        trust_host_key(&s, &direct.id, "bastion.example", 22, FP_A),
+        Err(CoreError::Invalid(_))
+    ));
+    assert_eq!(s.get(&direct.id).unwrap(), direct);
+
+    let p = s
+        .upsert(tunneled("a", "bastion.example", 22, None))
+        .unwrap();
+    for bad in [
+        "",
+        "garbage",
+        "MD5:aa:bb:cc",
+        "SHA256:tooshort",
+        "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        " SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    ] {
+        assert!(
+            matches!(
+                trust_host_key(&s, &p.id, "bastion.example", 22, bad),
+                Err(CoreError::Invalid(_))
+            ),
+            "{bad:?}"
+        );
+        assert_eq!(pin_of(&s, &p.id), None, "{bad:?}");
+    }
+    assert!(is_host_key_fingerprint(FP_A) && is_host_key_fingerprint(FP_B));
 }

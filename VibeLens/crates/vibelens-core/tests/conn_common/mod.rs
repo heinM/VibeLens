@@ -126,6 +126,11 @@ impl Sshd {
             known_host_fingerprint: pinned,
         }
     }
+    /// [`cfg`](Self::cfg) with this sshd's own host key pinned, which is what a connection
+    /// needs to get as far as authentication.
+    pub fn trusted(&self, auth: SshAuth) -> TunnelConfig {
+        self.cfg(auth, Some(self.host_fp()))
+    }
     pub fn key_auth(&self) -> SshAuth {
         SshAuth::PrivateKey {
             path: self.get("CLIENT_KEY").to_string(),

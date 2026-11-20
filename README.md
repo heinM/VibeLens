@@ -152,7 +152,7 @@ agent › Written. Review it in the new tab; it batches the backfill in 10k-row 
 | SSO access token | `~/.aws/sso/cache/*.json`, **plaintext, exactly like the AWS CLI** |
 | Connection profiles | `profiles.json` in the app config dir. No secrets, by type. |
 
-Also: a strict CSP, Tauri capabilities limited to `core:default` (plus opening `https://` links), TLS verify-full by default (with the RDS CA bundle), and TOFU SSH host-key pinning.
+Also: a strict CSP, Tauri capabilities limited to `core:default` (plus opening `https://` links), TLS verify-full by default (with the RDS CA bundle), and pinned SSH host keys: a key is never trusted silently, and no credential is sent to a host whose key you have not checked.
 
 **Prompt injection, honestly.** Tool output is fed back to the model framed as untrusted data, and a write needs your approval. But `READ ONLY` is not a sandbox: functions such as `dblink`, `pg_read_file`, `lo_export`, `pg_terminate_backend` and session-level advisory locks still work inside a read-only transaction. VibeLens routes any SELECT that calls a known side-effecting function to approval, and classification **fails closed**: anything it can't positively prove read-only goes to approval. That list is still a denylist. A least-privilege role is what actually contains a determined injection (see below).
 
@@ -279,7 +279,7 @@ The local engine reads the files with **your** credentials, so Lake Formation co
 <details>
 <summary><b>Private VPC via SSH bastion</b></summary>
 
-**Network → SSH tunnel**: bastion host, user, and ssh-agent, key file or password. On first connect the host key fingerprint is pinned; a later mismatch is refused. VibeLens forwards a random local port and still verifies TLS against the real database hostname.
+**Network → SSH tunnel**: bastion host, user, and ssh-agent, key file or password. The first time you connect or test, VibeLens shows the host key fingerprint and sends nothing to the server (no user name, key or password) until you have checked it and chosen to trust it. You can also paste the fingerprint into the connection up front. A later mismatch is refused. VibeLens forwards a random local port and still verifies TLS against the real database hostname.
 </details>
 
 ---

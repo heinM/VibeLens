@@ -32,6 +32,11 @@ pub(super) fn model_error_text(
 ) -> String {
     match e {
         CoreError::Tunnel(_) => "connection failed: tunnel error".into(),
+        // Trusting a host key is the user's decision, made in the app. The model gets no
+        // fingerprint to repeat back and has no tool that could pin one.
+        CoreError::UnknownHostKey(_) => {
+            "connection failed: the SSH host key of this connection has not been trusted yet; ask the user to connect to it in the app and check the key".into()
+        }
         CoreError::Auth(_) => {
             "authentication failed; ask the user to check this connection's credentials".into()
         }
@@ -391,6 +396,21 @@ mod tests {
             false,
         );
         assert_eq!(t, "connection failed: tunnel error");
+        // An unpinned SSH host: the model learns that the user has to act, and gets neither the
+        // host nor a fingerprint to repeat.
+        let t = text(
+            CoreError::UnknownHostKey(crate::model::PresentedHostKey {
+                host: "bastion.corp.example.com".into(),
+                port: 22,
+                fingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            }),
+            false,
+        );
+        assert!(
+            t.contains("has not been trusted yet") && t.contains("ask the user"),
+            "{t}"
+        );
+        assert!(!t.contains("bastion") && !t.contains("SHA256"), "{t}");
         let t = text(
             CoreError::Auth("rejected the offered key for user \"deploy\"".into()),
             false,

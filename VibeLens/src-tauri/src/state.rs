@@ -7,7 +7,6 @@ use vibelens_core::Result;
 use vibelens_core::agent::AgentService;
 use vibelens_core::aws::{AppCredentialSource, AwsService};
 use vibelens_core::connections::{AppToolBackend, ConnectionManager};
-use vibelens_core::model::TunnelConfig;
 use vibelens_core::ports::{ProfileStore, SecretVault};
 use vibelens_core::profiles::JsonProfileStore;
 use vibelens_core::tunnel::SshTunnelProvider;
@@ -44,22 +43,9 @@ impl AppState {
         let aws = AwsService::new();
         let creds = AppCredentialSource::new(aws.clone(), vault.clone());
 
-        // TOFU: persist a newly learned SSH host-key fingerprint into the profile.
-        let fp_profiles = profiles.clone();
-        let tunnels = SshTunnelProvider::new(
-            vault.clone(),
-            Arc::new(move |profile_id: &str, fingerprint: &str| {
-                let mut p = fp_profiles.get(profile_id)?;
-                if let Some(TunnelConfig::Ssh {
-                    known_host_fingerprint,
-                    ..
-                }) = p.tunnel.as_mut()
-                {
-                    *known_host_fingerprint = Some(fingerprint.to_string());
-                }
-                fp_profiles.upsert(p).map(|_| ())
-            }),
-        );
+        // The tunnel provider reads SSH secrets and never writes a profile: a host key is pinned
+        // only by the `trust_host_key` command, which the user triggers from a dialog.
+        let tunnels = SshTunnelProvider::new(vault.clone());
 
         let connections = ConnectionManager::new(profiles.clone(), creds, tunnels);
         connections.set_iceberg_deps(vibelens_core::iceberg::IcebergDeps {
