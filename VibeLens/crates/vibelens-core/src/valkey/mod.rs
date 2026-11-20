@@ -51,7 +51,7 @@ mod transport;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use redis::cluster_routing::SingleNodeRoutingInfo;
 use redis::{Cmd, Value, cmd, pipe};
@@ -78,12 +78,48 @@ pub struct ValkeyConnectParams {
 /// Default number of logical databases when `CONFIG GET databases` is not available.
 const DEFAULT_DB_COUNT: usize = 16;
 
+/// How long a refusal of `COMMAND INFO` is believed before the server is asked again. Until
+/// then the static table decides, which errs on the side of "this writes".
+const COMMAND_INFO_RETRY_AFTER: Duration = Duration::from_secs(60);
+
 #[derive(Default)]
 struct MetaCache {
     /// `name` or `name|sub` (lowercase) → what `COMMAND INFO` said (`None` = unknown command).
     commands: HashMap<String, Option<CommandMeta>>,
-    /// `COMMAND INFO` itself is refused or missing; use the static table.
-    unavailable: bool,
+    /// `COMMAND INFO` itself was refused or is missing; use the static table.
+    unavailable: Option<Refused>,
+}
+
+/// When `COMMAND INFO` was refused, and how many connections the session had built by then.
+#[derive(Clone, Copy)]
+struct Refused {
+    at: Instant,
+    connections: u64,
+}
+
+impl MetaCache {
+    /// Whether to go on believing that `COMMAND INFO` is refused. Not for the life of the
+    /// handle: the server also refuses for reasons that pass (it is loading its data, a script
+    /// is running, the user's ACL has since been changed). The refusal is dropped once the
+    /// session has built a new connection, or after [`COMMAND_INFO_RETRY_AFTER`], and the next
+    /// lookup asks the server again.
+    fn command_info_refused(&mut self, now: Instant, connections: u64) -> bool {
+        let still = self.unavailable.is_some_and(|r| {
+            r.connections == connections
+                && now.saturating_duration_since(r.at) < COMMAND_INFO_RETRY_AFTER
+        });
+        if !still {
+            self.unavailable = None;
+        }
+        still
+    }
+
+    fn refuse_command_info(&mut self, now: Instant, connections: u64) {
+        self.unavailable = Some(Refused {
+            at: now,
+            connections,
+        });
+    }
 }
 
 enum Lookup {
@@ -286,8 +322,8 @@ impl ValkeyHandle {
 
     async fn lookup_meta(&self, key: &str) -> Result<Lookup> {
         {
-            let cache = self.meta.lock().unwrap_or_else(|e| e.into_inner());
-            if cache.unavailable {
+            let mut cache = self.meta.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.command_info_refused(Instant::now(), self.session.connections_made()) {
                 return Ok(Lookup::Unavailable);
             }
             if let Some(found) = cache.commands.get(key) {
@@ -307,9 +343,10 @@ impl ValkeyHandle {
                 Ok(Lookup::Found(meta))
             }
             // The server answered with an error (unknown command, NOPERM): COMMAND INFO is not
-            // usable here. Connection-level failures are not cached; they propagate.
+            // usable here, for now (see `MetaCache::command_info_refused`). Connection-level
+            // failures are not cached; they propagate.
             Err(CoreError::Valkey(_)) => {
-                cache.unavailable = true;
+                cache.refuse_command_info(Instant::now(), self.session.connections_made());
                 Ok(Lookup::Unavailable)
             }
             Err(e) => Err(e),
@@ -554,6 +591,49 @@ fn parse_primaries(reply: &Value, fallback_host: &str) -> Result<Vec<(String, u1
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// A refusal of `COMMAND INFO` used to be believed for the life of the connection handle.
+    /// The server also refuses for reasons that pass (it is still loading its data, a script is
+    /// running, the ACL has since been changed), and from then on every command that is not on
+    /// the built-in read-only list counted as a write.
+    #[test]
+    fn a_refusal_of_command_info_is_believed_for_a_while_and_then_checked_again() {
+        let mut cache = MetaCache::default();
+        let t0 = Instant::now();
+        assert!(!cache.command_info_refused(t0, 2), "nothing refused yet");
+
+        cache.refuse_command_info(t0, 2);
+        assert!(cache.command_info_refused(t0, 2));
+        let almost = t0 + COMMAND_INFO_RETRY_AFTER - Duration::from_millis(1);
+        assert!(
+            cache.command_info_refused(almost, 2),
+            "within the delay the static table decides, without asking the server every time"
+        );
+        assert!(
+            !cache.command_info_refused(t0 + COMMAND_INFO_RETRY_AFTER, 2),
+            "after the delay the server is asked again"
+        );
+        // Asking again and being refused again starts a new delay.
+        let t1 = t0 + COMMAND_INFO_RETRY_AFTER;
+        cache.refuse_command_info(t1, 2);
+        assert!(cache.command_info_refused(t1 + Duration::from_secs(1), 2));
+    }
+
+    #[test]
+    fn a_refusal_of_command_info_does_not_outlive_the_connection_it_came_from() {
+        let mut cache = MetaCache::default();
+        let t0 = Instant::now();
+        cache.refuse_command_info(t0, 2);
+        assert!(cache.command_info_refused(t0, 2));
+        assert!(
+            !cache.command_info_refused(t0, 3),
+            "the session has built a new connection since: ask again"
+        );
+        assert!(
+            !cache.command_info_refused(t0, 3),
+            "and the old refusal is forgotten, not merely skipped once"
+        );
+    }
 
     fn bulk(s: &str) -> Value {
         Value::BulkString(s.as_bytes().to_vec())

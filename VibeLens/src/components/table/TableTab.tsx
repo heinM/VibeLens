@@ -116,6 +116,8 @@ function TableBrowser({ tab, profileId, schema, name }: { tab: WorkspaceTab; pro
     schema,
     name,
     columns,
+    kind: desc?.kind ?? null,
+    estimatedRows: desc?.estimatedRows ?? null,
     filters: applied.rows,
     rawWhere: applied.raw,
     sort,
@@ -743,6 +745,7 @@ function TableBrowser({ tab, profileId, schema, name }: { tab: WorkspaceTab; pro
         filtered={data.whereActive}
         countStatus={data.countStatus}
         keyset={data.keyset}
+        stableOrder={data.stableOrder}
         elapsedMs={data.elapsedMs}
         onFirst={data.first}
         onPrev={data.prev}

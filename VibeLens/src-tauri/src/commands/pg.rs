@@ -1,7 +1,6 @@
 use tauri::State;
 use tauri::ipc::Channel;
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use vibelens_core::model::*;
 use vibelens_core::sql::{StatementClass, classify};
 use vibelens_core::{CoreError, ErrorPayload};
@@ -93,13 +92,8 @@ pub async fn pg_execute(
         .pg(&profile_id, database.as_deref())
         .await
         .map_err(err)?;
-    let query_id = uuid::Uuid::new_v4().to_string();
-    let cancel = CancellationToken::new();
-    state
-        .running_queries
-        .lock()
-        .unwrap()
-        .insert(query_id.clone(), cancel.clone());
+    let run = state.running_queries.start();
+    let (query_id, cancel) = (run.id.clone(), run.cancel.clone());
 
     let (tx, mut rx) = mpsc::channel::<QueryEvent>(16);
     tauri::async_runtime::spawn(async move {
@@ -113,6 +107,8 @@ pub async fn pg_execute(
     let qid = query_id.clone();
     let tx_err = tx.clone();
     tauri::async_runtime::spawn(async move {
+        // Registered for as long as this task runs: the entry goes when the statement ends.
+        let _run = run;
         if let Err(e) = handle
             .execute_stream(qid.clone(), &sql, opts, cancel, tx)
             .await
@@ -144,12 +140,11 @@ pub(crate) fn prod_guard_reason(sql: &str, read_only: bool) -> Option<String> {
 
 #[tauri::command]
 pub async fn pg_cancel(state: State<'_, AppState>, query_id: String) -> CmdResult<()> {
-    match state.running_queries.lock().unwrap().remove(&query_id) {
-        Some(tok) => {
-            tok.cancel();
-            Ok(())
-        }
-        None => Err(CoreError::NotFound(format!("query {query_id}")).into()),
+    // Not found: no such run, or it has already ended or been cancelled.
+    if state.running_queries.cancel(&query_id) {
+        Ok(())
+    } else {
+        Err(CoreError::NotFound(format!("query {query_id}")).into())
     }
 }
 

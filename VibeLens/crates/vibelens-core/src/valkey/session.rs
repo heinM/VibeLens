@@ -114,6 +114,13 @@ impl Session {
         self.params.options.cluster
     }
 
+    /// How many connections this session has built so far. It grows whenever a connection is
+    /// rebuilt after a drop or an authentication error (and when another database is first
+    /// used), so a change means "the server may see us differently now".
+    pub fn connections_made(&self) -> u64 {
+        self.next_generation.load(Ordering::Relaxed)
+    }
+
     /// Seconds since the last call that used the connection.
     pub fn idle_secs(&self) -> u64 {
         let now = self.started.elapsed().as_millis() as u64;

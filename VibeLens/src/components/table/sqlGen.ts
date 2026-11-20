@@ -11,7 +11,7 @@
 //  * Numeric-typed values must look numeric before they are emitted (digits only inside the quotes).
 //  * The only free-form SQL is the user's "raw WHERE" text, which `validateRawWhere` fences in (no `;`,
 //    balanced quotes / parentheses / comments) and which is only ever used in read-only SELECTs.
-import type { Cell } from "../../ipc/types";
+import type { Cell, ObjectKind } from "../../ipc/types";
 import { findTruncated, formatBytes, hasInexactNumber, isBytesCell, isTruncatedCell, NUMERIC_STRING, type BytesCell } from "../grid/cellFormat";
 
 export class SqlGenError extends Error {
@@ -623,6 +623,76 @@ export interface SelectPageOptions {
   offset?: number;
   /** Keyset continuation: rows after these key values. */
   after?: { keys: readonly KeysetKey[]; values: readonly Cell[] } | null;
+}
+
+/** What the page plan needs to know about a column. */
+export interface PlanColumn {
+  name: string;
+  dataType: string;
+  nullable: boolean;
+  isPrimaryKey: boolean;
+}
+
+export interface PagePlan {
+  orderBy: SortKey[];
+  /** Page by the ordering key (primary key present, every ordering column NOT NULL) instead of OFFSET. */
+  keyset: boolean;
+  keys: KeysetKey[];
+  /** Index of each ordering column in `names` (the cursor values of a row). */
+  keyIdx: number[];
+  names: string[];
+  /** False when nothing fixes the order of rows, so that pages can overlap or miss rows. */
+  stableOrder: boolean;
+}
+
+/**
+ * Above this many rows (the catalog's estimate) a table with no primary key and no sort is not
+ * ordered by `ctid`. Postgres cannot read a table in `ctid` order without scanning all of it, for
+ * every page: measured on Postgres 17, the first page of a 3-million-row table took 94 ms ordered
+ * against 0.04 ms unordered, and the cost grows with the table. Below the limit that is cheap.
+ */
+export const CTID_ORDER_MAX_ROWS = 250_000;
+
+/**
+ * How a table page is ordered and paged.
+ *
+ * The user's sort comes first. Then something has to break ties, or `LIMIT n OFFSET m` can hand
+ * out one row on two pages and never show another:
+ * - the primary key, when there is one (and paging goes by key if every ordering column is
+ *   NOT NULL);
+ * - otherwise the row's physical position, `ctid`, for relations that have one: tables and
+ *   materialized views, and partitioned tables together with `tableoid`, because `ctid` starts
+ *   again in each partition. That order holds as long as the rows are not rewritten.
+ *
+ * A view or a foreign table has no `ctid`. A table that is large, or whose size is not known,
+ * gets the `ctid` tie-break only behind a sort (see {@link CTID_ORDER_MAX_ROWS}). In both cases
+ * `stableOrder` is false and the UI says so.
+ */
+export function planTablePage(columns: readonly PlanColumn[], sort: readonly SortKey[], relation: { kind: ObjectKind | null; estimatedRows: number | null }): PagePlan {
+  const pk = columns.filter((c) => c.isPrimaryKey);
+  const known = new Set(columns.map((c) => c.name));
+  const userSort = sort.filter((s) => known.has(s.column));
+  const orderBy: SortKey[] = [...userSort];
+  for (const c of pk) if (!orderBy.some((k) => k.column === c.name)) orderBy.push({ column: c.name, dir: "asc" });
+
+  let stableOrder = pk.length > 0;
+  if (!stableOrder) {
+    const physical = relation.kind === "partitionedTable" ? ["tableoid", "ctid"] : relation.kind === "table" || relation.kind === "materializedView" ? ["ctid"] : null;
+    // No estimate, or zero, tells nothing about the size: the table was never analysed (zero is
+    // what Postgres 13 and older report then) or it was empty when it last was.
+    const rows = relation.estimatedRows;
+    const cheap = userSort.length > 0 || (rows !== null && rows > 0 && rows <= CTID_ORDER_MAX_ROWS);
+    if (physical && cheap) {
+      for (const column of physical) orderBy.push({ column, dir: "asc" });
+      stableOrder = true;
+    }
+  }
+
+  const byName = new Map(columns.map((c) => [c.name, c]));
+  const keyset = pk.length > 0 && orderBy.every((k) => byName.get(k.column)?.nullable === false);
+  const keys: KeysetKey[] = orderBy.map((k) => ({ column: k.column, dataType: byName.get(k.column)?.dataType ?? "text", dir: k.dir }));
+  const keyIdx = orderBy.map((k) => columns.findIndex((c) => c.name === k.column));
+  return { orderBy, keyset, keys, keyIdx, names: columns.map((c) => c.name), stableOrder };
 }
 
 export function buildSelectPage(o: SelectPageOptions): string {

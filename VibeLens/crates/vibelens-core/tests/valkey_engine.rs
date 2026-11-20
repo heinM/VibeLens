@@ -933,6 +933,91 @@ async fn cluster_options_reject_nonzero_db_without_a_cluster() {
     assert!(r.is_err(), "a standalone server is not a cluster");
 }
 
+/// A refusal of `COMMAND INFO` used to be remembered for as long as the handle lived. Here the
+/// user is allowed `COMMAND` after the first refusal; once the connection has been rebuilt the
+/// server is asked again and its answer is used.
+#[tokio::test]
+async fn command_info_is_asked_again_after_the_connection_is_rebuilt() {
+    let (_g, env, h) = fixture!();
+    let user = "vgtest_latecommand";
+    run(
+        &h,
+        DB_A,
+        &[
+            "ACL",
+            "SETUSER",
+            user,
+            "on",
+            ">pw-for-test",
+            "+@all",
+            "-command",
+            "~*",
+            "&*",
+        ],
+    )
+    .await;
+    let creds: CredentialFn = Arc::new(move || {
+        async move {
+            Ok(ResolvedCredentials {
+                username: Some(user.into()),
+                password: Some(SecretString::from("pw-for-test".to_owned())),
+                ..ResolvedCredentials::anonymous()
+            })
+        }
+        .boxed()
+    });
+    let restricted = ValkeyHandle::connect(env.params(), creds)
+        .await
+        .expect("ACL user can connect");
+    let reason_for_set = || {
+        let r = restricted.clone();
+        async move {
+            match r.command(DB_A, argv(&["SET", "k", "v"]), false).await {
+                Ok(CommandOutcome::RequiresConfirmation { reason }) => reason,
+                other => panic!("{other:?}"),
+            }
+        }
+    };
+    // BITFIELD_RO only reads, and it is not on the built-in list: only the server can say so.
+    let unlisted_read = argv(&["BITFIELD_RO", "k", "GET", "u8", "0"]);
+
+    let before = reason_for_set().await;
+    assert!(before.contains("COMMAND INFO is unavailable"), "{before}");
+    assert!(
+        restricted.is_write_command(&unlisted_read).await.unwrap(),
+        "without COMMAND INFO an unlisted command counts as a write"
+    );
+
+    // The administrator allows COMMAND, and the user's connection is dropped.
+    run(&h, DB_A, &["ACL", "SETUSER", user, "+command"]).await;
+    let mut raw = env.raw(DB_A).await;
+    let killed: i64 = redis::cmd("CLIENT")
+        .arg("KILL")
+        .arg("USER")
+        .arg(user)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!(killed >= 1, "the user's connection was open");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // A read notices the drop and rebuilds the connection.
+    assert_eq!(run(&restricted, DB_A, &["GET", "after"]).await, Json::Null);
+
+    let after = reason_for_set().await;
+    assert!(
+        !after.contains("COMMAND INFO is unavailable"),
+        "the server must be asked again on the rebuilt connection, got: {after}"
+    );
+    assert!(
+        !restricted.is_write_command(&unlisted_read).await.unwrap(),
+        "the server's own answer is used again"
+    );
+
+    restricted.close().await;
+    run(&h, DB_A, &["ACL", "DELUSER", user]).await;
+    flush(&h).await;
+}
+
 /// An ACL user that may not call COMMAND: `COMMAND INFO` is unusable, so the static read-only
 /// table decides (allow-list: unlisted commands count as writes). Also exercises username +
 /// password auth. The user is removed afterwards.

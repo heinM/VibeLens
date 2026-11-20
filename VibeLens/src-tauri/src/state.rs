@@ -21,7 +21,7 @@ pub struct AppState {
     pub connections: Arc<ConnectionManager>,
     pub workspace: Arc<WorkspaceFs>,
     pub agent: Arc<AgentService>,
-    pub running_queries: Mutex<HashMap<String, CancellationToken>>,
+    pub running_queries: RunningQueries,
     pub config_dir: PathBuf,
 }
 
@@ -64,8 +64,128 @@ impl AppState {
             connections,
             workspace,
             agent,
-            running_queries: Mutex::new(HashMap::new()),
+            running_queries: RunningQueries::default(),
             config_dir,
         })
+    }
+}
+
+/// The statements that are running, by query id, so that one can be cancelled (`pg_cancel`,
+/// for every engine).
+#[derive(Clone, Default)]
+pub struct RunningQueries(Arc<Mutex<HashMap<String, CancellationToken>>>);
+
+/// One running statement. It is registered for as long as this value lives: the task that
+/// executes the statement owns it, so the entry goes when that task ends, however it ends.
+/// (Entries used to be removed only by a cancel, and every statement that ran to its end
+/// stayed in the map for the life of the app.)
+pub struct RunningQuery {
+    pub id: String,
+    pub cancel: CancellationToken,
+    registry: RunningQueries,
+}
+
+impl Drop for RunningQuery {
+    fn drop(&mut self) {
+        self.registry.entries().remove(&self.id);
+    }
+}
+
+impl RunningQueries {
+    fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<String, CancellationToken>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Registers a new run under a fresh id.
+    pub fn start(&self) -> RunningQuery {
+        let id = uuid::Uuid::new_v4().to_string();
+        let cancel = CancellationToken::new();
+        self.entries().insert(id.clone(), cancel.clone());
+        RunningQuery {
+            id,
+            cancel,
+            registry: self.clone(),
+        }
+    }
+
+    /// Cancels the run with this id and forgets it. `false` if there is none.
+    pub fn cancel(&self, id: &str) -> bool {
+        match self.entries().remove(id) {
+            Some(token) => {
+                token.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// How many runs are registered.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries().len()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RunningQueries;
+
+    /// Entries used to be removed only by a cancel, so every statement that ran to its end
+    /// stayed in the map for the life of the app.
+    #[test]
+    fn a_run_is_forgotten_when_it_ends() {
+        let running = RunningQueries::default();
+        let run = running.start();
+        let id = run.id.clone();
+        assert_eq!(running.len(), 1);
+        drop(run);
+        assert_eq!(running.len(), 0, "the run ended; its entry must go");
+        assert!(!running.cancel(&id), "nothing left to cancel");
+    }
+
+    #[test]
+    fn many_finished_runs_leave_nothing_behind() {
+        let running = RunningQueries::default();
+        for _ in 0..1000 {
+            let run = running.start();
+            assert!(!run.cancel.is_cancelled());
+        }
+        assert!(running.is_empty(), "{} entries left", running.len());
+    }
+
+    #[test]
+    fn cancelling_fires_the_token_and_forgets_the_run() {
+        let running = RunningQueries::default();
+        let run = running.start();
+        let other = running.start();
+        assert!(running.cancel(&run.id));
+        assert!(run.cancel.is_cancelled());
+        assert!(!other.cancel.is_cancelled(), "only the named run");
+        assert!(!running.cancel(&run.id), "a second cancel finds nothing");
+        assert!(!running.cancel("no-such-id"));
+        // The cancelled run's task still ends later; that must not disturb anything.
+        drop(run);
+        assert_eq!(running.len(), 1);
+        drop(other);
+        assert!(running.is_empty());
+    }
+
+    /// The run's guard lives in the task that executes the statement: when the task ends,
+    /// however it ends, the entry goes.
+    #[test]
+    fn a_run_is_forgotten_when_its_task_panics() {
+        let running = RunningQueries::default();
+        let run = running.start();
+        let task = std::thread::spawn(move || {
+            let _run = run;
+            panic!("the statement's task died");
+        });
+        assert!(task.join().is_err());
+        assert!(running.is_empty());
     }
 }

@@ -9,7 +9,9 @@
 //!    table. The table can only *downgrade* an `admin` / `pubsub` / `@scripting` verdict; a
 //!    server-reported `write` flag always wins.
 //! 2. `COMMAND INFO` may be unavailable (ACL-restricted users, some managed services). Then the
-//!    table is used as an *allow-list*: listed → read, everything else → write.
+//!    table is used as an *allow-list*: listed → read, everything else → write. A refusal is
+//!    not believed for ever: the server is asked again after a minute or once the connection
+//!    has been rebuilt (`MetaCache::command_info_refused` in `mod.rs`).
 //!
 //! Anything unknown to the server is treated as a write (fail safe).
 
@@ -155,7 +157,7 @@ pub(super) fn classify_fallback(display: &str, name: &str, sub: Option<&str>) ->
 /// Commands whose first argument selects a subcommand.
 const PARENTS: &[&str] = &[
     "config", "client", "slowlog", "latency", "memory", "acl", "command", "module", "function",
-    "script", "object", "xinfo", "pubsub", "cluster", "debug", "xgroup", "memory", "lolwut",
+    "script", "object", "xinfo", "pubsub", "cluster", "debug", "xgroup", "lolwut",
 ];
 
 /// Commands (or `command|subcommand`s) that are known not to write. Used to downgrade

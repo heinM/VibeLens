@@ -3,7 +3,6 @@
 use tauri::State;
 use tauri::ipc::Channel;
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use vibelens_core::ErrorPayload;
 use vibelens_core::model::*;
 
@@ -77,13 +76,8 @@ pub async fn ice_execute(
         ));
     }
     let handle = state.connections.iceberg(&profile_id).await.map_err(err)?;
-    let query_id = uuid::Uuid::new_v4().to_string();
-    let cancel = CancellationToken::new();
-    state
-        .running_queries
-        .lock()
-        .unwrap()
-        .insert(query_id.clone(), cancel.clone());
+    let run = state.running_queries.start();
+    let (query_id, cancel) = (run.id.clone(), run.cancel.clone());
 
     let (tx, mut rx) = mpsc::channel::<QueryEvent>(16);
     tauri::async_runtime::spawn(async move {
@@ -96,6 +90,8 @@ pub async fn ice_execute(
     let qid = query_id.clone();
     let tx_err = tx.clone();
     tauri::async_runtime::spawn(async move {
+        // Registered for as long as this task runs: the entry goes when the statement ends.
+        let _run = run;
         if let Err(e) = handle.execute_stream(qid, &sql, opts, cancel, tx).await {
             let _ = tx_err
                 .send(QueryEvent::Failed {
