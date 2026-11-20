@@ -151,6 +151,18 @@ describe("exporting values that were cut when they were read", () => {
     for (const out of [toCsv(cols2, rows2), toJson(cols2, rows2), toMarkdownTable(cols2, rows2)]) expect(out).not.toContain(START);
   });
 
+  // An Iceberg struct, list or map can hold a cut value below the top level.
+  it("a cut value inside a struct or list is a note too, and the rest of the value is kept", () => {
+    const nested: Cell[][] = [["1", { title: "t", parts: [cut, "whole"] } as Cell]];
+    const structCols = [cols2[0], { name: "body", typeName: "struct" }];
+    expect(JSON.parse(toJson(structCols, nested))).toEqual([{ id: "1", body: { title: "t", parts: [NOTE, "whole"] } }]);
+    for (const out of [toCsv(structCols, nested), toJson(structCols, nested), toMarkdownTable(structCols, nested)]) {
+      expect(out).not.toContain(START);
+      expect(out).toContain("52,428,800 bytes");
+      expect(out).toContain("whole");
+    }
+  });
+
   it("SQL INSERTs are refused: a script that loads a placeholder would be wrong data", () => {
     expect(() => toSqlInserts(cols2, rows2, { schema: "public", name: "docs" })).toThrow(/too large to load in full/);
     expect(() => toSqlInserts(cols2, rows2, { schema: "public", name: "docs" })).toThrow(/body/);

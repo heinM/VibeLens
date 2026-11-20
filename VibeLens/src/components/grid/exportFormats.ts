@@ -2,7 +2,7 @@
 // Copy / Export menu of every result and table tab. No React, no IPC.
 import type { Cell, ColumnMeta } from "../../ipc/types";
 import { bytesToHex, qualifiedName, quoteIdent, quoteLiteral, sqlLiteral, SqlGenError, typeCategory } from "../table/sqlGen";
-import { copyText, isBytesCell, isNumericType, isTruncatedCell, truncatedNote, uniqueColumnKeys } from "./cellFormat";
+import { copyText, isBytesCell, isNumericType, notingTruncated, uniqueColumnKeys } from "./cellFormat";
 import { uneditableReason } from "../table/sqlGen";
 
 type Rows = readonly (readonly Cell[])[];
@@ -69,7 +69,7 @@ export function toJson(columns: Cols, rows: Rows, pretty = true): string {
     for (let c = 0; c < keys.length; c++) {
       const v = row[c] ?? null;
       // A value that was cut when it was read is exported as a note that says so, never as its start.
-      o[keys[c]] = isBytesCell(v) ? `\\x${bytesToHex(v)}` : isTruncatedCell(v) ? truncatedNote(v) : v;
+      o[keys[c]] = isBytesCell(v) ? `\\x${bytesToHex(v)}` : notingTruncated(v);
     }
     return o;
   });

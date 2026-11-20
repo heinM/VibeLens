@@ -65,6 +65,18 @@ export function truncatedNote(c: TruncatedCell): string {
   return `‹value not loaded in full: ${formatCount(c.$truncated.bytes)} bytes${what ? ` of ${what}` : ""}›`;
 }
 
+/**
+ * `v` with every cut value in it, at any depth (an Iceberg struct can hold one), replaced by its
+ * `truncatedNote`. A value that holds none is returned as it is.
+ */
+export function notingTruncated<T>(v: T, depth = 0): T | string {
+  if (typeof v !== "object" || v === null || depth > 32) return v;
+  if (isTruncatedCell(v)) return truncatedNote(v);
+  if (!containsTruncated(v)) return v;
+  if (Array.isArray(v)) return v.map((x) => notingTruncated(x, depth + 1)) as T;
+  return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, notingTruncated(x, depth + 1)])) as T;
+}
+
 /** How many cells in `rows` (within `range`, when given) are or contain a cut value. */
 export function countTruncated(rows: readonly (readonly Cell[])[], range?: CellRange): number {
   const r0 = range?.r0 ?? 0;
@@ -172,7 +184,8 @@ export function copyText(c: Cell): string {
       return truncatedNote(c as TruncatedCell);
     case "json":
       try {
-        return JSON.stringify(c);
+        // A cut value inside the JSON is a note too, not its start.
+        return JSON.stringify(notingTruncated(c));
       } catch {
         return "";
       }
@@ -245,7 +258,7 @@ export function rowsToObjects(columns: readonly ColumnMeta[], rows: readonly (re
     const o: Record<string, Cell> = {};
     for (let c = 0; c < keys.length; c++) {
       const v = rows[r][c] ?? null;
-      o[keys[c]] = isTruncatedCell(v) ? truncatedNote(v) : v;
+      o[keys[c]] = notingTruncated(v);
     }
     out.push(o);
   }
