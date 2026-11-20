@@ -62,6 +62,8 @@ describe("host key fingerprints (review findings M1, M2)", () => {
     expect(withTrustedHostKey(profile(tunnel({ knownHostFingerprint: OTHER_FP })), key())).toBeNull();
     expect(withTrustedHostKey(profile(tunnel({ knownHostFingerprint: FP })), key())?.tunnel?.knownHostFingerprint).toBe(FP);
     expect(withTrustedHostKey(draft, key({ fingerprint: "garbage" }))).toBeNull();
+    // The host is compared as it is sent: a test or a save trims it, so the key comes back for the trimmed name.
+    expect(withTrustedHostKey(profile(tunnel({ host: " bastion.example " })), key())?.tunnel?.knownHostFingerprint).toBe(FP);
   });
 
   it("validates a pasted pin in the network section", () => {
@@ -70,6 +72,9 @@ describe("host key fingerprints (review findings M1, M2)", () => {
     const errors = validateProfile(profile(tunnel({ knownHostFingerprint: "garbage" })), []);
     expect(errors["tunnel.knownHostFingerprint"]).toMatch(/SHA256/);
     expect(sectionOf("tunnel.knownHostFingerprint")).toBe("network");
+    // A blank pin is no pin (Rust reads it that way too) and the form has nothing to correct.
+    expect(validateProfile(profile(tunnel({ knownHostFingerprint: "" })), [])).toEqual({});
+    expect(validateProfile(profile(tunnel({ knownHostFingerprint: "  " })), [])).toEqual({});
   });
 });
 
@@ -157,14 +162,50 @@ describe("useHostKeyPrompt", () => {
     await expect(Promise.all([a, b])).resolves.toEqual([true, true]);
   });
 
-  it("never carries a yes over to a different key or connection", async () => {
+  it("never carries a yes over to a different key of the same connection", async () => {
     const first = prompt().ask("p1", key());
     const otherKey = prompt().ask("p1", key({ fingerprint: OTHER_FP }));
     await expect(first).resolves.toBe(false); // replaced, so not trusted
-    const otherProfile = prompt().ask("p2", key({ fingerprint: OTHER_FP }));
-    await expect(otherKey).resolves.toBe(false);
-    expect(prompt().pending?.profileId).toBe("p2");
+    expect(prompt().pending?.key.fingerprint).toBe(OTHER_FP);
     prompt().answer(true);
-    await expect(otherProfile).resolves.toBe(true);
+    await expect(otherKey).resolves.toBe(true);
+    expect(prompt().pending).toBeNull();
+  });
+
+  // Connecting two profiles at once: the second question used to replace the first, which then
+  // failed as "not trusted" without the user ever seeing it.
+  it("asks about another connection after the open question, each with its own answer", async () => {
+    const first = prompt().ask("p1", key());
+    const second = prompt().ask("p2", key({ fingerprint: OTHER_FP }));
+    const third = prompt().ask("p3", key());
+    expect(prompt().pending?.profileId).toBe("p1");
+
+    prompt().answer(true);
+    await expect(first).resolves.toBe(true);
+    expect(prompt().pending?.profileId).toBe("p2");
+
+    prompt().answer(false);
+    await expect(second).resolves.toBe(false);
+    expect(prompt().pending?.profileId).toBe("p3");
+
+    prompt().answer(true);
+    await expect(third).resolves.toBe(true);
+    expect(prompt().pending).toBeNull();
+  });
+
+  it("replaces a waiting question when its connection presents a different key, keeping its turn", async () => {
+    const first = prompt().ask("p1", key());
+    const waiting = prompt().ask("p2", key());
+    const third = prompt().ask("p3", key());
+    const replacement = prompt().ask("p2", key({ fingerprint: OTHER_FP }));
+    await expect(waiting).resolves.toBe(false);
+
+    prompt().answer(false);
+    await expect(first).resolves.toBe(false);
+    expect(prompt().pending).toMatchObject({ profileId: "p2", key: { fingerprint: OTHER_FP } });
+    prompt().answer(true);
+    await expect(replacement).resolves.toBe(true);
+    prompt().answer(true);
+    await expect(third).resolves.toBe(true);
   });
 });

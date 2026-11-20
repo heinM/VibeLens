@@ -160,7 +160,8 @@ export function validateProfile(p: ConnectionProfile, others: ConnectionProfile[
     if (!intIn(t.port, 1, 65535)) e["tunnel.port"] = "Port must be 1-65535.";
     if (!t.username.trim()) e["tunnel.username"] = "SSH username is required.";
     if (t.auth.kind === "privateKey" && !t.auth.path.trim()) e["tunnel.keyPath"] = "Path to the private key file is required.";
-    if (t.knownHostFingerprint != null && !isHostKeyFingerprint(t.knownHostFingerprint))
+    // A blank pin is no pin, as in Rust: it must not block Save with nothing on screen to correct.
+    if (t.knownHostFingerprint?.trim() && !isHostKeyFingerprint(t.knownHostFingerprint))
       e["tunnel.knownHostFingerprint"] = "A host key fingerprint looks like SHA256: followed by 43 characters.";
   }
 

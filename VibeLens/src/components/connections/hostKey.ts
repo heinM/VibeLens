@@ -34,7 +34,8 @@ export function presentedHostKey(e: ErrorPayload | null | undefined): PresentedH
  */
 export function withTrustedHostKey(profile: ConnectionProfile, key: PresentedHostKey): ConnectionProfile | null {
   const t = profile.tunnel;
-  if (!t || t.host !== key.host || t.port !== key.port || !isHostKeyFingerprint(key.fingerprint)) return null;
+  // The draft's host is compared as it is sent (`cleanProfile` trims it before a test or a save).
+  if (!t || t.host.trim() !== key.host || t.port !== key.port || !isHostKeyFingerprint(key.fingerprint)) return null;
   const pinned = t.knownHostFingerprint?.trim();
   if (pinned && pinned !== key.fingerprint) return null;
   return { ...profile, tunnel: { ...t, knownHostFingerprint: key.fingerprint } };
