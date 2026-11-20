@@ -57,6 +57,13 @@ enum Outcome {
     /// Finished, but the session may hold a transaction that cannot be ended because the
     /// endpoint (pg-proxy shunt mode) refuses `ROLLBACK`: do not reuse the connection.
     DoneDiscard,
+    /// A read-only run's statement returned more rows than the cap. The server is still
+    /// producing the rest of that result, and anything else asked of this connection (the
+    /// after-statement check, the next statement, the final `ROLLBACK`) would queue behind all
+    /// of it. Nothing more was run: the connection is cancelled and closed, never reused.
+    Truncated {
+        statement_index: usize,
+    },
 }
 
 /// How many times a run is retried after [`Outcome::Stale`].
@@ -331,6 +338,9 @@ fn column_meta(st: &tokio_postgres::Statement) -> Vec<ColumnMeta> {
         .collect()
 }
 
+/// Runs one prepared statement and streams its result. `Ok(true)` means the result was cut off
+/// at `opts.max_rows`: the rest of it is still arriving on `client`, so whatever is sent next
+/// on this connection waits until the server has produced every remaining row.
 async fn run_prepared(
     client: &Client,
     sql: &str,
@@ -338,14 +348,14 @@ async fn run_prepared(
     idx: usize,
     opts: &ExecOptions,
     tx: &mpsc::Sender<QueryEvent>,
-) -> std::result::Result<(), Stop> {
+) -> std::result::Result<bool, Stop> {
     let t0 = Instant::now();
     let no_params: [&(dyn ToSql + Sync); 0] = [];
     if st.columns().is_empty() {
         let n = client.execute_raw(st, no_params.iter().copied()).await?;
         let tag = command_tag(sql, false);
         let rows_affected = tag.as_deref().is_some_and(counts_rows).then_some(n);
-        return emit(
+        emit(
             tx,
             QueryEvent::StatementDone {
                 statement_index: idx,
@@ -356,7 +366,8 @@ async fn run_prepared(
                 elapsed_ms: elapsed_ms(t0),
             },
         )
-        .await;
+        .await?;
+        return Ok(false);
     }
 
     let stream = client.query_raw(st, no_params.iter().copied()).await?;
@@ -376,7 +387,8 @@ async fn run_prepared(
     while let Some(row) = stream.try_next().await? {
         if row_count >= opts.max_rows {
             // More rows exist than we are willing to hold: stop reading. Dropping the stream does
-            // not stop the server: the driver keeps reading and discarding the rest of the result.
+            // not stop the server: the driver keeps reading and discarding the rest of the result
+            // until the connection is cancelled or closed (the caller's job, see the return value).
             truncated = true;
             break;
         }
@@ -429,7 +441,8 @@ async fn run_prepared(
             elapsed_ms: elapsed_ms(t0),
         },
     )
-    .await
+    .await?;
+    Ok(truncated)
 }
 
 /// Fallback for text that cannot be prepared (several commands in one string). Values are text.
@@ -588,6 +601,23 @@ fn left_read_only_tx() -> CoreError {
     CoreError::PolicyDenied("statement left the read-only transaction".into())
 }
 
+/// The error for the statements a read-only script did not reach because statement
+/// `truncated` (0-based) of `total` hit the row cap. Running them on another connection would
+/// silently drop the `SET`s, temporary tables and cursors the script made on this one.
+fn not_run_after_truncation(truncated: usize, total: usize, max_rows: usize) -> CoreError {
+    let (first, last) = (truncated + 2, total);
+    let rest = if first == last {
+        format!("statement {first} was not run")
+    } else {
+        format!("statements {first} to {last} were not run")
+    };
+    CoreError::Invalid(format!(
+        "statement {} returned more than {max_rows} rows, so this read-only run stopped there          and {rest}. Add a LIMIT to statement {}, or run the rest separately",
+        truncated + 1,
+        truncated + 1
+    ))
+}
+
 /// Everything `run_script` needs besides the connection and the statements.
 struct ScriptCtx<'a> {
     opts: &'a ExecOptions,
@@ -702,7 +732,9 @@ async fn run_script(client: &Client, statements: &[String], ctx: &ScriptCtx<'_>)
                 if txstate.load(Ordering::SeqCst) != TX_OPEN {
                     txstate.store(TX_MAYBE, Ordering::SeqCst);
                 }
-                run_simple(client, stmt, idx, opts, tx).await
+                run_simple(client, stmt, idx, opts, tx)
+                    .await
+                    .map(|()| false)
             }
             // Preparing has no side effects: a connection found dead here ran nothing yet.
             Err(e) if idx == 0 && is_connection_lost(&e) => {
@@ -711,7 +743,14 @@ async fn run_script(client: &Client, statements: &[String], ctx: &ScriptCtx<'_>)
             Err(e) => Err(Stop::from(e)),
         };
         match result {
-            Ok(()) => {
+            // Before the after-statement check: the check is a query on this connection and
+            // would not be answered until the server had sent the whole result.
+            Ok(true) if opts.read_only => {
+                return Outcome::Truncated {
+                    statement_index: idx,
+                };
+            }
+            Ok(_) => {
                 // A multi-command string says nothing reliable about its first keyword.
                 if !opts.read_only
                     && !simple
@@ -989,6 +1028,26 @@ impl PgHandle {
                 Some(Outcome::DoneDiscard) => {
                     conn.discard();
                     End::Finished
+                }
+                Some(Outcome::Truncated { statement_index }) => {
+                    // Dropping the guard asks the server to cancel the statement and closes the
+                    // connection. The after-statement read-only check was skipped for this
+                    // statement, and that is safe only because of this: nothing else ever runs
+                    // on the session, and it never goes back to the pool. Do not turn this into
+                    // a `release`.
+                    drop(conn);
+                    if statement_index + 1 < statements.len() {
+                        End::Failed {
+                            statement_index: Some(statement_index + 1),
+                            error: not_run_after_truncation(
+                                statement_index,
+                                statements.len(),
+                                opts.max_rows,
+                            ),
+                        }
+                    } else {
+                        End::Finished
+                    }
                 }
                 Some(Outcome::Gone) => {
                     // Dropping the guard cancels whatever the server is still running.

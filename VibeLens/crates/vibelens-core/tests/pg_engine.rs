@@ -1077,6 +1077,236 @@ async fn max_rows_truncates_without_draining_the_stream() {
     ));
 }
 
+// ---------------------------------------------------------------------------------------------
+// Read-only runs and the row cap (review finding H2)
+// ---------------------------------------------------------------------------------------------
+
+/// A result the server streams row by row and would take minutes to send in full.
+const HUGE_RESULT: &str = "SELECT g FROM (SELECT generate_series(1, 2000000000) AS g) s";
+
+/// How long a truncated run may take. Far more than it needs, far less than the whole result.
+const TRUNCATED_RUN_BUDGET: Duration = Duration::from_secs(10);
+
+/// Waits until no backend is running a statement whose text contains `marker` any more.
+async fn assert_server_stopped(d: &Dsn, marker: &str) {
+    let c = raw(d).await;
+    let t0 = Instant::now();
+    loop {
+        let running: i64 = c
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE pid <> pg_backend_pid() AND state <> 'idle' AND position($1 in query) > 0",
+                &[&marker],
+            )
+            .await
+            .expect("pg_stat_activity")
+            .get(0);
+        if running == 0 {
+            return;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "{running} backend(s) still producing the abandoned result after {:?}",
+            t0.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The read-only twin of `max_rows_truncates_without_draining_the_stream`. A read-only run
+/// checks its transaction after every statement and ends it with `ROLLBACK`, both on the same
+/// connection: they must not wait for the rest of a result nobody will read.
+#[tokio::test]
+async fn read_only_max_rows_truncates_without_draining_the_stream() {
+    let d = require_pg!();
+    let h = connect_single(&d).await;
+    // Its own upper bound, so `pg_stat_activity` can tell this statement from other tests'.
+    const MARKER: &str = "generate_series(1, 2000000123)";
+    let sql = format!("SELECT g FROM (SELECT {MARKER} AS g) s");
+    let t0 = Instant::now();
+    let evs = tokio::time::timeout(
+        TRUNCATED_RUN_BUDGET * 2,
+        run(
+            &h,
+            &sql,
+            ExecOptions {
+                max_rows: 5,
+                page_size: 2,
+                read_only: true,
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "still running after {:?}: the read-only run waited for the whole result",
+            t0.elapsed()
+        )
+    });
+    assert!(
+        t0.elapsed() < TRUNCATED_RUN_BUDGET,
+        "took {:?}: the stream must not be drained",
+        t0.elapsed()
+    );
+    assert_eq!(row_pages(&evs), [2, 2, 1]);
+    match dones(&evs)[0] {
+        QueryEvent::StatementDone {
+            row_count: 5,
+            truncated: true,
+            ..
+        } => {}
+        other => panic!("{other:?}"),
+    }
+    assert_finished(&evs);
+    // The server was told to stop, not left to produce two thousand million rows for nobody.
+    assert_server_stopped(&d, MARKER).await;
+    // The pool (of one) still serves queries, read-only and not.
+    assert_eq!(scalar(&h, "7::int4").await, json!(7));
+    let r = h
+        .execute_collect(
+            "SELECT current_setting('transaction_read_only')",
+            ExecOptions {
+                read_only: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("read-only run after a truncated one");
+    assert_eq!(r.rows, vec![vec![json!("on")]]);
+
+    // Exactly max_rows rows is not truncation, and keeps the connection.
+    let pid = scalar(&h, "pg_backend_pid()").await;
+    let evs = run(
+        &h,
+        "SELECT g FROM generate_series(1, 5) g",
+        ExecOptions {
+            max_rows: 5,
+            read_only: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(matches!(
+        dones(&evs)[0],
+        QueryEvent::StatementDone {
+            row_count: 5,
+            truncated: false,
+            ..
+        }
+    ));
+    assert_finished(&evs);
+    assert_eq!(
+        scalar(&h, "pg_backend_pid()").await,
+        pid,
+        "an untruncated read-only run returns its connection to the pool"
+    );
+}
+
+/// The AI agent's path: materialised, read-only, 200 rows, 30 s statement timeout. It must get
+/// its 200 rows at once, not a statement-timeout error half a minute later.
+#[tokio::test]
+async fn read_only_execute_collect_truncates_without_draining_the_stream() {
+    let d = require_pg!();
+    let h = connect_single(&d).await;
+    let t0 = Instant::now();
+    let r = tokio::time::timeout(
+        Duration::from_secs(45),
+        h.execute_collect(
+            HUGE_RESULT,
+            ExecOptions {
+                max_rows: 200,
+                read_only: true,
+                timeout_ms: Some(30_000),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("still running after {:?}", t0.elapsed()));
+    let took = t0.elapsed();
+    let r = r.unwrap_or_else(|e| panic!("after {took:?}: {e}"));
+    assert!(
+        took < TRUNCATED_RUN_BUDGET,
+        "took {took:?}: the stream must not be drained"
+    );
+    assert_eq!((r.rows.len(), r.row_count, r.truncated), (200, 200, true));
+    assert_eq!(r.rows[0], vec![json!(1)]);
+    assert_eq!(r.rows[199], vec![json!(200)]);
+    assert_eq!(scalar(&h, "7::int4").await, json!(7));
+}
+
+/// A statement that is cut off stops a read-only script: the statements after it would have to
+/// wait for the rest of its result, and running them on another connection would lose the
+/// `SET`s, temporary tables and cursors the script made. The run says which were not run.
+#[tokio::test]
+async fn read_only_script_stops_after_a_truncated_statement_that_is_not_the_last() {
+    let d = require_pg!();
+    let h = connect_single(&d).await;
+    let script = format!("SELECT 1 AS one; {HUGE_RESULT}; SELECT 42 AS answer; SELECT 43");
+    let opts = || ExecOptions {
+        max_rows: 5,
+        read_only: true,
+        ..Default::default()
+    };
+    let t0 = Instant::now();
+    let evs = tokio::time::timeout(TRUNCATED_RUN_BUDGET * 2, run(&h, &script, opts()))
+        .await
+        .unwrap_or_else(|_| panic!("still running after {:?}", t0.elapsed()));
+    assert!(
+        t0.elapsed() < TRUNCATED_RUN_BUDGET,
+        "took {:?}",
+        t0.elapsed()
+    );
+
+    let summary: Vec<_> = dones(&evs)
+        .into_iter()
+        .map(|e| match e {
+            QueryEvent::StatementDone {
+                statement_index,
+                row_count,
+                truncated,
+                ..
+            } => (*statement_index, *row_count, *truncated),
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [(0, 1, false), (1, 5, true)],
+        "the rows that were read are still delivered: {evs:?}"
+    );
+    let (idx, err) = failed(&evs);
+    assert_eq!(
+        idx,
+        Some(2),
+        "reported on the first statement that did not run"
+    );
+    assert_eq!(err.code, "invalid");
+    assert!(
+        err.message
+            .contains("statement 2 returned more than 5 rows")
+            && err.message.contains("statements 3 to 4 were not run"),
+        "{}",
+        err.message
+    );
+    assert!(
+        !evs.iter().any(|e| matches!(
+            e,
+            QueryEvent::Columns { statement_index, .. } if *statement_index >= 2
+        )),
+        "nothing after the truncated statement ran: {evs:?}"
+    );
+
+    // The materialised form reports the same thing as an error.
+    let e = h
+        .execute_collect(&format!("{HUGE_RESULT}; SELECT 42"), opts())
+        .await
+        .expect_err("the last statement did not run");
+    assert!(e.to_string().contains("statement 2 was not run"), "{e}");
+    assert_eq!(scalar(&h, "7::int4").await, json!(7));
+}
+
 #[tokio::test]
 async fn execute_collect_honours_max_rows() {
     let d = require_pg!();
@@ -2318,6 +2548,63 @@ async fn pgproxy_block_errors_are_policy_denials() {
     )
     .await;
     assert_eq!(failed(&evs).1.code, "database");
+}
+
+/// Review finding H2 in shunt mode: the after-statement check and the closing `SET` are queries
+/// on the same connection too, so a truncated result must not be waited for there either.
+#[tokio::test]
+async fn shunt_mode_read_only_truncates_without_draining_the_stream() {
+    let d = require_pg!();
+    let mut p = shunt_params(&d);
+    p.options.max_pool_size = 1;
+    let h = connect_with(&d, p).await;
+    let opts = || ExecOptions {
+        max_rows: 5,
+        read_only: true,
+        ..Default::default()
+    };
+    let t0 = Instant::now();
+    let evs = tokio::time::timeout(TRUNCATED_RUN_BUDGET * 2, run(&h, HUGE_RESULT, opts()))
+        .await
+        .unwrap_or_else(|_| panic!("still running after {:?}", t0.elapsed()));
+    assert!(
+        t0.elapsed() < TRUNCATED_RUN_BUDGET,
+        "took {:?}",
+        t0.elapsed()
+    );
+    assert!(matches!(
+        dones(&evs)[0],
+        QueryEvent::StatementDone {
+            row_count: 5,
+            truncated: true,
+            ..
+        }
+    ));
+    assert_finished(&evs);
+
+    let script = format!("{HUGE_RESULT}; SELECT 42");
+    let t0 = Instant::now();
+    let evs = tokio::time::timeout(TRUNCATED_RUN_BUDGET * 2, run(&h, &script, opts()))
+        .await
+        .unwrap_or_else(|_| panic!("still running after {:?}", t0.elapsed()));
+    assert!(
+        t0.elapsed() < TRUNCATED_RUN_BUDGET,
+        "took {:?}",
+        t0.elapsed()
+    );
+    let (idx, err) = failed(&evs);
+    assert_eq!(idx, Some(1));
+    assert!(err.message.contains("statement 2 was not run"), "{err:?}");
+
+    // The next run gets a fresh session: not read-only by a default the closed one left behind.
+    let r = h
+        .execute_collect(
+            "SELECT current_setting('default_transaction_read_only')",
+            ExecOptions::default(),
+        )
+        .await
+        .expect("run after a truncated one");
+    assert_eq!(r.rows, vec![vec![json!("off")]]);
 }
 
 #[tokio::test]

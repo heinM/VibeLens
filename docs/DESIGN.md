@@ -127,7 +127,7 @@ On Linux (dev/CI) there is no keychain backend. The app falls back to an in-memo
 
 **Advisory:** SQL classification. It fails closed: `ReadOnly` is returned only when sqlparser yields a Query, Explain (non-analyze), Show or Values AST with no known side-effecting function (`dblink*`, `pg_read_file`, `lo_*`, `pg_terminate_backend`, advisory locks, `set_config`, `nextval`, …). Anything unparseable goes to approval. But a user-defined `SECURITY DEFINER` function, or an extension we don't know about, can still do work inside READ ONLY. **Use a least-privilege role for anything the agent touches.** The README says so plainly.
 
-**Defence in depth:** after every statement in a read-only run, the executor checks that the session is still inside its READ ONLY transaction. If not, it aborts and discards the connection. Pooled connections get a `DISCARD ALL`-equivalent reset when a run ends and on recycle (`ROLLBACK`, `RESET ALL`, advisory locks released, temp objects dropped). It omits `DEALLOCATE ALL`, which would break the driver's cached statements, and a connection whose run was dropped mid-flight is never returned to the pool.
+**Defence in depth:** after every statement in a read-only run, the executor checks that the session is still inside its READ ONLY transaction. If not, it aborts and discards the connection. The one statement that is not checked is a read-only statement cut off at the row cap: the check is a query on the same connection and would wait for the whole result, so that connection is cancelled and closed instead and nothing else runs on it. Pooled connections get a `DISCARD ALL`-equivalent reset when a run ends and on recycle (`ROLLBACK`, `RESET ALL`, advisory locks released, temp objects dropped). It omits `DEALLOCATE ALL`, which would break the driver's cached statements, and a connection whose run was dropped mid-flight is never returned to the pool.
 
 **Independent review (2026-10-31):** a separate reviewer probed the build and found a CR-terminated-comment bypass (critical), connection reuse after a cancelled run (high), `dblink` under READ ONLY (high), quoted `EXPLAIN ("analyze")` (medium), `EVAL_RO` (medium), and value leakage via error text under schemaOnly (medium), plus minor items. All were fixed with regression tests; see the git history for this date.
 
@@ -177,7 +177,7 @@ ConnectionManager ──iceberg(profile)──► IcebergHandle (single-flight, 
 * **No SSM Session Manager tunnels yet.** Many enterprises ban bastions in favour of SSM port forwarding. This needs the `session-manager-plugin` protocol and is the top V1.1 item.
 * **SSO uses the device-code grant.** The AWS CLI now defaults to authorization-code + PKCE. Device code still works but is phishable; PKCE (loopback redirect) is V1.1.
 * **Multi-statement scripts** run statement-by-statement in autocommit unless the script contains its own `BEGIN`/`COMMIT`.
-* **Server-side cursors** aren't used. Results are capped at `maxRows` (100k default) and the rest are discarded with `truncated=true`.
+* **Server-side cursors** aren't used. Results are capped at `maxRows` (100k default) and the rest are discarded with `truncated=true`. In a read-only run (every agent read, 200 rows) hitting the cap cancels the statement and closes its connection, so each truncated read costs a reconnect, and a multi-statement read-only script stops at the truncated statement with an error naming the statements that were not run.
 * **Iceberg, local engine:**
   * no row-level DML;
   * no views (iceberg-rust 0.10 has no view API);
