@@ -660,9 +660,9 @@ export const CTID_ORDER_MAX_ROWS = 250_000;
  * out one row on two pages and never show another:
  * - the primary key, when there is one (and paging goes by key if every ordering column is
  *   NOT NULL);
- * - otherwise the row's physical position, `ctid`, for relations that have one: tables and
- *   materialized views, and partitioned tables together with `tableoid`, because `ctid` starts
- *   again in each partition. That order holds as long as the rows are not rewritten.
+ * - otherwise the row's physical position, `ctid`, for relations that have one: materialized
+ *   views, and tables together with `tableoid`, because `ctid` starts again in each partition
+ *   and in each inheritance child. That order holds as long as the rows are not rewritten.
  *
  * A view or a foreign table has no `ctid`. A table that is large, or whose size is not known,
  * gets the `ctid` tie-break only behind a sort (see {@link CTID_ORDER_MAX_ROWS}). In both cases
@@ -677,7 +677,10 @@ export function planTablePage(columns: readonly PlanColumn[], sort: readonly Sor
 
   let stableOrder = pk.length > 0;
   if (!stableOrder) {
-    const physical = relation.kind === "partitionedTable" ? ["tableoid", "ctid"] : relation.kind === "table" || relation.kind === "materializedView" ? ["ctid"] : null;
+    // A plain table can have children too (inheritance, which is also what a TimescaleDB
+    // hypertable is), and reading the parent reads them, so it gets `tableoid` like a partitioned one.
+    const physical =
+      relation.kind === "table" || relation.kind === "partitionedTable" ? ["tableoid", "ctid"] : relation.kind === "materializedView" ? ["ctid"] : null;
     // No estimate, or zero, tells nothing about the size: the table was never analysed (zero is
     // what Postgres 13 and older report then) or it was empty when it last was.
     const rows = relation.estimatedRows;

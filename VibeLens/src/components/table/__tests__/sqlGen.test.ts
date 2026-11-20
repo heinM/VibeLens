@@ -481,13 +481,13 @@ describe("the order of a table page", () => {
   // can hand out the same row on two pages and never show another.
   it("breaks ties by ctid for a table without a primary key", () => {
     const p = planTablePage(noPk, [], small);
-    expect(order(p)).toEqual(["ctid asc"]);
+    expect(order(p)).toEqual(["tableoid asc", "ctid asc"]);
     expect(p).toMatchObject({ keyset: false, stableOrder: true });
     expect(buildSelectPage({ schema: "public", table: "log", columns: p.names, orderBy: p.orderBy, limit: 100, offset: 200 })).toBe(
-      'SELECT "n", "body"\nFROM "public"."log"\nORDER BY "ctid" ASC\nLIMIT 100\nOFFSET 200',
+      'SELECT "n", "body"\nFROM "public"."log"\nORDER BY "tableoid" ASC, "ctid" ASC\nLIMIT 100\nOFFSET 200',
     );
     // After the user's own sort, which leaves ties wherever values repeat.
-    expect(order(planTablePage(noPk, [{ column: "body", dir: "desc" }], small))).toEqual(["body desc", "ctid asc"]);
+    expect(order(planTablePage(noPk, [{ column: "body", dir: "desc" }], small))).toEqual(["body desc", "tableoid asc", "ctid asc"]);
     // A materialized view is stored like a table.
     expect(order(planTablePage(noPk, [], { kind: "materializedView", estimatedRows: 10 }))).toEqual(["ctid asc"]);
   });
@@ -521,7 +521,7 @@ describe("the order of a table page", () => {
     expect(planTablePage(noPk, [], { kind: "table", estimatedRows: CTID_ORDER_MAX_ROWS }).stableOrder).toBe(true);
     // With a sort the server orders the rows anyway: the tie-break rides along.
     const sorted = planTablePage(noPk, [{ column: "n", dir: "desc" }], { kind: "table", estimatedRows: 500_000_000 });
-    expect(order(sorted)).toEqual(["n desc", "ctid asc"]);
+    expect(order(sorted)).toEqual(["n desc", "tableoid asc", "ctid asc"]);
     expect(sorted.stableOrder).toBe(true);
     // A primary key needs none of this, whatever the size.
     expect(order(planTablePage(withPk, [], { kind: "table", estimatedRows: 500_000_000 }))).toEqual(["id asc"]);
