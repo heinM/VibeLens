@@ -126,6 +126,13 @@ describe("applyAgentEvent: approvals", () => {
     expect(tool(after)?.status).toBe("rejected");
   });
 
+  it("keeps the target the backend resolved, and tolerates events without one", () => {
+    const target = { connection: "orders-db", engine: "postgres" as const, environment: "prod" as const, database: "payments", defaultDatabase: "shop", valkeyDb: null };
+    const s = run([prompt, started, { type: "approvalRequired", callId: "c1", tool: "run_sql", arguments: { sql: "delete from t" }, reason: "writes", preview: "delete from t", target }]);
+    expect(approval(s)?.target).toEqual(target);
+    expect(approval(run(ask))?.target).toBeNull();
+  });
+
   it("creates the tool card if approvalRequired arrives first", () => {
     const s = run([prompt, { type: "approvalRequired", callId: "z", tool: "write_file", arguments: { path: "m.sql" }, reason: "Writes a file", preview: "--- a\n+++ b" }]);
     expect(tool(s, "z")).toMatchObject({ tool: "write_file", status: "awaitingApproval" });

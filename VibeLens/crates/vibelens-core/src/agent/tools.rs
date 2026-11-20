@@ -23,6 +23,8 @@ const MAX_SCHEMA_TABLES: usize = 200;
 /// Cap on `write_file` contents the agent may propose.
 const MAX_WRITE_BYTES: usize = 1024 * 1024;
 const MAX_CELL_CHARS: usize = 500;
+/// Longest `purpose` shown on an approval card, in characters.
+pub(super) const MAX_PURPOSE_CHARS: usize = 200;
 
 /// A validated tool invocation.
 #[derive(Debug, Clone, PartialEq)]
@@ -80,6 +82,45 @@ fn opt_str(input: &Value, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(String::from)
+}
+
+/// Characters that change how surrounding text is laid out without being visible themselves:
+/// bidirectional embeddings, overrides and isolates, and the Unicode line/paragraph separators.
+fn is_layout_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// The model's `purpose` as it may appear on an approval card: one line (line breaks, control
+/// and bidirectional characters become spaces, runs of whitespace collapse) of at most
+/// [`MAX_PURPOSE_CHARS`] characters. It sits next to the facts the user approves, so it must not
+/// be able to push them out of view or imitate them on a line of its own.
+pub(super) fn bounded_purpose(raw: &str) -> String {
+    let flat: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_control() || is_layout_control(c) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let line = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() <= MAX_PURPOSE_CHARS {
+        return line;
+    }
+    let mut cut: String = line.chars().take(MAX_PURPOSE_CHARS - 1).collect();
+    cut.push('…');
+    cut
 }
 
 fn req_str(input: &Value, key: &str) -> std::result::Result<String, String> {
@@ -143,6 +184,18 @@ impl ToolCall {
         }
     }
 
+    /// Fixes the Postgres database of a `run_sql` call to the one `configured` (the profile's
+    /// database) resolves to, so the name on the approval card is the name execution is handed,
+    /// even if the profile is edited while the card is open. No-op for every other call.
+    pub fn pin_database(&mut self, configured: Option<&str>) {
+        if let ToolCall::RunSql { database, .. } = self {
+            *database = Some(crate::model::effective_database(
+                configured,
+                database.as_deref(),
+            ));
+        }
+    }
+
     /// Validates the model's arguments. `default_profile` fills in a missing `profile_id`
     /// with the connection the user has active.
     pub fn parse(
@@ -186,6 +239,8 @@ impl ToolCall {
                     database: opt_str(input, "database"),
                     sql,
                     purpose: opt_str(input, "purpose")
+                        .map(|p| bounded_purpose(&p))
+                        .filter(|p| !p.is_empty())
                         .unwrap_or_else(|| "(no purpose given)".into()),
                 }
             }
@@ -1099,6 +1154,78 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// Review finding M3: `purpose` is model-written text in the approval card's headline.
+    #[test]
+    fn purpose_is_one_bounded_line() {
+        assert_eq!(
+            bounded_purpose("  check\tthe   totals \n"),
+            "check the totals"
+        );
+        assert_eq!(
+            bounded_purpose("line one\r\nline two\u{2028}three\u{0085}four"),
+            "line one line two three four"
+        );
+        // Bidirectional controls would let the text reorder what is shown around it.
+        assert_eq!(
+            bounded_purpose("safe\u{202E}evil\u{2066}x\u{2069}\u{200F}"),
+            "safe evil x"
+        );
+        let long = bounded_purpose(&"é".repeat(5_000));
+        assert_eq!(long.chars().count(), MAX_PURPOSE_CHARS);
+        assert!(long.ends_with('…'));
+        assert_eq!(
+            bounded_purpose(&"x".repeat(MAX_PURPOSE_CHARS))
+                .chars()
+                .count(),
+            200
+        );
+
+        let parsed = |purpose: &str| match ToolCall::parse(
+            "run_sql",
+            &json!({"profile_id":"p","sql":"select 1","purpose":purpose}),
+            None,
+        )
+        .unwrap()
+        {
+            ToolCall::RunSql { purpose, .. } => purpose,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            parsed("why\n\nPRODUCTION connection 'x'"),
+            "why PRODUCTION connection 'x'"
+        );
+        assert_eq!(parsed("\u{202E}\n"), "(no purpose given)");
+        assert!(parsed(&"a ".repeat(10_000)).chars().count() <= MAX_PURPOSE_CHARS);
+    }
+
+    #[test]
+    fn pin_database_resolves_like_execution_and_only_touches_run_sql() {
+        let run = |database: Option<&str>| ToolCall::RunSql {
+            profile_id: "p".into(),
+            database: database.map(String::from),
+            sql: "select 1".into(),
+            purpose: "x".into(),
+        };
+        let pinned = |mut c: ToolCall, configured: Option<&str>| {
+            c.pin_database(configured);
+            c
+        };
+        assert_eq!(pinned(run(None), Some("shop")), run(Some("shop")));
+        assert_eq!(
+            pinned(run(Some(" other ")), Some("shop")),
+            run(Some("other"))
+        );
+        assert_eq!(pinned(run(Some("  ")), Some("shop")), run(Some("shop")));
+        assert_eq!(pinned(run(None), None), run(Some("postgres")));
+        let scan = ToolCall::ValkeyScan {
+            profile_id: "v".into(),
+            db: 2,
+            pattern: "*".into(),
+            limit: 5,
+        };
+        assert_eq!(pinned(scan.clone(), Some("shop")), scan);
     }
 
     #[test]

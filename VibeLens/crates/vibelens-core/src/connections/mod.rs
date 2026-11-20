@@ -314,7 +314,7 @@ impl ConnectionManager {
                         None
                     }
                 };
-                let db = default_database(&profile, None);
+                let db = profile.effective_database(None);
                 if let Some(entry) = self.lock().pg.get_mut(&(profile.id.clone(), db))
                     && Arc::ptr_eq(&entry.handle, &handle)
                 {
@@ -465,7 +465,7 @@ impl ConnectionManager {
                 {
                     crate::pg::pgproxy_ready(url).await?;
                 }
-                let db = default_database(profile, None);
+                let db = profile.effective_database(None);
                 let (handle, tunnel) = self.dial_pg(profile, &db, creds).await?;
                 let version = handle.server_version().await;
                 handle.close().await;
@@ -527,11 +527,12 @@ impl ConnectionManager {
     }
 
     /// Pool for `(profile, database)`, connecting lazily. `database` defaults to the profile's
-    /// database, then `"postgres"`.
+    /// database, then `"postgres"` ([`ConnectionProfile::effective_database`], which is also what
+    /// the agent's approval card shows).
     pub async fn pg(&self, profile_id: &str, database: Option<&str>) -> Result<Arc<PgHandle>> {
         let profile = self.profiles.get(profile_id)?;
         require_engine(&profile, EngineKind::Postgres)?;
-        let db = default_database(&profile, database);
+        let db = profile.effective_database(database);
         let key = (profile.id.clone(), db.clone());
         let signature = connection_signature(&profile);
 
@@ -960,21 +961,6 @@ fn namespace_levels(filter: Option<&str>) -> Option<Vec<String>> {
 
 fn idle_exceeded(idle_secs: u64, limit_secs: u64) -> bool {
     limit_secs > 0 && idle_secs > limit_secs
-}
-
-fn default_database(profile: &ConnectionProfile, requested: Option<&str>) -> String {
-    requested
-        .map(str::trim)
-        .filter(|d| !d.is_empty())
-        .or_else(|| {
-            profile
-                .database
-                .as_deref()
-                .map(str::trim)
-                .filter(|d| !d.is_empty())
-        })
-        .unwrap_or("postgres")
-        .to_string()
 }
 
 fn require_engine(profile: &ConnectionProfile, wanted: EngineKind) -> Result<()> {
@@ -1429,13 +1415,14 @@ mod tests {
     #[test]
     fn default_database_precedence() {
         let mut p = profile(EngineKind::Postgres);
-        assert_eq!(default_database(&p, None), "postgres");
+        assert_eq!(p.effective_database(None), "postgres");
         p.database = Some("app".into());
-        assert_eq!(default_database(&p, None), "app");
-        assert_eq!(default_database(&p, Some("other")), "other");
-        assert_eq!(default_database(&p, Some("  ")), "app");
+        assert_eq!(p.effective_database(None), "app");
+        assert_eq!(p.effective_database(Some("other")), "other");
+        assert_eq!(p.effective_database(Some(" other ")), "other");
+        assert_eq!(p.effective_database(Some("  ")), "app");
         p.database = Some(String::new());
-        assert_eq!(default_database(&p, None), "postgres");
+        assert_eq!(p.effective_database(None), "postgres");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 // Pure transcript reducer for the AI agent. No React, no IPC: unit-tested in
 // src/store/__tests__/agentReducer.test.ts.
-import type { AgentEvent, ErrorPayload, ToolRisk, Usage } from "../../ipc/types";
+import type { AgentEvent, ApprovalTarget, ErrorPayload, ToolRisk, Usage } from "../../ipc/types";
 
 export type ToolStatus = "proposed" | "awaitingApproval" | "running" | "ok" | "error" | "denied" | "rejected";
 
@@ -38,6 +38,8 @@ export interface ApprovalItem {
   args: unknown;
   reason: string;
   preview: string | null;
+  /** Connection and database the call runs against; null for workspace tools. */
+  target: ApprovalTarget | null;
   status: "pending" | "approved" | "rejected";
   rejectReason: string | null;
 }
@@ -155,6 +157,7 @@ export function applyAgentEvent(state: AgentCore, ev: AgentStoreEvent): AgentCor
         args: ev.arguments,
         reason: ev.reason,
         preview: ev.preview,
+        target: ev.target ?? null,
         status: "pending",
         rejectReason: null,
       };

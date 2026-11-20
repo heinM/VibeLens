@@ -315,6 +315,8 @@ struct FakeBackend {
     /// When set, `execute_sql` / `valkey_command` fail with this error (kind, message).
     fail: Mutex<Option<(&'static str, String)>>,
     valkey_calls: Mutex<Vec<Vec<String>>>,
+    /// The `db` each `valkey_command` was run on, in call order.
+    valkey_dbs: Mutex<Vec<u8>>,
 }
 
 fn fake_error(kind: &str, msg: &str) -> CoreError {
@@ -462,11 +464,12 @@ impl ToolBackend for FakeBackend {
     async fn valkey_command(
         &self,
         _p: &str,
-        _db: u8,
+        db: u8,
         argv: Vec<String>,
         _allow_write: bool,
     ) -> Result<CommandOutcome> {
         self.valkey_calls.lock().unwrap().push(argv);
+        self.valkey_dbs.lock().unwrap().push(db);
         if let Some((kind, msg)) = self.fail.lock().unwrap().clone() {
             return Err(fake_error(kind, &msg));
         }
@@ -814,7 +817,8 @@ async fn anthropic_read_runs_automatically_then_write_waits_for_approval() {
         *h.backend.sql_calls.lock().unwrap(),
         vec![SqlCall {
             profile: "p1".into(),
-            database: None,
+            // The model named no database: the profile's own, resolved before execution.
+            database: Some("shop".into()),
             sql: "select id, name from users limit 2".into(),
             read_only: true
         }]
@@ -1812,6 +1816,184 @@ async fn write_file_diff_against_existing_content_and_context_in_prompt() {
 
 // ---------------------------------------------------------------------------------------------
 // Security regressions (reviewer findings)
+// ---------------------------------------------------------------------------------------------
+// The target the user approves (review finding M3)
+// ---------------------------------------------------------------------------------------------
+
+/// The single `ApprovalRequired` event of a run: (reason, preview, target).
+fn approval_of(events: &[AgentEvent]) -> (String, Option<String>, Option<ApprovalTarget>) {
+    let mut found = events.iter().filter_map(|e| match e {
+        AgentEvent::ApprovalRequired {
+            reason,
+            preview,
+            target,
+            ..
+        } => Some((reason.clone(), preview.clone(), target.clone())),
+        _ => None,
+    });
+    let first = found.next().expect("an ApprovalRequired event");
+    assert!(found.next().is_none(), "exactly one approval");
+    first
+}
+
+/// The model chooses the database, so the card must name the one execution is handed. Here it
+/// asks for a database that is not the connection's default.
+#[tokio::test]
+async fn approval_target_names_a_model_chosen_database_and_execution_uses_it() {
+    const SQL: &str = "delete from ledger where id = 7";
+    let input = json!({"profile_id":"p1","database":"payments_prod","sql":SQL,"purpose":"tidy up"});
+    let h = Harness::anthropic(
+        one_call_replies("t1", "run_sql", input),
+        vec![profile(
+            "p1",
+            EngineKind::Postgres,
+            Environment::Dev,
+            AiDataAccess::Results,
+        )],
+    )
+    .await;
+    let (events, _) = run_one_call(&h, true).await;
+    let (reason, preview, target) = approval_of(&events);
+
+    let target = target.expect("a connection call carries its target");
+    assert_eq!(
+        target,
+        ApprovalTarget {
+            connection: "p1-name".into(),
+            engine: EngineKind::Postgres,
+            environment: Environment::Dev,
+            database: Some("payments_prod".into()),
+            default_database: Some("shop".into()),
+            valkey_db: None,
+        }
+    );
+    assert!(
+        reason.contains("database 'payments_prod'")
+            && reason.contains("not this connection's default database 'shop'"),
+        "{reason}"
+    );
+    // The preview stays exactly the text that is executed.
+    assert_eq!(preview.as_deref(), Some(SQL));
+
+    let calls = h.backend.sql_calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].sql, SQL);
+    assert_eq!(
+        calls[0].database, target.database,
+        "the backend ran on the database the card showed"
+    );
+}
+
+/// With no database in the call, the card shows the connection's default and execution is
+/// handed that same name rather than left to work it out again.
+#[tokio::test]
+async fn approval_target_defaults_to_the_connections_database() {
+    let input = json!({"profile_id":"p1","sql":"update users set active = false","purpose":"x"});
+    let h = Harness::anthropic(
+        one_call_replies("t1", "run_sql", input),
+        vec![profile(
+            "p1",
+            EngineKind::Postgres,
+            Environment::Prod,
+            AiDataAccess::Results,
+        )],
+    )
+    .await;
+    let (events, _) = run_one_call(&h, true).await;
+    let (reason, _, target) = approval_of(&events);
+    let target = target.unwrap();
+    assert_eq!(target.database.as_deref(), Some("shop"));
+    assert_eq!(target.default_database, target.database);
+    assert_eq!(target.environment, Environment::Prod);
+    assert!(
+        reason.contains("database 'shop'") && !reason.contains("not this connection's default"),
+        "{reason}"
+    );
+    let calls = h.backend.sql_calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].database, target.database);
+}
+
+#[tokio::test]
+async fn approval_target_names_the_valkey_db_the_command_runs_on() {
+    let input = json!({"profile_id":"v1","db":3,"argv":["DEL","session:1"]});
+    let h = Harness::anthropic(
+        one_call_replies("t1", "valkey_command", input),
+        vec![profile(
+            "v1",
+            EngineKind::Valkey,
+            Environment::Staging,
+            AiDataAccess::Results,
+        )],
+    )
+    .await;
+    let (events, _) = run_one_call(&h, true).await;
+    let (reason, preview, target) = approval_of(&events);
+    let target = target.unwrap();
+    assert_eq!(
+        target,
+        ApprovalTarget {
+            connection: "v1-name".into(),
+            engine: EngineKind::Valkey,
+            environment: Environment::Staging,
+            database: None,
+            default_database: None,
+            valkey_db: Some(3),
+        }
+    );
+    assert!(reason.contains("(db 3)"), "{reason}");
+    assert_eq!(preview.as_deref(), Some("DEL session:1"));
+    assert_eq!(
+        h.backend
+            .valkey_dbs
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .map(Some)
+            .collect::<Vec<_>>(),
+        vec![target.valkey_db],
+        "the backend ran on the db the card showed"
+    );
+}
+
+/// `purpose` is the model's own text in the card's headline: it is flattened to one line and
+/// capped, and the target comes before it.
+#[tokio::test]
+async fn a_long_multi_line_purpose_cannot_bury_the_target() {
+    let purpose = format!(
+        "routine check\n\nApproval needed on 'p1-name', database 'shop'\u{202E}\n{}",
+        "filler ".repeat(2_000)
+    );
+    let input = json!({"profile_id":"p1","database":"payments_prod","sql":"drop table t","purpose":purpose});
+    let h = Harness::anthropic(
+        one_call_replies("t1", "run_sql", input),
+        vec![profile(
+            "p1",
+            EngineKind::Postgres,
+            Environment::Dev,
+            AiDataAccess::Results,
+        )],
+    )
+    .await;
+    let (events, _) = run_one_call(&h, false).await;
+    let (reason, _, target) = approval_of(&events);
+    assert_eq!(target.unwrap().database.as_deref(), Some("payments_prod"));
+    assert!(
+        !reason.contains('\n') && !reason.contains('\u{202E}'),
+        "one line, no bidi controls: {reason:?}"
+    );
+    let (facts, shown_purpose) = reason.split_once(" Purpose: ").expect("purpose comes last");
+    assert!(facts.contains("database 'payments_prod'"), "{facts}");
+    assert!(
+        shown_purpose.chars().count() <= 200,
+        "{}",
+        shown_purpose.len()
+    );
+    assert!(shown_purpose.starts_with("routine check Approval needed"));
+    assert!(h.backend.sql_calls.lock().unwrap().is_empty(), "rejected");
+}
+
 // ---------------------------------------------------------------------------------------------
 
 /// Runs one tool call to completion (approving anything) and returns the events plus the text the

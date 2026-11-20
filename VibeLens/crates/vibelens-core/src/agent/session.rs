@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::diff::unified_diff;
-use super::policy::{Assessment, ProfileFacts, assess};
+use super::policy::{Assessment, ProfileFacts, approval_target, assess};
 use super::prompt::build_system_prompt;
 use super::providers::{LlmRequest, LlmResponse, ProviderClient};
 use super::redact::model_error_text;
@@ -393,7 +393,7 @@ impl TurnRunner {
 
     async fn handle_call(&mut self, id: &str, name: &str, input: &Value) -> CallOutcome {
         let default_profile = self.ctx.profile_id.as_deref();
-        let call = match ToolCall::parse(name, input, default_profile) {
+        let mut call = match ToolCall::parse(name, input, default_profile) {
             Ok(c) => c,
             Err(msg) => {
                 return CallOutcome::Result(
@@ -416,6 +416,13 @@ impl TurnRunner {
             },
             None => None,
         };
+
+        // The model picks the database. Resolve it once, here, with the rule execution uses:
+        // the approval card shows this value and the backend is handed this value.
+        if let Some(f) = facts.as_ref().filter(|f| f.engine == EngineKind::Postgres) {
+            call.pin_database(f.database.as_deref());
+        }
+        let target = facts.as_ref().and_then(|f| approval_target(&call, f));
 
         // Ask the server whether a Valkey command writes, but only when it could matter (a Valkey
         // connection that may be used at all; policy refuses the call on any other engine).
@@ -499,6 +506,7 @@ impl TurnRunner {
                     arguments: input.clone(),
                     reason: plan.reason.clone().unwrap_or_default(),
                     preview,
+                    target,
                 })
                 .await;
                 let decision = tokio::select! {

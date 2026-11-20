@@ -102,7 +102,7 @@
 
 **Loop**: at most 16 tool steps per turn, then stop. Tool results go back to the model as *data* (tagged, truncated to about 24 KB). Under `schemaOnly`, row data never leaves the machine. Prompt injection in DB content can make the agent *request* any tool call. Writes and side effects hit the approval gate **only if they're recognised**. `READ ONLY` does not stop `dblink`, `pg_read_file`, `lo_*` or advisory locks, so those functions are classified as needing approval. Classification fails closed (§6).
 
-**Approval**: the loop emits `approvalRequired`, then parks on a `oneshot` keyed by `(session_id, call_id)`. `agent_resolve_approval` wakes it. Cancelling the turn rejects all pending approvals.
+**Approval**: the loop emits `approvalRequired`, then parks on a `oneshot` keyed by `(session_id, call_id)`. `agent_resolve_approval` wakes it. Cancelling the turn rejects all pending approvals. The event carries a `target` (connection name, environment, and the Postgres database or Valkey db number), which the card shows in a fixed header apart from the reason. The model chooses the database, so Rust resolves it once with the rule the connection manager uses (`effective_database`), shows that name and hands the same name to execution. The model's `purpose` is flattened to one line and capped at 200 characters.
 
 ---
 

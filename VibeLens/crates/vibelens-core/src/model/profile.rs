@@ -298,7 +298,24 @@ pub struct ConnectionProfile {
     pub iceberg: Option<super::iceberg::IcebergOptions>,
 }
 
+/// The Postgres database a call runs against: the requested one, else the profile's configured
+/// database, else `postgres` (blank names count as unset).
+///
+/// This is the only place that rule lives. The connection manager opens its pool with the
+/// result and the agent's approval card shows it, so the two cannot disagree.
+pub fn effective_database(configured: Option<&str>, requested: Option<&str>) -> String {
+    let named = |d: Option<&str>| d.map(str::trim).filter(|d| !d.is_empty()).map(String::from);
+    named(requested)
+        .or_else(|| named(configured))
+        .unwrap_or_else(|| "postgres".to_string())
+}
+
 impl ConnectionProfile {
+    /// [`effective_database`] for this profile.
+    pub fn effective_database(&self, requested: Option<&str>) -> String {
+        effective_database(self.database.as_deref(), requested)
+    }
+
     /// Keychain entries this profile's current auth, tunnel and Iceberg settings never read.
     /// Anything here is left over from an earlier configuration and should be deleted.
     pub fn unused_vault_keys(&self) -> Vec<String> {

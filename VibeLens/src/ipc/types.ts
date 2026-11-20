@@ -494,11 +494,26 @@ export interface Usage {
   inputTokens: number;
   outputTokens: number;
 }
+/**
+ * Where an agent call that needs approval will run. Rust builds it from the stored profile and
+ * the same database resolution execution uses, never from text the model wrote.
+ */
+export interface ApprovalTarget {
+  connection: string;
+  engine: EngineKind;
+  environment: Environment;
+  /** Postgres: the database the statement runs against. */
+  database: string | null;
+  /** Postgres: the connection's default database (what `database` is when the model names none). */
+  defaultDatabase: string | null;
+  /** Valkey: the logical database number. */
+  valkeyDb: number | null;
+}
 export type AgentEvent =
   | { type: "turnStarted"; turnId: string; providerId: string; model: string }
   | { type: "textDelta"; text: string }
   | { type: "toolCallProposed"; callId: string; tool: string; arguments: unknown; risk: ToolRisk; reason: string | null }
-  | { type: "approvalRequired"; callId: string; tool: string; arguments: unknown; reason: string; preview: string | null }
+  | { type: "approvalRequired"; callId: string; tool: string; arguments: unknown; reason: string; preview: string | null; target?: ApprovalTarget | null }
   | { type: "toolStarted"; callId: string }
   | { type: "toolFinished"; callId: string; ok: boolean; summary: string; elapsedMs: number }
   | { type: "fileWritten"; path: string }

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use super::profile::{EngineKind, Environment};
 use crate::error::ErrorPayload;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -133,6 +134,25 @@ pub struct Usage {
     pub output_tokens: u64,
 }
 
+/// Where a call that needs approval will run. Built by the agent loop from the stored profile
+/// and the same database resolution execution uses ([`super::profile::effective_database`]),
+/// never from text the model wrote, so the approval card can show it apart from the reason.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalTarget {
+    /// The connection's name.
+    pub connection: String,
+    pub engine: EngineKind,
+    pub environment: Environment,
+    /// Postgres: the database the statement runs against. `None` for other engines.
+    pub database: Option<String>,
+    /// Postgres: the connection's default database, i.e. what `database` is when the model
+    /// names none. The card warns when the two differ.
+    pub default_database: Option<String>,
+    /// Valkey: the logical database number. `None` for other engines.
+    pub valkey_db: Option<u8>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(
     tag = "type",
@@ -163,6 +183,8 @@ pub enum AgentEvent {
         reason: String,
         /// Human-readable preview: the SQL, or a unified diff for file writes.
         preview: Option<String>,
+        /// The connection and database the call runs against; `None` for workspace tools.
+        target: Option<ApprovalTarget>,
     },
     ToolStarted {
         call_id: String,

@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { parseBlocks, parseInline } from "../markdownParser";
 import { tokenizeSql } from "../sqlHighlight";
-import { mentionsProd, previewKind, summarizeToolArgs, formatElapsed } from "../toolSummary";
+import { describeTarget, mentionsProd, previewKind, summarizeToolArgs, formatElapsed } from "../toolSummary";
+import type { ApprovalTarget } from "../../../ipc/types";
 import { buildAgentContext, resolveTarget, NO_EXCLUSIONS } from "../../../hooks/useAgentContext";
 
 describe("markdown tables", () => {
@@ -97,6 +98,32 @@ describe("tool summaries", () => {
     expect(formatElapsed(450)).toBe("450 ms");
     expect(formatElapsed(2300)).toBe("2.3 s");
     expect(formatElapsed(null)).toBe("");
+  });
+});
+
+describe("approval target (review finding M3)", () => {
+  const pg = (database: string, defaultDatabase: string): ApprovalTarget => ({ connection: "orders-db", engine: "postgres", environment: "dev", database, defaultDatabase, valkeyDb: null });
+
+  it("names the connection, environment and database a statement runs against", () => {
+    expect(describeTarget(pg("shop", "shop"))).toEqual({ connection: "orders-db", environment: "dev", where: "database shop", warning: null });
+  });
+  it("says so in plain words when the database is not the connection's default", () => {
+    const t = describeTarget(pg("payments_prod", "shop"));
+    expect(t?.where).toBe("database payments_prod");
+    expect(t?.warning).toBe("Not this connection's default database (shop).");
+  });
+  it("shows the Valkey logical database number", () => {
+    expect(describeTarget({ connection: "cache", engine: "valkey", environment: "prod", database: null, defaultDatabase: null, valkeyDb: 3 })).toEqual({
+      connection: "cache",
+      environment: "prod",
+      where: "db 3",
+      warning: null,
+    });
+  });
+  it("has nothing to add for Iceberg and nothing at all without a target", () => {
+    expect(describeTarget({ connection: "lake", engine: "iceberg", environment: "test", database: null, defaultDatabase: null, valkeyDb: null })?.where).toBeNull();
+    expect(describeTarget(null)).toBeNull();
+    expect(describeTarget(undefined)).toBeNull();
   });
 });
 

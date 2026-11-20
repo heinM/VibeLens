@@ -1,5 +1,6 @@
 // Presentation helpers for agent tool calls. Argument shapes come from the Rust agent, so
 // everything here is defensive: unknown shapes fall back to compact JSON.
+import type { ApprovalTarget, Environment } from "../../ipc/types";
 
 export type ToolIconName = "list" | "schema" | "table" | "sql" | "key" | "files" | "file" | "write" | "other";
 
@@ -92,6 +93,35 @@ export function summarizeToolArgs(tool: string, args: unknown): string {
 
 /** True when text clearly concerns production (for the red approval treatment). */
 export const mentionsProd = (s: string | null | undefined): boolean => !!s && /\bprod(uction)?\b/i.test(s);
+
+/** What the approval card's fixed header says about where a call runs. */
+export interface TargetSummary {
+  connection: string;
+  environment: Environment;
+  /** "database shop" (Postgres) or "db 3" (Valkey); null when the engine has neither. */
+  where: string | null;
+  /** Set when the statement runs somewhere other than the connection's default database. */
+  warning: string | null;
+}
+
+/**
+ * Turns the backend-resolved target into the card's header text. The model picks the database
+ * (and the Valkey db number), so this is the user's only reliable view of where a call lands.
+ */
+export function describeTarget(target: ApprovalTarget | null | undefined): TargetSummary | null {
+  if (!target) return null;
+  let where: string | null = null;
+  let warning: string | null = null;
+  if (target.database != null) {
+    where = `database ${target.database}`;
+    if (target.defaultDatabase != null && target.defaultDatabase !== target.database) {
+      warning = `Not this connection's default database (${target.defaultDatabase}).`;
+    }
+  } else if (target.valkeyDb != null) {
+    where = `db ${target.valkeyDb}`;
+  }
+  return { connection: target.connection, environment: target.environment, where, warning };
+}
 
 export type PreviewKind = "sql" | "diff" | "text";
 

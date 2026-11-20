@@ -27,7 +27,8 @@
 
 use super::tools::ToolCall;
 use crate::model::{
-    AiDataAccess, ConnectionProfile, EngineKind, Environment, IcebergQueryEngine, ToolRisk,
+    AiDataAccess, ApprovalTarget, ConnectionProfile, EngineKind, Environment, IcebergQueryEngine,
+    ToolRisk, effective_database,
 };
 use crate::sql::{SqlClassification, StatementClass, classify};
 
@@ -41,6 +42,9 @@ pub(super) struct ProfileFacts {
     /// Iceberg connection whose SQL runs on Amazon Athena (billed per TB scanned, full DML)
     /// rather than the embedded engine (append-only). `false` for every other engine.
     pub athena: bool,
+    /// The profile's configured database (Postgres only; `None` when unset or another engine).
+    /// Always resolved through [`effective_database`], the rule execution uses.
+    pub database: Option<String>,
 }
 
 impl From<&ConnectionProfile> for ProfileFacts {
@@ -54,7 +58,59 @@ impl From<&ConnectionProfile> for ProfileFacts {
                 && p.iceberg
                     .as_ref()
                     .is_some_and(|o| matches!(o.query_engine, IcebergQueryEngine::Athena { .. })),
+            database: p
+                .database
+                .clone()
+                .filter(|_| p.engine == EngineKind::Postgres),
         }
+    }
+}
+
+/// Where `call` will run, for the approval card's fixed header: the connection, its environment
+/// and the Postgres database or Valkey db number. The model chooses the database and the db
+/// number, so they are resolved here exactly as execution resolves them
+/// ([`effective_database`]) and shown apart from anything the model wrote. `None` for tools
+/// that touch no connection.
+pub(super) fn approval_target(call: &ToolCall, f: &ProfileFacts) -> Option<ApprovalTarget> {
+    call.profile_id()?;
+    let postgres = f.engine == EngineKind::Postgres;
+    let requested = match call {
+        ToolCall::RunSql { database, .. }
+        | ToolCall::GetSchema { database, .. }
+        | ToolCall::DescribeTable { database, .. } => database.as_deref(),
+        _ => None,
+    };
+    let valkey_db = match call {
+        ToolCall::ValkeyScan { db, .. }
+        | ToolCall::ValkeyGet { db, .. }
+        | ToolCall::ValkeyCommand { db, .. } => Some(*db),
+        _ => None,
+    };
+    Some(ApprovalTarget {
+        connection: f.name.clone(),
+        engine: f.engine,
+        environment: f.environment,
+        database: postgres.then(|| effective_database(f.database.as_deref(), requested)),
+        default_database: postgres.then(|| effective_database(f.database.as_deref(), None)),
+        valkey_db: valkey_db.filter(|_| f.engine == EngineKind::Valkey),
+    })
+}
+
+/// `'orders-db', database 'payments' (not this connection's default database 'shop')` for
+/// Postgres, just the quoted connection name for Iceberg (which has no database to choose).
+fn sql_target_text(f: &ProfileFacts, requested: Option<&str>) -> String {
+    if f.engine != EngineKind::Postgres {
+        return format!("'{}'", f.name);
+    }
+    let database = effective_database(f.database.as_deref(), requested);
+    let default = effective_database(f.database.as_deref(), None);
+    if database == default {
+        format!("'{}', database '{database}'", f.name)
+    } else {
+        format!(
+            "'{}', database '{database}' (not this connection's default database '{default}')",
+            f.name
+        )
     }
 }
 
@@ -270,12 +326,17 @@ pub(super) fn assess(
             redact_values: f.access != AiDataAccess::Results,
             ..Assessment::safe()
         },
-        ToolCall::RunSql { sql, purpose, .. } => assess_sql(f, sql, purpose),
-        ToolCall::ValkeyGet { key, .. } => match f.access {
+        ToolCall::RunSql {
+            database,
+            sql,
+            purpose,
+            ..
+        } => assess_sql(f, database.as_deref(), sql, purpose),
+        ToolCall::ValkeyGet { db, key, .. } => match f.access {
             AiDataAccess::Results => Assessment::safe(),
             AiDataAccess::ResultsWithApproval => Assessment::approval(
                 format!(
-                    "Reading the value of '{key}' on '{}' sends stored data to the LLM provider; this connection requires approval for that.",
+                    "Reading the value of '{key}' on '{}' (db {db}) sends stored data to the LLM provider; this connection requires approval for that.",
                     f.name
                 ),
                 Some(format!("GET {key}")),
@@ -285,7 +346,9 @@ pub(super) fn assess(
                 f.name
             )),
         },
-        ToolCall::ValkeyCommand { argv, .. } => assess_valkey_command(f, argv, valkey_write),
+        ToolCall::ValkeyCommand { db, argv, .. } => {
+            assess_valkey_command(f, *db, argv, valkey_write)
+        }
         // Handled above.
         ToolCall::ListConnections
         | ToolCall::ListFiles
@@ -316,17 +379,20 @@ fn iceberg_write_note(f: &ProfileFacts, c: &SqlClassification) -> String {
     note
 }
 
-fn assess_sql(f: &ProfileFacts, sql: &str, purpose: &str) -> Assessment {
+/// `database` is what the model asked for; the reason names the database that results from it.
+/// The target always comes before the statement summary and the model's `purpose`, so neither
+/// can push it out of view. The preview is exactly the text that is executed.
+fn assess_sql(f: &ProfileFacts, database: Option<&str>, sql: &str, purpose: &str) -> Assessment {
     let c = classify(sql);
     let preview = Some(sql.to_string());
+    let target = sql_target_text(f, database);
     match c.overall {
         StatementClass::ReadOnly => match f.access {
             AiDataAccess::Results => Assessment::safe(),
             AiDataAccess::ResultsWithApproval => Assessment::approval(
                 format!(
-                    "Read-only query ({}) on '{}'. The rows it returns will be sent to the LLM provider.{} Purpose: {purpose}",
+                    "Read-only query on {target} ({}). The rows it returns will be sent to the LLM provider.{} Purpose: {purpose}",
                     c.summary,
-                    f.name,
                     if f.athena {
                         " Athena is billed per TB scanned."
                     } else {
@@ -371,8 +437,8 @@ fn assess_sql(f: &ProfileFacts, sql: &str, purpose: &str) -> Assessment {
             };
             Assessment::approval(
                 format!(
-                    "{prefix}{what} on '{}': {}{parse_note}.{note} Purpose: {purpose}",
-                    f.name, c.summary
+                    "{prefix}{what} on {target}: {}{parse_note}.{note} Purpose: {purpose}",
+                    c.summary
                 ),
                 preview,
             )
@@ -383,6 +449,7 @@ fn assess_sql(f: &ProfileFacts, sql: &str, purpose: &str) -> Assessment {
 
 fn assess_valkey_command(
     f: &ProfileFacts,
+    db: u8,
     argv: &[String],
     backend_says_write: bool,
 ) -> Assessment {
@@ -398,7 +465,7 @@ fn assess_valkey_command(
         let prefix = prod_prefix(f);
         return Assessment::approval(
             format!(
-                "{prefix}This command modifies data or runs code on '{}': {}",
+                "{prefix}This command modifies data or runs code on '{}' (db {db}): {}",
                 f.name,
                 command_line(argv)
             ),
@@ -413,7 +480,7 @@ fn assess_valkey_command(
         AiDataAccess::Results => Assessment::safe(),
         AiDataAccess::ResultsWithApproval => Assessment::approval(
             format!(
-                "Read command on '{}' returns stored values, which will be sent to the LLM provider: {}",
+                "Read command on '{}' (db {db}) returns stored values, which will be sent to the LLM provider: {}",
                 f.name,
                 command_line(argv)
             ),
@@ -439,6 +506,7 @@ mod tests {
             environment: env,
             access,
             athena: false,
+            database: Some("shop".into()),
         }
     }
     fn ice(access: AiDataAccess, env: Environment, athena: bool) -> ProfileFacts {
@@ -448,6 +516,7 @@ mod tests {
             environment: env,
             access,
             athena,
+            database: None,
         }
     }
     fn vk(access: AiDataAccess, env: Environment) -> ProfileFacts {
@@ -457,6 +526,7 @@ mod tests {
             environment: env,
             access,
             athena: false,
+            database: None,
         }
     }
     fn sql(s: &str) -> ToolCall {
@@ -1281,6 +1351,209 @@ mod tests {
         assert!(f.athena && f.engine == EngineKind::Iceberg);
         // The facts never carry catalog details.
         assert!(!format!("{f:?}").contains("sqlite"));
+    }
+
+    // ---- The target the user approves (review finding M3) --------------------------------
+
+    fn sql_on(database: Option<&str>, s: &str) -> ToolCall {
+        ToolCall::RunSql {
+            profile_id: "p".into(),
+            database: database.map(String::from),
+            sql: s.into(),
+            purpose: "testing".into(),
+        }
+    }
+
+    /// The model chooses the database, so the approval text must name the one that will be used.
+    #[test]
+    fn sql_approval_reason_names_the_database_the_statement_runs_against() {
+        for (access, s) in [
+            (Results, "delete from t"),
+            (ResultsWithApproval, "select * from t"),
+        ] {
+            let r = assess(
+                &sql_on(Some("payments_prod"), s),
+                Some(&pg(access, Environment::Dev)),
+                false,
+            );
+            assert_eq!(r.risk, NeedsApproval, "{s}");
+            let reason = r.reason.unwrap();
+            assert!(reason.contains("payments_prod"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn sql_approval_reason_says_when_the_database_is_not_the_default() {
+        let facts = pg(Results, Environment::Prod);
+        let reason = |database: Option<&str>| {
+            assess(&sql_on(database, "delete from t"), Some(&facts), false)
+                .reason
+                .unwrap()
+        };
+        // Named or not, the connection's own database is shown without a warning.
+        for same in [None, Some("shop"), Some("  "), Some(" shop ")] {
+            let r = reason(same);
+            assert!(r.contains("on 'orders-db', database 'shop':"), "{r}");
+            assert!(!r.contains("not this connection's default"), "{r}");
+        }
+        let r = reason(Some("payments_prod"));
+        assert!(
+            r.contains(
+                "on 'orders-db', database 'payments_prod' (not this connection's default database 'shop'):"
+            ),
+            "{r}"
+        );
+        // The target comes before the statement summary and the model's purpose.
+        let (target_at, summary_at, purpose_at) = (
+            r.find("payments_prod").unwrap(),
+            r.find("1 statement").unwrap(),
+            r.find("Purpose:").unwrap(),
+        );
+        assert!(target_at < summary_at && summary_at < purpose_at, "{r}");
+
+        // A profile with no database set runs on `postgres`, like the connection manager.
+        let unset = ProfileFacts {
+            database: None,
+            ..pg(Results, Environment::Dev)
+        };
+        let r = assess(&sql_on(None, "delete from t"), Some(&unset), false)
+            .reason
+            .unwrap();
+        assert!(r.contains("database 'postgres'"), "{r}");
+        // Iceberg has no database to choose; the argument is ignored there.
+        let r = assess(
+            &sql_on(Some("ignored"), "insert into shop.t values (1)"),
+            Some(&ice(Results, Environment::Dev, false)),
+            false,
+        )
+        .reason
+        .unwrap();
+        assert!(r.contains("on 'lake':") && !r.contains("ignored"), "{r}");
+    }
+
+    #[test]
+    fn approval_target_resolves_the_database_like_execution() {
+        let facts = pg(Results, Environment::Staging);
+        let t = approval_target(&sql_on(Some("payments_prod"), "select 1"), &facts).unwrap();
+        assert_eq!(
+            t,
+            ApprovalTarget {
+                connection: "orders-db".into(),
+                engine: EngineKind::Postgres,
+                environment: Environment::Staging,
+                database: Some("payments_prod".into()),
+                default_database: Some("shop".into()),
+                valkey_db: None,
+            }
+        );
+        let t = approval_target(&sql_on(None, "select 1"), &facts).unwrap();
+        assert_eq!(t.database.as_deref(), Some("shop"));
+        assert_eq!(t.database, t.default_database);
+
+        // Same rule as `ConnectionProfile::effective_database`, for every combination.
+        for configured in [None, Some("shop"), Some(""), Some("  ")] {
+            for requested in [None, Some("other"), Some(""), Some(" other ")] {
+                let facts = ProfileFacts {
+                    database: configured.map(String::from),
+                    ..pg(Results, Environment::Dev)
+                };
+                let t = approval_target(&sql_on(requested, "select 1"), &facts).unwrap();
+                assert_eq!(
+                    t.database,
+                    Some(effective_database(configured, requested)),
+                    "{configured:?} / {requested:?}"
+                );
+            }
+        }
+
+        let v = approval_target(
+            &ToolCall::ValkeyCommand {
+                profile_id: "v".into(),
+                db: 3,
+                argv: vec!["DEL".into(), "k".into()],
+            },
+            &vk(Results, Environment::Prod),
+        )
+        .unwrap();
+        assert_eq!((v.valkey_db, v.database.as_deref()), (Some(3), None));
+        assert_eq!(v.environment, Environment::Prod);
+
+        let i = approval_target(
+            &sql_on(Some("ignored"), "select 1"),
+            &ice(Results, Environment::Dev, true),
+        )
+        .unwrap();
+        assert_eq!(
+            (i.database, i.default_database, i.valkey_db),
+            (None, None, None)
+        );
+
+        // Workspace tools touch no connection.
+        let w = ToolCall::WriteFile {
+            path: "a.sql".into(),
+            contents: "x".into(),
+        };
+        assert!(approval_target(&w, &facts).is_none());
+    }
+
+    #[test]
+    fn facts_carry_the_configured_database_for_postgres_only() {
+        let mut p = ConnectionProfile {
+            id: "p".into(),
+            name: "orders-db".into(),
+            engine: EngineKind::Postgres,
+            host: "h".into(),
+            port: 5432,
+            database: Some("shop".into()),
+            auth: crate::model::AuthMethod::None,
+            tls: Default::default(),
+            tunnel: None,
+            environment: Environment::Dev,
+            ai_data_access: Results,
+            color: None,
+            pg: Default::default(),
+            valkey: Default::default(),
+            created_at: None,
+            updated_at: None,
+            iceberg: None,
+        };
+        assert_eq!(ProfileFacts::from(&p).database.as_deref(), Some("shop"));
+        p.engine = EngineKind::Valkey;
+        assert_eq!(ProfileFacts::from(&p).database, None);
+    }
+
+    #[test]
+    fn valkey_approval_reason_names_the_logical_database() {
+        let on_db3 = |argv: &[&str]| ToolCall::ValkeyCommand {
+            profile_id: "v".into(),
+            db: 3,
+            argv: argv.iter().map(|s| s.to_string()).collect(),
+        };
+        let write = assess(
+            &on_db3(&["DEL", "k"]),
+            Some(&vk(Results, Environment::Dev)),
+            true,
+        );
+        assert!(
+            write.reason.as_deref().unwrap().contains("db 3"),
+            "{write:?}"
+        );
+        let read = assess(
+            &on_db3(&["HGETALL", "h"]),
+            Some(&vk(ResultsWithApproval, Environment::Dev)),
+            false,
+        );
+        assert!(read.reason.as_deref().unwrap().contains("db 3"), "{read:?}");
+        let get = assess(
+            &ToolCall::ValkeyGet {
+                profile_id: "v".into(),
+                db: 3,
+                key: "k".into(),
+            },
+            Some(&vk(ResultsWithApproval, Environment::Dev)),
+            false,
+        );
+        assert!(get.reason.as_deref().unwrap().contains("db 3"), "{get:?}");
     }
 
     #[test]
