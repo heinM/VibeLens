@@ -484,9 +484,9 @@ fn with_default_region(props: &HashMap<String, String>) -> Option<HashMap<String
 /// `credential_process` or ECS identity, whatever the storage kind. This runs for every FileIO, so
 /// a path scheme that picks S3 regardless of the profile's storage setting is covered too.
 fn without_ambient_credentials(mut props: HashMap<String, String>) -> HashMap<String, String> {
-    if !props
+    if props
         .get("s3.access-key-id")
-        .is_some_and(|v| !v.trim().is_empty())
+        .is_none_or(|v| v.trim().is_empty())
     {
         props.insert("s3.allow-anonymous".into(), "true".into());
     }
