@@ -5,6 +5,8 @@
 //!   cargo test -p vibelens-core --test pg_engine
 //! ```
 
+mod services;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -58,7 +60,7 @@ macro_rules! require_pg {
         match dsn() {
             Some(d) => d,
             None => {
-                eprintln!("VG_TEST_PG not set; skipping");
+                crate::services::skip("pg", "VG_TEST_PG is not set");
                 return;
             }
         }

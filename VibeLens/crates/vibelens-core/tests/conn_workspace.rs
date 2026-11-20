@@ -1,5 +1,7 @@
 //! WorkspaceFs: the path jail, size cap, atomic writes and listing.
 
+mod services;
+
 use std::fs;
 
 use tempfile::tempdir;
@@ -519,7 +521,10 @@ async fn conn_an_unreadable_file_is_an_error_not_a_missing_file_and_is_not_repla
     let path = w.root().join("locked.sql");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
     if fs::read(&path).is_ok() {
-        eprintln!("skipping: this user can read a file with no permissions (root)");
+        services::skip(
+            "non-root",
+            "this user can read a file that has no permissions (root)",
+        );
         return;
     }
 

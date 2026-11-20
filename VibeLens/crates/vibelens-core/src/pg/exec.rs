@@ -1496,7 +1496,7 @@ mod tests {
         assert_eq!(r.command_tag.as_deref(), Some("INSERT"));
     }
 
-    // ---- database-backed (skipped without VG_TEST_PG) ------------------------------------------
+    // ---- database-backed (skipped without VG_TEST_PG; see tests/services) ----------------------
 
     use futures_util::FutureExt;
     use secrecy::SecretString;
@@ -1568,7 +1568,7 @@ mod tests {
     #[tokio::test]
     async fn after_statement_check_catches_what_the_lexer_misses() {
         let Some(h) = handle().await else {
-            eprintln!("VG_TEST_PG not set; skipping");
+            crate::test_services::skip("pg", "VG_TEST_PG is not set");
             return;
         };
         let table = format!("vg_unit_victim_{}", uuid::Uuid::new_v4().simple());
@@ -1633,6 +1633,7 @@ mod tests {
     #[tokio::test]
     async fn after_statement_check_does_not_trust_read_only_alone() {
         let Some(h) = handle().await else {
+            crate::test_services::skip("pg", "VG_TEST_PG is not set");
             return;
         };
         let obj = h.pool.get().await.expect("conn");
@@ -1675,6 +1676,7 @@ mod tests {
     #[tokio::test]
     async fn recycle_resets_a_connection_returned_dirty() {
         let Some(h) = handle().await else {
+            crate::test_services::skip("pg", "VG_TEST_PG is not set");
             return;
         };
         let key = i64::from(uuid::Uuid::new_v4().as_u128() as u32);

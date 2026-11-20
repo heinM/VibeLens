@@ -323,9 +323,12 @@ Override the workspace with `VIBELENS_WORKSPACE=/path`.
 docker compose -f docker-compose.dev.yml up -d
 export VG_TEST_PG="host=127.0.0.1 port=55432 user=postgres password=vibelens dbname=vibelens_test"
 export VG_TEST_VALKEY=redis://127.0.0.1:56379
+export VG_TEST_REQUIRE=pg,valkey   # optional: a test that would skip for lack of one of these fails
 cargo test -p vibelens-core     # engines, AWS signing, agent loop vs mock LLM
 npm run typecheck && npm test   # frontend
 ```
+
+Tests that need a service which is not configured skip: they print `skipping (<service>): <why>` (shown with `-- --nocapture`) and pass. `VG_TEST_REQUIRE` lists the services that must be there, and a skip for one of them is a failure; CI sets it to `pg,valkey`. The service names are in `crates/vibelens-core/tests/services/mod.rs`.
 
 **Contract rule:** `crates/vibelens-core/src/model/*.rs` ⇄ `src/ipc/types.ts`, and `src-tauri/src/lib.rs` ⇄ `src/ipc/commands.ts`. Change both sides in the same commit.
 

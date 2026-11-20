@@ -4,6 +4,8 @@
 //! Only logical databases 14 and 15 are touched; both are flushed at the start and end of
 //! every test. Tests serialise on a global lock because they share those databases.
 
+mod services;
+
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -127,7 +129,7 @@ macro_rules! fixture {
         match setup().await {
             Some(f) => f,
             None => {
-                eprintln!("VG_TEST_VALKEY not set; skipping");
+                crate::services::skip("valkey", "VG_TEST_VALKEY is not set");
                 return;
             }
         }
@@ -881,7 +883,7 @@ async fn idle_secs_and_close() {
 #[tokio::test]
 async fn wrong_credentials_are_an_auth_error_and_unreachable_is_not_connected() {
     let Some(env) = env() else {
-        eprintln!("VG_TEST_VALKEY not set; skipping");
+        crate::services::skip("valkey", "VG_TEST_VALKEY is not set");
         return;
     };
     // Dead port
@@ -923,7 +925,7 @@ async fn cluster_options_reject_nonzero_db_without_a_cluster() {
     // Pure option plumbing: asking for cluster mode against a standalone server fails to connect
     // cleanly (no panic, a typed error).
     let Some(env) = env() else {
-        eprintln!("VG_TEST_VALKEY not set; skipping");
+        crate::services::skip("valkey", "VG_TEST_VALKEY is not set");
         return;
     };
     let mut p = env.params();

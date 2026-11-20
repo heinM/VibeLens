@@ -1,5 +1,7 @@
 //! JsonProfileStore: CRUD, uniqueness, timestamps, atomic writes, corrupt-file recovery.
 
+mod services;
+
 mod conn_common;
 
 use std::fs;

@@ -8,6 +8,8 @@
 //!   its invalidation, disconnect, the idle reaper and the agent's tool backend.
 #![cfg(feature = "iceberg")]
 
+mod services;
+
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -492,11 +494,15 @@ struct Fixture {
     warehouse: String,
 }
 
+/// The pyiceberg fixture, or `None` after reporting the skip: the test returns.
 fn fixture() -> Option<Fixture> {
-    let db = std::env::var("VG_TEST_ICEBERG_SQL_DB").ok()?;
-    let warehouse = std::env::var("VG_TEST_ICEBERG_WAREHOUSE").ok()?;
+    let db = std::env::var("VG_TEST_ICEBERG_SQL_DB").unwrap_or_default();
+    let warehouse = std::env::var("VG_TEST_ICEBERG_WAREHOUSE").unwrap_or_default();
     if db.is_empty() || warehouse.is_empty() {
-        eprintln!("skipping: set VG_TEST_ICEBERG_SQL_DB and VG_TEST_ICEBERG_WAREHOUSE");
+        services::skip(
+            "iceberg",
+            "VG_TEST_ICEBERG_SQL_DB and VG_TEST_ICEBERG_WAREHOUSE are not both set",
+        );
         return None;
     }
     Some(Fixture { db, warehouse })

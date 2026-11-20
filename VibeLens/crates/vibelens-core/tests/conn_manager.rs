@@ -3,6 +3,8 @@
 //! connections point at a closed local port so engine connects fail fast, which is exactly
 //! what lets us check status transitions, tunnel lifecycle and error mapping.
 
+mod services;
+
 mod conn_common;
 
 use std::collections::HashMap;

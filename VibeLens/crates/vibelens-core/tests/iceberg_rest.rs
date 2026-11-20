@@ -2,6 +2,8 @@
 //! pyiceberg fixture, and the "profile storage settings beat catalog-vended ones" rule.
 #![cfg(feature = "iceberg")]
 
+mod services;
+
 mod iceberg_common;
 
 use std::collections::BTreeMap;
@@ -23,7 +25,7 @@ macro_rules! fixture {
         match shared() {
             Some(f) => f,
             None => {
-                eprintln!("skipping: VG_TEST_ICEBERG_SQL_DB / VG_TEST_ICEBERG_WAREHOUSE not set");
+                // The fixture helper has reported the skip.
                 return;
             }
         }

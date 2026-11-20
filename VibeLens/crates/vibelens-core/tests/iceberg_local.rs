@@ -2,6 +2,8 @@
 //! Gated on `VG_TEST_ICEBERG_SQL_DB` and `VG_TEST_ICEBERG_WAREHOUSE`.
 #![cfg(feature = "iceberg")]
 
+mod services;
+
 mod iceberg_common;
 
 use iceberg_common::*;
@@ -17,7 +19,7 @@ macro_rules! fixture {
         match shared() {
             Some(f) => f,
             None => {
-                eprintln!("skipping: VG_TEST_ICEBERG_SQL_DB / VG_TEST_ICEBERG_WAREHOUSE not set");
+                // The fixture helper has reported the skip.
                 return;
             }
         }

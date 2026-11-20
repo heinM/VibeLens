@@ -4,6 +4,8 @@
 //! card text and what the model is told, for both the embedded engine and Athena.
 #![cfg(feature = "iceberg")]
 
+mod services;
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1227,7 +1229,10 @@ mod real {
             std::env::var("VG_TEST_ICEBERG_SQL_DB"),
             std::env::var("VG_TEST_ICEBERG_WAREHOUSE"),
         ) else {
-            eprintln!("skipping: set VG_TEST_ICEBERG_SQL_DB and VG_TEST_ICEBERG_WAREHOUSE");
+            crate::services::skip(
+                "iceberg",
+                "VG_TEST_ICEBERG_SQL_DB and VG_TEST_ICEBERG_WAREHOUSE are not both set",
+            );
             return;
         };
         let mut profile = iceberg_profile(

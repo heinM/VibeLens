@@ -33,3 +33,9 @@ pub mod vault;
 pub mod workspace;
 
 pub use error::{CoreError, ErrorPayload, Result};
+
+/// The rule for a test whose outside service is missing (`VG_TEST_REQUIRE`): one file, shared
+/// with the integration tests in `tests/`.
+#[cfg(test)]
+#[path = "../tests/services/mod.rs"]
+mod test_services;

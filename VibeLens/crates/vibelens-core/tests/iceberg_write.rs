@@ -2,6 +2,8 @@
 //! fixture with pyiceberg (the shared one is never modified).
 #![cfg(feature = "iceberg")]
 
+mod services;
+
 mod iceberg_common;
 
 use iceberg_common::*;
@@ -13,7 +15,7 @@ macro_rules! fixture {
         match private_copy() {
             Some(f) => f,
             None => {
-                eprintln!("skipping: fixture env not set or pyiceberg unavailable");
+                // The fixture helper has reported the skip.
                 return;
             }
         }

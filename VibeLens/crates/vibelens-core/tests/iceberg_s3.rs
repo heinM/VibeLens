@@ -7,6 +7,8 @@
 //! `python3` with pyiceberg to write the tables. Skips cleanly otherwise.
 #![cfg(feature = "iceberg")]
 
+mod services;
+
 mod iceberg_common;
 
 use std::path::PathBuf;
@@ -51,14 +53,17 @@ m.main()
     {
         Ok(o) if o.status.success() => true,
         Ok(o) => {
-            eprintln!(
-                "skipping: cannot seed tables on S3: {}",
-                String::from_utf8_lossy(&o.stderr)
+            services::skip(
+                "iceberg-seed",
+                format!(
+                    "the seed script could not write tables to S3: {}",
+                    String::from_utf8_lossy(&o.stderr)
+                ),
             );
             false
         }
         Err(e) => {
-            eprintln!("skipping: python3 not runnable: {e}");
+            services::skip("iceberg-seed", format!("python3 could not be run: {e}"));
             false
         }
     }
@@ -117,6 +122,7 @@ async fn reads_from_s3_compatible_store_without_a_region() {
         .ok()
         .filter(|e| !e.is_empty())
     else {
+        services::skip("s3", "VG_TEST_S3_ENDPOINT is not set");
         return;
     };
     let tmp = tempfile::tempdir().unwrap();

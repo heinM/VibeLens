@@ -52,6 +52,9 @@ jobs:
     env:
       VG_TEST_PG: host=127.0.0.1 port=5432 user=postgres password=vibelens dbname=vibelens_test
       VG_TEST_VALKEY: redis://127.0.0.1:6379
+      # The two services above must really be there: a test that would skip for lack of one
+      # fails instead (crates/vibelens-core/tests/services/mod.rs).
+      VG_TEST_REQUIRE: pg,valkey
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 · Node 24
       - name: System deps (WebKitGTK for the Tauri shell)

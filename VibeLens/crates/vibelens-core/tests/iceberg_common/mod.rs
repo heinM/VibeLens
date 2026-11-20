@@ -2,7 +2,7 @@
 //!
 //! The tests run against Iceberg tables written by pyiceberg (see `scripts/seed/iceberg-seed.py`).
 //! Set `VG_TEST_ICEBERG_SQL_DB` (SQLite catalog file) and `VG_TEST_ICEBERG_WAREHOUSE` (warehouse
-//! directory); without them every test returns early. Tests that write regenerate a private copy
+//! directory); without them every test skips (`crate::services::skip`, service `iceberg`). Tests that write regenerate a private copy
 //! with the seed script, because the metadata files embed absolute paths and cannot be relocated.
 #![allow(dead_code)]
 
@@ -25,11 +25,15 @@ pub struct Fixture {
     pub _tmp: Option<tempfile::TempDir>,
 }
 
-/// The shared read-only fixture, or `None` (test skips).
+/// The shared read-only fixture, or `None` after reporting the skip: the test returns.
 pub fn shared() -> Option<Fixture> {
-    let db = std::env::var("VG_TEST_ICEBERG_SQL_DB").ok()?;
-    let warehouse = std::env::var("VG_TEST_ICEBERG_WAREHOUSE").ok()?;
+    let db = std::env::var("VG_TEST_ICEBERG_SQL_DB").unwrap_or_default();
+    let warehouse = std::env::var("VG_TEST_ICEBERG_WAREHOUSE").unwrap_or_default();
     if db.is_empty() || warehouse.is_empty() {
+        crate::services::skip(
+            "iceberg",
+            "VG_TEST_ICEBERG_SQL_DB and VG_TEST_ICEBERG_WAREHOUSE are not both set",
+        );
         return None;
     }
     Some(Fixture {
@@ -39,13 +43,13 @@ pub fn shared() -> Option<Fixture> {
     })
 }
 
-/// A private, freshly seeded fixture that tests may write to. `None` when the env is unset or
-/// pyiceberg is not available (the test then skips).
+/// A private, freshly seeded fixture that tests may write to. `None` after reporting the skip
+/// when the env is unset or pyiceberg is not available: the test returns.
 pub fn private_copy() -> Option<Fixture> {
     shared()?;
     let script =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/seed/iceberg-seed.py");
-    let tmp = tempfile::tempdir().ok()?;
+    let tmp = tempfile::tempdir().expect("tempdir");
     let db = tmp.path().join("catalog.db");
     let wh = tmp.path().join("warehouse");
     let out = std::process::Command::new("python3")
@@ -54,12 +58,21 @@ pub fn private_copy() -> Option<Fixture> {
         .arg(&db)
         .arg("--warehouse")
         .arg(&wh)
-        .output()
-        .ok()?;
+        .output();
+    let out = match out {
+        Ok(out) => out,
+        Err(e) => {
+            crate::services::skip("iceberg-seed", format!("python3 could not be run: {e}"));
+            return None;
+        }
+    };
     if !out.status.success() {
-        eprintln!(
-            "skipping: cannot seed a private fixture: {}",
-            String::from_utf8_lossy(&out.stderr)
+        crate::services::skip(
+            "iceberg-seed",
+            format!(
+                "the seed script could not write a private fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ),
         );
         return None;
     }

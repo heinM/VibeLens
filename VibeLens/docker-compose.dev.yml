@@ -4,6 +4,7 @@
 #   scripts/seed/valkey-seed.sh | docker compose -f docker-compose.dev.yml exec -T valkey valkey-cli
 #   export VG_TEST_PG="host=127.0.0.1 port=55432 user=postgres password=vibelens dbname=vibelens_test"
 #   export VG_TEST_VALKEY=redis://127.0.0.1:56379
+#   export VG_TEST_REQUIRE=pg,valkey   # optional: a test that would skip for lack of one of these fails
 #   cargo test -p vibelens-core
 services:
   postgres:

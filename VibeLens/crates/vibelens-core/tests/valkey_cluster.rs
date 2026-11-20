@@ -11,6 +11,8 @@
 //!
 //! The test writes keys prefixed `vgtest:` and deletes them at the end.
 
+mod services;
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -64,7 +66,7 @@ async fn cleanup(h: &ValkeyHandle, keys: &[String]) {
 #[tokio::test]
 async fn scans_every_primary_exactly_once() {
     let Some(h) = connect().await else {
-        eprintln!("VG_TEST_VALKEY_CLUSTER not set; skipping");
+        services::skip("valkey-cluster", "VG_TEST_VALKEY_CLUSTER is not set");
         return;
     };
 
@@ -223,7 +225,10 @@ async fn tls_cluster_verifies_the_certificate_name_not_the_dial_host() {
             .ok()
             .filter(|s| !s.is_empty()),
     ) else {
-        eprintln!("VG_TEST_VALKEY_CLUSTER_TLS/CA/SNI not set; skipping");
+        services::skip(
+            "valkey-cluster-tls",
+            "VG_TEST_VALKEY_CLUSTER_TLS, _CA and _SNI are not all set",
+        );
         return;
     };
     let (host, port) = target.rsplit_once(':').expect("host:port");

@@ -5,6 +5,8 @@
 //! - `VG_TEST_PG="host=… port=… user=… password=… dbname=…"`  Postgres tests
 //! - `VG_TEST_SSH=1` (+ VG_TEST_VALKEY)       Valkey through a real SSH tunnel
 
+mod services;
+
 mod conn_common;
 
 use std::sync::Arc;
@@ -102,7 +104,7 @@ fn argv(parts: &[&str]) -> Vec<String> {
 #[tokio::test]
 async fn conn_valkey_lifecycle_reuse_invalidation_and_reaping() {
     let Some((host, port)) = valkey_target() else {
-        eprintln!("VG_TEST_VALKEY not set; skipping");
+        services::skip("valkey", "VG_TEST_VALKEY is not set");
         return;
     };
     let l = live(
@@ -190,7 +192,7 @@ async fn conn_valkey_lifecycle_reuse_invalidation_and_reaping() {
 #[tokio::test]
 async fn conn_valkey_tool_backend_scan_get_and_write_detection() {
     let Some((host, port)) = valkey_target() else {
-        eprintln!("VG_TEST_VALKEY not set; skipping");
+        services::skip("valkey", "VG_TEST_VALKEY is not set");
         return;
     };
     let l = live(
@@ -292,7 +294,7 @@ async fn conn_valkey_tool_backend_scan_get_and_write_detection() {
 #[tokio::test]
 async fn conn_valkey_test_connection_reports_version_and_failures() {
     let Some((host, port)) = valkey_target() else {
-        eprintln!("VG_TEST_VALKEY not set; skipping");
+        services::skip("valkey", "VG_TEST_VALKEY is not set");
         return;
     };
     let l = live(
@@ -373,7 +375,7 @@ fn pg_profile_for(d: &Dsn) -> ConnectionProfile {
 #[tokio::test]
 async fn conn_postgres_connect_reuse_databases_and_tool_backend() {
     let Some(d) = pg_dsn() else {
-        eprintln!("VG_TEST_PG not set; skipping");
+        services::skip("pg", "VG_TEST_PG is not set");
         return;
     };
     let l = live(
@@ -468,7 +470,7 @@ async fn conn_postgres_connect_reuse_databases_and_tool_backend() {
 #[tokio::test]
 async fn conn_postgres_test_connection_with_password_override() {
     let Some(d) = pg_dsn() else {
-        eprintln!("VG_TEST_PG not set; skipping");
+        services::skip("pg", "VG_TEST_PG is not set");
         return;
     };
     // The credential source would hand out a WRONG password; only the override can succeed.
@@ -558,7 +560,7 @@ fn stored_pin(store: &JsonProfileStore, id: &str) -> Option<String> {
 #[tokio::test]
 async fn conn_test_never_writes_a_host_key_to_the_saved_profile() {
     let Some((host, port)) = valkey_target() else {
-        eprintln!("VG_TEST_VALKEY not set; skipping");
+        services::skip("valkey", "VG_TEST_VALKEY is not set");
         return;
     };
     let _one_sshd = SSHD.lock().await;
@@ -637,7 +639,7 @@ async fn conn_test_never_writes_a_host_key_to_the_saved_profile() {
 #[tokio::test]
 async fn conn_valkey_over_a_real_ssh_tunnel_with_explicit_trust_pinning_and_recovery() {
     let Some((host, port)) = valkey_target() else {
-        eprintln!("VG_TEST_VALKEY not set; skipping");
+        services::skip("valkey", "VG_TEST_VALKEY is not set");
         return;
     };
     let _one_sshd = SSHD.lock().await;
@@ -773,7 +775,7 @@ async fn conn_valkey_over_a_real_ssh_tunnel_with_explicit_trust_pinning_and_reco
 #[tokio::test]
 async fn conn_postgres_idle_reaper_releases_sessions_but_stays_connected() {
     let Some(d) = pg_dsn() else {
-        eprintln!("VG_TEST_PG not set; skipping");
+        services::skip("pg", "VG_TEST_PG is not set");
         return;
     };
     let l = live(

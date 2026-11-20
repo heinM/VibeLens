@@ -1,12 +1,14 @@
 //! SshTunnelProvider against a real, throwaway `sshd` (127.0.0.1:2222).
 //!
 //! Opt-in: set `VG_TEST_SSH=1` (the setup script installs `openssh-server` if needed and starts
-//! `sshd -D` with generated keys; see `conn_tunnel_setup.sh`). Without it every test returns
-//! immediately. The forwarding target is the local Redis on 127.0.0.1:6379 (override with
+//! `sshd -D` with generated keys; see `conn_tunnel_setup.sh`). Without it every test skips
+//! (`services::skip`, service `ssh`). The forwarding target is the local Redis on 127.0.0.1:6379 (override with
 //! `VG_TEST_REDIS_ADDR`) and a small in-process echo server.
 //!
 //! Tests are serialised: they share the sshd port and a few process-wide environment variables
 //! (`SSH_AUTH_SOCK`, `HOME`).
+
+mod services;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -406,8 +408,9 @@ async fn conn_password_authentication() {
     sshd_or_return!(_g, sshd);
     let pw_user = sshd.get("PASSWORD_USER").to_string();
     if pw_user.is_empty() {
-        eprintln!(
-            "skipping password auth: setup script could not create a password user (not root?)"
+        services::skip(
+            "ssh-password",
+            "the setup script could not create a password user (not root?)",
         );
         return;
     }
@@ -532,6 +535,7 @@ async fn conn_ssh_agent_authentication() {
 async fn conn_unreachable_bastion_is_a_tunnel_error() {
     let _g = SERIAL.lock().await;
     if std::env::var("VG_TEST_SSH").as_deref() != Ok("1") {
+        services::skip("ssh", "VG_TEST_SSH is not 1 (the sshd-backed tests)");
         return;
     }
     let free = std::net::TcpListener::bind("127.0.0.1:0")
