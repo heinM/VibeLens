@@ -125,6 +125,21 @@ impl AgentService {
         config.base_url = config.base_url.trim().to_string();
         config.model = config.model.trim().to_string();
         store::validate(&config)?;
+        // The key this provider will have once saved: the new one, or the stored one when kept.
+        let will_have_key = match &api_key {
+            Some(k) => !k.expose_secret().trim().is_empty(),
+            // An unreadable keychain is not a reason to refuse the save; the same rule runs
+            // again when the provider is used.
+            None => self
+                .api_key(&config.id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|k| !k.expose_secret().trim().is_empty()),
+        };
+        if will_have_key {
+            store::check_key_is_not_sent_in_cleartext(&config)?;
+        }
         let key_name = vault_keys::llm_api_key(&config.id);
         if let Some(k) = &api_key {
             let k = k.expose_secret().trim();

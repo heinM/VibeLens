@@ -116,24 +116,16 @@ pub(super) fn validate(cfg: &ProviderConfig) -> Result<()> {
     }
     let url = url::Url::parse(cfg.base_url.trim())
         .map_err(|e| CoreError::Invalid(format!("base URL is not valid: {e}")))?;
-    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-    match url.scheme() {
-        "https" => {}
-        "http" => {
-            let loopback = host == "localhost"
-                || host == "127.0.0.1"
-                || host == "[::1]"
-                || host.ends_with(".localhost");
-            if cfg.requires_api_key && !loopback {
-                return bad(
-                    "an API key would be sent unencrypted: use an https:// base URL for remote providers",
-                );
-            }
-        }
-        _ => return bad("base URL must start with http:// or https://"),
+    if !matches!(url.scheme(), "http" | "https") {
+        return bad("base URL must start with http:// or https://");
     }
-    if host.is_empty() {
+    if url.host_str().unwrap_or_default().is_empty() {
         return bad("base URL has no host");
+    }
+    if cfg.requires_api_key && crate::cleartext::is_cleartext_remote(&url) {
+        return bad(
+            "an API key would be sent unencrypted: use an https:// base URL for remote providers",
+        );
     }
     for (k, v) in &cfg.extra_headers {
         if reqwest::header::HeaderName::from_bytes(k.as_bytes()).is_err()
@@ -144,11 +136,7 @@ pub(super) fn validate(cfg: &ProviderConfig) -> Result<()> {
             )));
         }
         // providers.json is not the vault: credentials must not end up in it.
-        if SECRET_HEADERS.contains(&k.to_ascii_lowercase().as_str())
-            || v.trim_start()
-                .get(..7)
-                .is_some_and(|p| p.eq_ignore_ascii_case("bearer "))
-        {
+        if crate::cleartext::is_credential_header(k, v) {
             return Err(CoreError::Invalid(format!(
                 "extra header '{k}' looks like a credential: put secrets in the API key field, not in extra headers"
             )));
@@ -160,16 +148,24 @@ pub(super) fn validate(cfg: &ProviderConfig) -> Result<()> {
     Ok(())
 }
 
-/// Lower-case header names that carry credentials.
-const SECRET_HEADERS: &[&str] = &[
-    "authorization",
-    "proxy-authorization",
-    "x-api-key",
-    "api-key",
-    "x-goog-api-key",
-    "x-portkey-api-key",
-    "cookie",
-];
+/// Refuses to pair an API key with a cleartext address on another machine. [`validate`] covers
+/// providers that say they need a key; this covers a key that exists anyway (one saved earlier,
+/// then "requires an API key" was switched off). An error, not a silently dropped key: the user
+/// should know why the provider they configured is not used.
+pub(super) fn check_key_is_not_sent_in_cleartext(cfg: &ProviderConfig) -> Result<()> {
+    let Ok(url) = url::Url::parse(cfg.base_url.trim()) else {
+        return Ok(()); // `validate` reports an unusable base URL
+    };
+    if crate::cleartext::is_cleartext_remote(&url) {
+        return Err(CoreError::Invalid(format!(
+            "{} has an API key saved, and it would be sent unencrypted to {}. Use an https:// \
+             base URL, or remove the key if this endpoint needs none",
+            cfg.label.trim(),
+            url.host_str().unwrap_or_default()
+        )));
+    }
+    Ok(())
+}
 
 /// Older builds wrote providers.json with default permissions; tighten it to match new writes.
 #[cfg(unix)]

@@ -161,7 +161,10 @@ pub(crate) struct ProviderClient {
 }
 
 impl ProviderClient {
-    /// Fails with `Invalid` when the config is unusable (no model, missing key).
+    /// Fails with `Invalid` when the config is unusable (no model, missing key) or would not
+    /// pass a save: `providers.json` can be edited by hand, so the rules of
+    /// [`validate`](super::store::validate) run again here, and a key is never attached to a
+    /// cleartext address on another machine.
     pub fn new(
         cfg: ProviderConfig,
         key: Option<SecretString>,
@@ -173,15 +176,16 @@ impl ProviderClient {
                 cfg.label
             )));
         }
-        if cfg.kind == ProviderKind::Portkey {
-            portkey::validate(&cfg)?;
-        }
+        super::store::validate(&cfg)?;
         let key = key.filter(|k| !k.expose_secret().trim().is_empty());
         if cfg.requires_api_key && key.is_none() {
             return Err(CoreError::Invalid(format!(
                 "add an API key for {} in Settings",
                 cfg.label
             )));
+        }
+        if key.is_some() {
+            super::store::check_key_is_not_sent_in_cleartext(&cfg)?;
         }
         Ok(Self { cfg, key, http })
     }
@@ -461,6 +465,69 @@ pub(crate) fn parse_tool_args(raw: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cfg(base_url: &str, requires_api_key: bool) -> ProviderConfig {
+        ProviderConfig {
+            id: "gw".into(),
+            label: "Gateway".into(),
+            kind: ProviderKind::OpenAiCompatible,
+            base_url: base_url.into(),
+            model: "m".into(),
+            max_tokens: 1024,
+            temperature: None,
+            extra_headers: Default::default(),
+            requires_api_key,
+            portkey: None,
+        }
+    }
+
+    fn client(cfg: ProviderConfig, key: Option<&str>) -> Result<ProviderClient> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        ProviderClient::new(
+            cfg,
+            key.map(|k| SecretString::from(k.to_string())),
+            reqwest::Client::new(),
+        )
+    }
+
+    fn refusal(r: Result<ProviderClient>) -> String {
+        match r {
+            Err(CoreError::Invalid(m)) => m,
+            Err(e) => panic!("expected Invalid, got {e:?}"),
+            Ok(_) => panic!("expected Invalid, got a usable client"),
+        }
+    }
+
+    /// Review finding M7. "No API key needed" can be ticked while a key from earlier is still
+    /// in the keychain; it would be attached and sent in the clear.
+    #[test]
+    fn a_key_is_never_attached_to_a_cleartext_remote_endpoint() {
+        const K: &str = "sk-test-0123456789";
+        let m = refusal(client(cfg("http://llm.internal:8080/v1", false), Some(K)));
+        assert!(m.contains("unencrypted") && !m.contains(K), "{m}");
+
+        // Nothing to leak without a key; this machine and https take the key.
+        assert!(client(cfg("http://llm.internal:8080/v1", false), None).is_ok());
+        assert!(client(cfg("http://localhost:11434/v1", false), Some(K)).is_ok());
+        assert!(client(cfg("https://llm.example/v1", false), Some(K)).is_ok());
+    }
+
+    /// `providers.json` can be edited by hand, so what `validate` refuses on save is refused
+    /// again on use.
+    #[test]
+    fn a_config_is_validated_again_when_it_is_used() {
+        const K: &str = "sk-test-0123456789";
+        let m = refusal(client(cfg("http://llm.internal/v1", true), Some(K)));
+        assert!(m.contains("unencrypted"), "{m}");
+
+        let mut c = cfg("https://llm.example/v1", true);
+        c.extra_headers
+            .insert("Authorization".into(), "Bearer abc".into());
+        let m = refusal(client(c, Some(K)));
+        assert!(m.contains("credential") && !m.contains("abc"), "{m}");
+
+        refusal(client(cfg("ftp://llm.example/v1", false), None));
+    }
 
     #[test]
     fn redirect_targets_are_shown_without_credentials_or_query() {

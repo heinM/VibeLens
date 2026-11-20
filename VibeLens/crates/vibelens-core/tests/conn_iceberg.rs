@@ -317,6 +317,84 @@ async fn ice_engine_mismatch_and_missing_options_are_invalid_and_never_dial() {
 
 // ---- always-on: status transitions on failure --------------------------------------------------
 
+/// Review finding M7: a profile edited by hand (the in-memory store has no rules) that would
+/// send a secret in the clear, or that keeps one outside the keychain, is refused when used.
+#[tokio::test]
+async fn ice_profiles_with_a_secret_in_the_wrong_place_are_refused_on_use() {
+    let h = harness();
+    let vault = Arc::new(MemoryVault::new());
+    h.mgr.set_iceberg_deps(IcebergDeps {
+        aws: AwsService::new(),
+        vault: vault.clone(),
+    });
+    let options = |catalog| {
+        Some(IcebergOptions {
+            catalog,
+            storage: IcebergStorage::Local,
+            query_engine: IcebergQueryEngine::Local,
+            default_namespace: None,
+        })
+    };
+    let rest = |uri: String, auth, header: Option<(&str, &str)>| IcebergCatalog::Rest {
+        uri,
+        warehouse: None,
+        auth,
+        headers: header
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    };
+    let here = format!("http://127.0.0.1:{}", closed_port());
+    for p in [
+        base(
+            "token to a cleartext catalog",
+            options(rest(
+                "http://catalog.internal.example:8181".into(),
+                RestAuth::Bearer,
+                None,
+            )),
+        ),
+        base(
+            "credential in a header",
+            options(rest(
+                here.clone(),
+                RestAuth::None,
+                Some(("Authorization", "Basic c2VjcmV0")),
+            )),
+        ),
+        base(
+            "password in the catalog URI",
+            options(IcebergCatalog::Sql {
+                uri: format!("postgres://iceberg:hunter2@127.0.0.1:{}/c", closed_port()),
+                warehouse: "file:///tmp/vg-none".into(),
+                catalog_name: "c".into(),
+            }),
+        ),
+    ] {
+        let saved = h.profiles.upsert(p).unwrap();
+        // A token is in the keychain, so only the rule stands between it and the network.
+        use vibelens_core::ports::SecretVault;
+        vault
+            .set(
+                &vault_keys::iceberg_secret(&saved.id),
+                &SecretString::from("s3cr3t-token".to_string()),
+            )
+            .await
+            .unwrap();
+        let e = h.mgr.iceberg(&saved.id).await.err().expect("refused");
+        assert!(
+            matches!(&e, CoreError::Invalid(m) if !m.contains("hunter2") && !m.contains("c2VjcmV0") && !m.contains("s3cr3t")),
+            "{}: {e:?}",
+            saved.name
+        );
+        assert!(
+            matches!(h.mgr.test(&saved, None).await, Err(CoreError::Invalid(_))),
+            "{}",
+            saved.name
+        );
+    }
+}
+
 #[tokio::test]
 async fn ice_failed_connect_records_error_status_with_detail_then_disconnect_clears_it() {
     let h = harness_with_deps();

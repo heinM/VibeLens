@@ -61,6 +61,8 @@ impl IcebergHandle {
             .iceberg
             .clone()
             .ok_or_else(|| CoreError::Invalid("this connection has no Iceberg options".into()))?;
+        // The stored profile may have been edited by hand; the rules a save applies run again.
+        crate::cleartext::check_profile(&profile)?;
         let athena_cfg = athena_target(&opts)?;
 
         let factory: Arc<dyn CatalogFactory> = Arc::new(ProfileFactory::new(&profile, &deps)?);

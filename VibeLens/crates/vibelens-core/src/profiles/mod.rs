@@ -1,8 +1,11 @@
 //! JSON-file profile store (OWNER: connections agent).
 //!
 //! File: `<config_dir>/profiles.json` = `{ "version": 1, "profiles": [...] }`, written atomically
-//! (temp file in the same directory, fsync, rename; `0600` on unix). Contains NO secrets, which
-//! the type system enforces: secrets aren't fields of [`ConnectionProfile`].
+//! (temp file in the same directory, fsync, rename; `0600` on unix). It is meant to contain no
+//! secrets. Passwords, tokens and keys are not fields of [`ConnectionProfile`], but a few
+//! free-text fields could carry one (Iceberg REST headers, a catalog URI with a password in it),
+//! so [`upsert`](ProfileStore::upsert) refuses those through [`crate::cleartext::check_profile`],
+//! together with settings that would send a secret unencrypted.
 //!
 //! The file is loaded lazily on first use and cached in memory behind a mutex; every mutation is
 //! persisted *before* the cache is updated, so a failed write leaves memory and disk in agreement.
@@ -204,6 +207,7 @@ impl ProfileStore for JsonProfileStore {
         if profile.name.is_empty() {
             return Err(CoreError::Invalid("profile name must not be empty".into()));
         }
+        crate::cleartext::check_profile(&profile)?;
         profile.id = profile.id.trim().to_string();
 
         let mut guard = self.loaded()?;

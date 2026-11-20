@@ -1487,6 +1487,79 @@ async fn start_turn_validates_before_spawning() {
     assert!(matches!(e, CoreError::NotFound(_)));
 }
 
+/// Review finding M7, providers: a key is neither stored for nor sent to a cleartext address on
+/// another machine, whatever "requires an API key" says.
+#[tokio::test]
+async fn a_key_is_not_saved_for_or_sent_to_a_cleartext_remote_provider() {
+    let llm = MockLlm::start(vec![]).await;
+    let h = Harness::new(llm, vec![]);
+    let key = || Some(SecretString::from(KEY.to_string()));
+    let has_key = |list: Vec<ProviderSummary>| {
+        list.iter()
+            .find(|p| p.config.id == "gw")
+            .is_some_and(|p| p.has_api_key)
+    };
+    let refused = |r: Result<()>| match r {
+        Err(CoreError::Invalid(m)) => {
+            assert!(m.contains("unencrypted") && !m.contains(KEY), "{m}");
+        }
+        other => panic!("expected Invalid, got {other:?}"),
+    };
+    let remote = "http://llm.internal.example:8080";
+    let secure = "https://llm.internal.example";
+
+    // Saving a key together with the cleartext address: refused, and nothing is stored.
+    refused(
+        h.svc
+            .save_provider(openai_cfg("gw", remote, false), key())
+            .await,
+    );
+    assert!(!has_key(h.svc.list_providers().await.unwrap()));
+
+    // A key saved while the address was https, then the address changes and the key is kept.
+    h.svc
+        .save_provider(openai_cfg("gw", secure, false), key())
+        .await
+        .unwrap();
+    refused(
+        h.svc
+            .save_provider(openai_cfg("gw", remote, false), None)
+            .await,
+    );
+    // Removing the key in the same save makes the cleartext address acceptable.
+    h.svc
+        .save_provider(
+            openai_cfg("gw", remote, false),
+            Some(SecretString::from(String::new())),
+        )
+        .await
+        .unwrap();
+    assert!(!has_key(h.svc.list_providers().await.unwrap()));
+
+    // providers.json edited by hand while a key is in the keychain: refused when it is used.
+    h.svc
+        .save_provider(openai_cfg("gw", secure, false), key())
+        .await
+        .unwrap();
+    let path = h._dir.path().join("providers.json");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains(secure), "{text}");
+    std::fs::write(&path, text.replace(secure, remote)).unwrap();
+    let (tx, _rx) = mpsc::channel(8);
+    let e = h
+        .svc
+        .start_turn(
+            "s".into(),
+            "gw".into(),
+            "hi".into(),
+            AgentContext::default(),
+            tx,
+        )
+        .await
+        .map(|_| ());
+    refused(e);
+}
+
 #[tokio::test]
 async fn provider_settings_roundtrip() {
     let llm = MockLlm::start(vec![]).await;

@@ -15,6 +15,7 @@ pub mod agent;
 #[cfg(feature = "iceberg")]
 pub mod athena;
 pub mod aws;
+pub mod cleartext;
 pub mod connections;
 pub mod error;
 pub mod iceberg;

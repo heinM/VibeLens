@@ -173,12 +173,14 @@ pub(crate) fn storage_identity(opts: &IcebergOptions) -> Option<&AwsTarget> {
     }
 }
 
-/// Rewrites a `postgres://` URI so it carries `password` (percent-encoded by `url`). Other schemes
-/// and URIs that already carry a password are returned unchanged.
+/// Rewrites a `postgres://` URI so it carries `password` (percent-encoded by `url`). Other
+/// schemes are returned unchanged. A URI that brings its own password is refused: it would have
+/// been written to the profile file ([`crate::cleartext::check_sql_catalog_uri`]).
 pub(crate) fn inject_password(uri: &str, password: &str) -> Result<String> {
+    crate::cleartext::check_sql_catalog_uri(uri)?;
     let mut url = url::Url::parse(uri)
         .map_err(|e| CoreError::Invalid(format!("catalog URI is not valid: {e}")))?;
-    if !matches!(url.scheme(), "postgres" | "postgresql") || url.password().is_some() {
+    if !matches!(url.scheme(), "postgres" | "postgresql") {
         return Ok(uri.to_string());
     }
     if url.username().is_empty() {
@@ -204,6 +206,9 @@ fn trim_uri(uri: &str) -> String {
 }
 
 /// REST catalog properties (without storage props).
+///
+/// Refuses, before the secret is looked at, a combination that would send it in the clear or
+/// that keeps a credential in a header ([`crate::cleartext::check_rest_catalog`]).
 pub(crate) fn rest_props(
     uri: &str,
     warehouse: Option<&str>,
@@ -211,6 +216,7 @@ pub(crate) fn rest_props(
     secret: Option<&str>,
     headers: &std::collections::BTreeMap<String, String>,
 ) -> Result<HashMap<String, String>> {
+    crate::cleartext::check_rest_catalog(uri, auth, headers)?;
     let mut p = HashMap::new();
     p.insert("uri".to_string(), trim_uri(uri));
     if let Some(w) = warehouse.map(str::trim).filter(|w| !w.is_empty()) {
@@ -693,6 +699,8 @@ impl CatalogFactory for ProfileFactory {
                 warehouse,
                 catalog_name,
             } => {
+                // Also when no password is stored: one in the URI would go straight to the driver.
+                crate::cleartext::check_sql_catalog_uri(uri)?;
                 install_sql_drivers();
                 let secret = self.secret().await?;
                 let uri = match secret.as_deref().filter(|s| !s.is_empty()) {
@@ -1324,7 +1332,7 @@ mod tests {
         assert!(!p.contains_key("token") && !p.contains_key("credential"));
 
         let p = rest_props(
-            "http://x",
+            "https://x",
             None,
             &RestAuth::Bearer,
             Some("abc"),
@@ -1338,7 +1346,7 @@ mod tests {
             scope: Some("PRINCIPAL_ROLE:ALL".into()),
             server_uri: Some("https://idp/token".into()),
         };
-        let p = rest_props("http://x", None, &oauth, Some("s3cr3t"), &BTreeMap::new()).unwrap();
+        let p = rest_props("https://x", None, &oauth, Some("s3cr3t"), &BTreeMap::new()).unwrap();
         assert_eq!(p["credential"], "cid:s3cr3t");
         assert_eq!(p["scope"], "PRINCIPAL_ROLE:ALL");
         assert_eq!(p["oauth2-server-uri"], "https://idp/token");
@@ -1347,13 +1355,13 @@ mod tests {
     #[test]
     fn missing_secret_is_an_auth_error() {
         let e =
-            rest_props("http://x", None, &RestAuth::Bearer, None, &BTreeMap::new()).unwrap_err();
+            rest_props("https://x", None, &RestAuth::Bearer, None, &BTreeMap::new()).unwrap_err();
         assert!(
             matches!(&e, CoreError::Auth(m) if m == "no token saved"),
             "{e:?}"
         );
         let e = rest_props(
-            "http://x",
+            "https://x",
             None,
             &RestAuth::Bearer,
             Some(""),
@@ -1367,9 +1375,80 @@ mod tests {
             server_uri: None,
         };
         assert!(matches!(
-            rest_props("http://x", None, &oauth, None, &BTreeMap::new()),
+            rest_props("https://x", None, &oauth, None, &BTreeMap::new()),
             Err(CoreError::Auth(_))
         ));
+    }
+
+    /// Review finding M7. The rules run where the properties are built, so a profile edited by
+    /// hand gets no further than one saved through the app.
+    #[test]
+    fn rest_props_never_puts_a_secret_on_a_cleartext_connection() {
+        let none = BTreeMap::new();
+        let oauth = |server: Option<&str>| RestAuth::OAuth2 {
+            client_id: "cid".into(),
+            scope: None,
+            server_uri: server.map(String::from),
+        };
+        for auth in [RestAuth::Bearer, oauth(None)] {
+            let e = rest_props(
+                "http://catalog.internal:8181",
+                None,
+                &auth,
+                Some("s3cr3t"),
+                &none,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&e, CoreError::Invalid(m) if m.contains("unencrypted") && !m.contains("s3cr3t")),
+                "{e:?}"
+            );
+        }
+        let e = rest_props(
+            "https://catalog.example",
+            None,
+            &oauth(Some("http://idp.internal/token")),
+            Some("s3cr3t"),
+            &none,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&e, CoreError::Invalid(m) if m.contains("client secret")),
+            "{e:?}"
+        );
+
+        let mut h = BTreeMap::new();
+        h.insert("X-Api-Key".to_string(), "s3cr3t".to_string());
+        let e = rest_props("https://catalog.example", None, &RestAuth::None, None, &h).unwrap_err();
+        assert!(
+            matches!(&e, CoreError::Invalid(m) if m.contains("X-Api-Key") && !m.contains("s3cr3t")),
+            "{e:?}"
+        );
+
+        // The default new connection, and a local catalog that wants a token.
+        rest_props("http://localhost:8181", None, &RestAuth::None, None, &none).unwrap();
+        let p = rest_props(
+            "http://127.0.0.1:8181",
+            None,
+            &RestAuth::Bearer,
+            Some("t"),
+            &none,
+        )
+        .unwrap();
+        assert_eq!(p["token"], "t");
+    }
+
+    #[test]
+    fn a_sql_catalog_uri_with_its_own_password_is_refused() {
+        let e = inject_password(
+            "postgres://iceberg:hunter2@db.internal/catalog",
+            "from-the-keychain",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&e, CoreError::Invalid(m) if m.contains("password field") && !m.contains("hunter2")),
+            "{e:?}"
+        );
     }
 
     #[test]
@@ -1382,14 +1461,10 @@ mod tests {
         assert_eq!(parsed.path(), "/catalog");
         assert_eq!(percent_decode(parsed.password().unwrap()), "p@ss/w:rd#1");
         assert!(!u.contains("p@ss"), "raw password must not appear: {u}");
-        // sqlite is untouched; an existing password is respected.
+        // sqlite is untouched. (A URI with its own password is refused: see the test above.)
         assert_eq!(
             inject_password("sqlite:///tmp/c.db", "x").unwrap(),
             "sqlite:///tmp/c.db"
-        );
-        assert_eq!(
-            inject_password("postgres://u:old@h/db", "new").unwrap(),
-            "postgres://u:old@h/db"
         );
         assert!(
             inject_password("postgres://h/db", "x").is_err(),

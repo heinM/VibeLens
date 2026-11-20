@@ -561,6 +561,91 @@ async fn conn_different_databases_connect_independently() {
 
 // ---- test() -------------------------------------------------------------------------------
 
+/// Review finding M7, the open point: a token that whoever reads it can replay is not sent
+/// without TLS to another machine. The in-memory store here has no rules of its own, like a
+/// `profiles.json` edited by hand.
+#[tokio::test]
+async fn conn_bearer_credentials_are_not_sent_without_tls_to_another_machine() {
+    let h = harness();
+    let aws = AwsTarget {
+        identity: AwsIdentity::DefaultChain,
+        region: "eu-west-1".into(),
+    };
+
+    let mut token = pg_profile("token");
+    token.auth = AuthMethod::AccessToken {
+        username: "me".into(),
+        command: None,
+    };
+    token.tls.mode = TlsMode::Disable;
+    token.pg.connect_timeout_secs = 2;
+    let token = h.profiles.upsert(token).unwrap();
+
+    let mut iam = token.clone();
+    iam.id = String::new();
+    iam.name = "iam".into();
+    iam.auth = AuthMethod::RdsIam {
+        username: "app".into(),
+        aws: aws.clone(),
+    };
+    let iam = h.profiles.upsert(iam).unwrap();
+
+    for p in [&token, &iam] {
+        let e = h.mgr.pg(&p.id, None).await.err().expect("refused");
+        assert!(
+            matches!(&e, CoreError::Invalid(m) if m.contains("TLS")),
+            "{}: {e:?}",
+            p.name
+        );
+        assert!(
+            matches!(h.mgr.test(p, None).await, Err(CoreError::Invalid(_))),
+            "{}",
+            p.name
+        );
+    }
+
+    let mut cache = valkey_profile("cache", "cache.internal.example", 6379);
+    cache.auth = AuthMethod::ElastiCacheIam {
+        username: "app".into(),
+        cache_name: "c".into(),
+        serverless: false,
+        aws,
+    };
+    cache.valkey.connect_timeout_secs = 2;
+    let cache = h.profiles.upsert(cache).unwrap();
+    let e = h.mgr.valkey(&cache.id).await.err().expect("refused");
+    assert!(
+        matches!(&e, CoreError::Invalid(m) if m.contains("TLS")),
+        "{e:?}"
+    );
+    assert!(matches!(
+        h.mgr.test(&cache, None).await,
+        Err(CoreError::Invalid(_))
+    ));
+
+    assert_eq!(
+        h.creds.resolves.load(Ordering::SeqCst),
+        0,
+        "no credential was fetched"
+    );
+
+    // Through the SSH tunnel the same profile is dialled (and fails here only because the
+    // fake tunnel leads to a closed port).
+    let mut tunnelled = token.clone();
+    tunnelled.id = String::new();
+    tunnelled.name = "tunnelled".into();
+    tunnelled.tunnel = Some(ssh_tunnel());
+    let tunnelled = h.profiles.upsert(tunnelled).unwrap();
+    let e = h
+        .mgr
+        .pg(&tunnelled.id, None)
+        .await
+        .err()
+        .expect("dead port");
+    assert!(!matches!(e, CoreError::Invalid(_)), "{e:?}");
+    assert_eq!(h.tunnels.calls().len(), 1);
+}
+
 #[tokio::test]
 async fn conn_test_rejects_invalid_input_with_err() {
     let h = harness();

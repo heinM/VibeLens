@@ -414,6 +414,8 @@ impl ConnectionManager {
                 ));
             }
         }
+        // A draft that would send a secret in the clear is invalid input, not a failed test.
+        crate::cleartext::check_profile(profile)?;
         let started = Instant::now();
         let outcome =
             match tokio::time::timeout(TEST_TIMEOUT, self.test_inner(profile, password_override))
@@ -877,6 +879,9 @@ impl ConnectionManager {
         database: &str,
         creds: CredentialFn,
     ) -> Result<(Arc<PgHandle>, Option<TunnelHandle>)> {
+        // Before the tunnel and before any credential is fetched. The profile may have been
+        // edited by hand, so the rules a save applies run again here.
+        crate::cleartext::check_profile(profile)?;
         let tunnel = self.open_tunnel(profile).await?;
         let (host, port) = dial_target(profile, &tunnel);
         let params = PgConnectParams {
@@ -897,6 +902,7 @@ impl ConnectionManager {
         profile: &ConnectionProfile,
         creds: CredentialFn,
     ) -> Result<(Arc<ValkeyHandle>, Option<TunnelHandle>)> {
+        crate::cleartext::check_profile(profile)?;
         if profile.tunnel.is_some() && profile.valkey.cluster {
             tracing::warn!(profile = %profile.name, "Valkey cluster mode through an SSH tunnel will not follow MOVED redirects (see docs/DESIGN.md §8)");
         }

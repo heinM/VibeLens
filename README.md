@@ -150,7 +150,7 @@ agent › Written. Review it in the new tab; it batches the backfill in 10k-row 
 | Passwords, SSH keys' passphrases, LLM API keys | macOS Keychain / Windows Credential Manager |
 | Secrets Manager values, IAM DB tokens | Process memory only (zeroized on drop), never sent to the UI |
 | SSO access token | `~/.aws/sso/cache/*.json`, **plaintext, exactly like the AWS CLI** |
-| Connection profiles | `profiles.json` in the app config dir. No secrets, by type. |
+| Connection profiles | `profiles.json` in the app config dir. No secrets: passwords, tokens and keys are not part of a profile, and a save is refused if a header or a catalog URI carries one. |
 
 Also: a strict CSP, Tauri capabilities limited to `core:default` (plus opening `https://` links), TLS verify-full by default (with the RDS CA bundle), and pinned SSH host keys: a key is never trusted silently, and no credential is sent to a host whose key you have not checked.
 
