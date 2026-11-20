@@ -638,7 +638,7 @@ fn not_run_after_truncation(truncated: usize, total: usize, max_rows: usize) -> 
         format!("statements {first} to {last} were not run")
     };
     CoreError::Invalid(format!(
-        "statement {} returned more than {max_rows} rows, so this read-only run stopped there          and {rest}. Add a LIMIT to statement {}, or run the rest separately",
+        "statement {} returned more than {max_rows} rows, so this read-only run stopped there and {rest}. Add a LIMIT to statement {}, or run the rest separately",
         truncated + 1,
         truncated + 1
     ))
