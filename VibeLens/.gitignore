@@ -28,3 +28,4 @@ dist-ssr
 
 # Redis/Valkey snapshots from local test servers
 dump.rdb
+dist-release
