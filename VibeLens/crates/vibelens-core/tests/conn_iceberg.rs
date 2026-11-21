@@ -156,6 +156,7 @@ fn base(name: &str, options: Option<IcebergOptions>) -> ConnectionProfile {
         created_at: None,
         updated_at: None,
         iceberg: options,
+        redshift: None,
     }
 }
 

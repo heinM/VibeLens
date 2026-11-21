@@ -11,6 +11,9 @@ pub enum EngineKind {
     Valkey,
     /// Apache Iceberg tables via a catalog (REST, Glue, S3 Tables, SQL, HMS). Options in `iceberg`.
     Iceberg,
+    /// Amazon Redshift (provisioned or Serverless) through the Redshift Data API, authenticated
+    /// with IAM. Options in `redshift`.
+    Redshift,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -320,6 +323,10 @@ pub struct ConnectionProfile {
     /// Required when `engine == Iceberg`; ignored otherwise. `host`/`port` are unused for Iceberg.
     #[serde(default)]
     pub iceberg: Option<super::iceberg::IcebergOptions>,
+    /// Required when `engine == Redshift`; ignored otherwise. `host`, `port`, `auth`, `tls` and
+    /// `tunnel` are unused for Redshift. Holds no secret, so it has no vault entry.
+    #[serde(default)]
+    pub redshift: Option<super::redshift::RedshiftOptions>,
 }
 
 /// The Postgres database a call runs against: the requested one, else the profile's configured

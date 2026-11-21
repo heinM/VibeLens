@@ -25,6 +25,8 @@ aws-sdk-athena = { version = "1.127.0", default-features = false, features = ["d
 # Same version iceberg uses: its StorageFactory trait objects are typetag-serialized.
 typetag = { version = "0.2.23", optional = true }
 aws-sdk-rds = { version = "1.159.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+# Amazon Redshift through the Data API (SigV4, no database password on the machine).
+aws-sdk-redshiftdata = { version = "1.126.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-s3tables = { version = "1.76.0", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 aws-sdk-secretsmanager = { version = "1.125.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-sso = { version = "1.119.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
