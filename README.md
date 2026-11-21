@@ -38,6 +38,7 @@ VibeLens makes that path native, and adds an agent that does real work (inspecti
 | Secrets Manager ARN as the credential | – | ✅ in-memory only |
 | ElastiCache (Valkey) IAM auth | – | ✅ |
 | Apache Iceberg: REST, Glue, S3 Tables, SQL catalogs; local engine or Athena | – / separate tool | ✅ |
+| Amazon Redshift (provisioned or Serverless) with IAM, through the Data API | JDBC + IAM plugin | ✅ no password, no tunnel |
 | Works with the AI switched off (Classic mode) | ✅ | ✅ |
 | SSH bastion tunnel with host-key pinning | ✅ | ✅ |
 | Idle disconnect so Serverless can scale to zero | – | ✅ |
@@ -277,6 +278,26 @@ The local engine reads the files with **your** credentials, so Lake Formation co
 </details>
 
 <details>
+<summary><b>Amazon Redshift with IAM</b></summary>
+
+New connection → **Amazon Redshift**. Pick a provisioned cluster or a Serverless workgroup, the
+database, an AWS identity and how the database user is chosen. Every call goes through the Redshift
+Data API over HTTPS, signed with that identity: no database password is stored, and no tunnel or VPN
+to the cluster is needed.
+
+| Auth | IAM permissions (besides the Data API calls below) |
+|---|---|
+| IAM identity (default): your IAM user or role is the database user (`IAM:user` / `IAMR:role`) | provisioned: `redshift:GetClusterCredentialsWithIAM`; Serverless: `redshift-serverless:GetCredentials` |
+| Database user (provisioned only) | `redshift:GetClusterCredentials` on that `dbuser` (and `dbname`) |
+| Secrets Manager secret | `secretsmanager:GetSecretValue` on the secret |
+
+Data API calls: `redshift-data:ExecuteStatement`, `DescribeStatement`, `GetStatementResult`,
+`CancelStatement`, `ListDatabases`, `ListSchemas`, `ListTables`, `DescribeTable`. Each statement commits on
+its own (the Data API has no multi-statement transactions), so `BEGIN`/`COMMIT`/`ROLLBACK` are refused;
+results are limited to 100 MB per statement.
+</details>
+
+<details>
 <summary><b>Private VPC via SSH bastion</b></summary>
 
 **Network → SSH tunnel**: bastion host, user, and ssh-agent, key file or password. The first time you connect or test, VibeLens shows the host key fingerprint and sends nothing to the server (no user name, key or password) until you have checked it and chosen to trust it. You can also paste the fingerprint into the connection up front. A later mismatch is refused. VibeLens forwards a random local port and still verifies TLS against the real database hostname.
@@ -350,6 +371,7 @@ Tests that need a service which is not configured skip: they print `skipping (<s
   - It reads S3 directly, so **Lake Formation permissions are not applied**; use Athena for LF-governed tables.
 - **Iceberg SQL catalogs** created by pyiceberg or Java's default JDBC schema lack a nullable `iceberg_type` column that the Rust catalog needs. VibeLens adds it automatically **only on connections marked dev**. Elsewhere it tells you the one `ALTER TABLE` for the catalog's owner to run.
 - **Athena** results and cost come from real AWS APIs, but VibeLens's Athena integration has so far been tested against a mock endpoint, not a live account. Set a per-query data-scanned limit on the workgroup you use.
+- **Redshift** has so far been tested against a mock of the Data API, not a live warehouse. No multi-statement transactions (each statement commits on its own); results up to 100 MB per statement.
 
 ## Roadmap
 **Done since V1:** interface modes · query history · exports · ERD · explain visualiser · table editing · Apache Iceberg + Athena
