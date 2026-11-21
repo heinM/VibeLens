@@ -19,7 +19,18 @@
 
 use super::lex::{Lexed, Tok, lex};
 use crate::error::{CoreError, Result};
-use crate::sql::{StatementClass, classify};
+use crate::sql::{SpanKind, StatementClass, classify, quoted_and_comment_spans};
+
+/// Whether byte `p` of `stmt` lies inside a single-quoted literal (any prefix) or a double-quoted
+/// identifier in `spans`. A dollar-quoted body does not count.
+fn inside_quotes(stmt: &str, spans: &[(SpanKind, usize, usize)], p: usize) -> bool {
+    spans.iter().any(|&(kind, start, end)| {
+        start <= p
+            && p < end
+            && matches!(kind, SpanKind::Str | SpanKind::QuotedIdent)
+            && stmt.as_bytes().get(start) != Some(&b'$')
+    })
+}
 
 fn words(stmt: &str) -> Vec<String> {
     lex(stmt, true).words_upper()
@@ -78,6 +89,38 @@ pub(crate) fn check_unambiguous(statements: &[String]) -> Result<()> {
                  as an escaped quote while standard SQL reads '\\' as a complete string, so \
                  VibeLens cannot tell what this statement would do and does not run it. Write a \
                  quote inside a string by doubling it ('it''s'), and a backslash as CHR(92)",
+                which(i, statements.len())
+            )));
+        }
+        // A non-ASCII byte outside a `'…'` literal or a `"…"` identifier (in a word, a comment, a
+        // dollar-quote tag or body) is where lexers have been seen to disagree: `$é$` is a
+        // dollar-quote tag to one and not to another, and every boundary after it moves. Refused
+        // unless both this module's lexers and the classifier's place it inside quotes.
+        let sql_spans = quoted_and_comment_spans(stmt);
+        let rs_spans = lex(stmt, true).spans;
+        let std_spans = lex(stmt, false).spans;
+        let stray = stmt.bytes().enumerate().any(|(p, b)| {
+            b >= 0x80
+                && !(inside_quotes(stmt, &sql_spans, p)
+                    && inside_quotes(stmt, &rs_spans, p)
+                    && inside_quotes(stmt, &std_spans, p))
+        });
+        if stray {
+            return Err(CoreError::PolicyDenied(format!(
+                "{}the statement has a non-ASCII character outside a 'string' or a \"quoted \
+                 identifier\" (in a name, a comment or a $tag$ quote). Those are read \
+                 differently by different SQL lexers, so VibeLens cannot be sure what Redshift \
+                 would run. Put the text in a 'string' or the name in \"double quotes\", and \
+                 use ASCII $$ tags",
+                which(i, statements.len())
+            )));
+        }
+        // Belt and braces: the classifier and Redshift must agree on every string, quoted
+        // identifier and comment, or nothing they say about the statement can be trusted.
+        if sql_spans != rs_spans {
+            return Err(CoreError::PolicyDenied(format!(
+                "{}VibeLens's SQL reader and Redshift's would split this statement into strings \
+                 and comments differently, so it is not run. Simplify the quoting",
                 which(i, statements.len())
             )));
         }
@@ -566,6 +609,71 @@ mod tests {
         ] {
             check_script(&stmts(sql)).unwrap_or_else(|e| panic!("{sql}: {e}"));
         }
+    }
+
+    /// Re-audit: a non-ASCII dollar-quote tag. `crate::sql` reads `$é$ … $é$` as a string; a lexer
+    /// with an ASCII-only tag rule does not, and every boundary after it moves.
+    #[test]
+    fn non_ascii_outside_quotes_is_refused() {
+        for sql in [
+            r"SELECT $é$ ' $é$ , '\' , ' AS x INTO public.pwned FROM secrets -- '",
+            "SELECT $é$ ' $é$ , exfil_lambda(ssn) , $é$ ' $é$ FROM customers",
+            "SELECT $é$ x $é$",
+            "SELECT café FROM t",
+            "SELECT 1 -- naïve comment",
+            "SELECT $$ é $$",
+        ] {
+            assert!(check_script(&stmts(sql)).is_err(), "{sql}");
+        }
+        for sql in [
+            "SELECT 'café', \"naïve\" FROM t",
+            "SELECT E'é', U&'é', N'é' FROM t",
+        ] {
+            check_script(&stmts(sql)).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+    }
+
+    /// Property: whatever `check_unambiguous` admits, the classifier's lexer and Redshift's
+    /// agree on every string, quoted identifier and comment span. The corpus holds every payload
+    /// of both audits and the quoting forms that differ between dialects.
+    #[test]
+    fn admitted_statements_have_identical_spans_under_both_lexers() {
+        let corpus = [
+            r"SELECT '\' , ' AS x INTO public.pwned FROM secrets -- '",
+            r"SELECT '\' , ' , pg_terminate_backend(123) -- '",
+            r"SELECT $é$ ' $é$ , '\' , ' AS x INTO public.pwned FROM secrets -- '",
+            "SELECT $é$ ' $é$ , exfil_lambda(ssn) , $é$ ' $é$ FROM customers",
+            "SELECT f_notify(card_number) FROM payments",
+            r"SELECT E'\'' , 1",
+            "SELECT E'abc', B'101', X'ff', N'x'",
+            "SELECT U&'d\\0061t' , U&\"d\\0061t\" FROM t",
+            "SELECT $$ it's; $$, $tag$ a $$ b $tag$, $1",
+            "SELECT $a$ x $b$ y $a$ , 2",
+            "SELECT /* a /* nested ' */ still */ 1",
+            "SELECT 1 -- comment ' \r, 'after CR'",
+            "SELECT 1 -- comment \n, 'after LF'",
+            "SELECT 'a''b', \"c\"\"d\" FROM t",
+            "SELECT 'open",
+            "SELECT /* open",
+            "SELECT $x$ open",
+            "SELECT \"open",
+            "SELECT 1_000, 1.5e3, x$y FROM t",
+            "SELECT 'café', \"naïve\"",
+        ];
+        let mut admitted = 0;
+        for sql in corpus {
+            if check_unambiguous(&[sql.to_string()]).is_ok() {
+                admitted += 1;
+                assert_eq!(quoted_and_comment_spans(sql), lex(sql, true).spans, "{sql}");
+                assert_eq!(
+                    quoted_and_comment_spans(sql),
+                    lex(sql, false).spans,
+                    "{sql}"
+                );
+            }
+        }
+        // Not vacuous: the ordinary forms are admitted.
+        assert!(admitted >= 12, "only {admitted} admitted");
     }
 
     #[test]
