@@ -419,7 +419,10 @@ impl TurnRunner {
 
         // The model picks the database. Resolve it once, here, with the rule execution uses:
         // the approval card shows this value and the backend is handed this value.
-        if let Some(f) = facts.as_ref().filter(|f| f.engine == EngineKind::Postgres) {
+        if let Some(f) = facts
+            .as_ref()
+            .filter(|f| matches!(f.engine, EngineKind::Postgres | EngineKind::Redshift))
+        {
             call.pin_database(f.database.as_deref());
         }
         let target = facts.as_ref().and_then(|f| approval_target(&call, f));

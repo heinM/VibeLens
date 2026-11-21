@@ -65,6 +65,28 @@ fn iceberg_notes(p: &ConnectionProfile) -> String {
     s
 }
 
+/// What the model needs to know on an Amazon Redshift connection: the dialect and that the Data
+/// API has no transactions. Names the database; never the cluster, workgroup, region or identity.
+fn redshift_notes(p: &ConnectionProfile) -> String {
+    let mut s = String::from("\nAmazon Redshift notes (this connection)\n");
+    s.push_str(
+        "- The SQL dialect is Amazon Redshift's (PostgreSQL 8.0 based, with its own functions and types such as SUPER, VARBYTE and GEOMETRY). Many PostgreSQL features are missing: no indexes, no enforced primary or foreign keys, no RETURNING, no generate_series in queries on tables, no CREATE INDEX. Check syntax against Redshift, not current PostgreSQL.\n\
+         - Statements run through the Redshift Data API: each statement runs in its own session and commits on its own. There are no multi-statement transactions; BEGIN, COMMIT, ROLLBACK, START TRANSACTION, END and ABORT are refused, and SET only lasts for its own statement. A script that fails part-way leaves the earlier statements applied, so make each step safe on its own.\n\
+         - Read-only calls are checked to be plain queries (SELECT, WITH, SHOW, EXPLAIN) and refused otherwise; there is no READ ONLY session. Tables are addressed as schema.table; get_schema lists schemas, tables and columns (Redshift has no indexes or enforced keys to show). Results are capped at 100 MB per statement by the Data API.\n",
+    );
+    if let Some(db) = p
+        .redshift
+        .as_ref()
+        .map(|o| o.database.trim())
+        .filter(|d| !d.is_empty())
+    {
+        s.push_str(&format!(
+            "- Default database: {db}. The `database` argument of run_sql and get_schema chooses another database of the same cluster or workgroup.\n"
+        ));
+    }
+    s
+}
+
 fn access_blurb(a: AiDataAccess) -> &'static str {
     match a {
         AiDataAccess::None => "none: you must not use this connection",
@@ -99,6 +121,7 @@ pub(super) fn build_system_prompt(
                 EngineKind::Postgres => "PostgreSQL",
                 EngineKind::Valkey => "Valkey/Redis",
                 EngineKind::Iceberg => "Apache Iceberg",
+                EngineKind::Redshift => "Amazon Redshift",
             };
             s.push_str(&format!(
                 "- Active connection: \"{}\" (id {}), {engine}, environment {}, AI data access {}.\n",
@@ -112,6 +135,9 @@ pub(super) fn build_system_prompt(
             }
             if p.engine == EngineKind::Iceberg {
                 s.push_str(&iceberg_notes(p));
+            }
+            if p.engine == EngineKind::Redshift {
+                s.push_str(&redshift_notes(p));
             }
         }
         None => match &ctx.profile_id {
@@ -169,6 +195,7 @@ mod tests {
             created_at: None,
             updated_at: None,
             iceberg: None,
+            redshift: None,
         }
     }
 
@@ -298,5 +325,49 @@ mod tests {
             },
         );
         assert!(p.contains("could not be found"));
+    }
+
+    #[test]
+    fn redshift_prompt_is_truthful_and_names_no_cluster_or_region() {
+        use crate::model::{AwsIdentity, AwsTarget, RedshiftAuth, RedshiftOptions, RedshiftTarget};
+        let p = ConnectionProfile {
+            engine: EngineKind::Redshift,
+            host: String::new(),
+            port: 0,
+            database: None,
+            redshift: Some(RedshiftOptions {
+                target: RedshiftTarget::Provisioned {
+                    cluster_identifier: "secret-cluster".into(),
+                },
+                database: "analytics".into(),
+                aws: AwsTarget {
+                    identity: AwsIdentity::Profile {
+                        profile_name: "secret-profile".into(),
+                    },
+                    region: "ap-south-2".into(),
+                },
+                auth: RedshiftAuth::DbUser {
+                    db_user: "secret_user".into(),
+                },
+            }),
+            ..profile(Environment::Dev, AiDataAccess::Results)
+        };
+        let s = build_system_prompt(Some(&p), &AgentContext::default());
+        assert!(s.contains("Amazon Redshift") && s.contains("Amazon Redshift notes"));
+        assert!(s.contains("commits on its own") && s.contains("BEGIN, COMMIT"));
+        assert!(s.contains("Default database: analytics"));
+        for leak in [
+            "secret-cluster",
+            "ap-south-2",
+            "secret-profile",
+            "secret_user",
+        ] {
+            assert!(!s.contains(leak), "{leak}");
+        }
+        let pg = build_system_prompt(
+            Some(&profile(Environment::Dev, AiDataAccess::Results)),
+            &AgentContext::default(),
+        );
+        assert!(!pg.contains("Amazon Redshift notes"));
     }
 }

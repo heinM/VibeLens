@@ -11,6 +11,9 @@
 //!   the connection does not vanish from the UI after five quiet minutes. Valkey and Iceberg
 //!   handles are still closed outright. `0` means "never".
 //! - `AppToolBackend` implements `ports::ToolBackend` over this + `WorkspaceFs`.
+//! - Redshift: one `RedshiftEngine` per profile. It holds only a Data API client (no socket,
+//!   no session, no tunnel), so the idle reaper leaves it alone; AWS identity comes from the
+//!   same `AwsService` as Iceberg's.
 //!
 //! Concurrency rules:
 //! - The registry lock is a plain `std::sync::Mutex` and is **never held across an `.await`**.
@@ -40,6 +43,7 @@ use crate::ports::{
     CredentialFn, CredentialSource, FileVersion, ProfileStore, SecretVault, ToolBackend,
     TunnelHandle, TunnelProvider,
 };
+use crate::redshift::RedshiftEngine;
 use crate::valkey::{ValkeyConnectParams, ValkeyHandle};
 use crate::workspace::WorkspaceFs;
 
@@ -56,6 +60,9 @@ const AGENT_VALKEY_MAX_ITEMS: usize = 200;
 const AGENT_SQL_TIMEOUT_MS: u64 = 30_000;
 /// Athena queries are queued and run server-side, so they get a longer budget than a local scan.
 const AGENT_ATHENA_TIMEOUT_MS: u64 = 120_000;
+/// Redshift statements are queued and run server-side too (and a Serverless workgroup may have
+/// to resume first), so they get the same budget as Athena.
+const AGENT_REDSHIFT_TIMEOUT_MS: u64 = 120_000;
 /// Safety valve for `valkey_scan`: stop after this many SCAN pages even if the cursor never ends.
 const MAX_SCAN_PAGES: usize = 2_000;
 
@@ -83,6 +90,14 @@ struct IcebergEntry {
     target: String,
 }
 
+struct RedshiftEntry {
+    engine: Arc<RedshiftEngine>,
+    connected_at: DateTime<Utc>,
+    signature: String,
+    /// `RedshiftEngine::describe_target()`: `Redshift · {cluster or workgroup} · {db} · {region}`.
+    target: String,
+}
+
 /// Non-steady states. "Connected" is derived from the live entries so it can never go stale.
 #[derive(Debug, Clone)]
 enum Transient {
@@ -106,6 +121,7 @@ struct State {
     pg: HashMap<(ProfileId, String), PgEntry>,
     valkey: HashMap<ProfileId, ValkeyEntry>,
     iceberg: HashMap<ProfileId, IcebergEntry>,
+    redshift: HashMap<ProfileId, RedshiftEntry>,
     transient: HashMap<ProfileId, Transient>,
     epochs: HashMap<ProfileId, u64>,
     connect_locks: HashMap<ConnectLockKey, Arc<tokio::sync::Mutex<()>>>,
@@ -115,6 +131,7 @@ impl State {
     fn has_live(&self, profile_id: &str) -> bool {
         self.valkey.contains_key(profile_id)
             || self.iceberg.contains_key(profile_id)
+            || self.redshift.contains_key(profile_id)
             || self.pg.keys().any(|(id, _)| id == profile_id)
     }
     fn epoch(&self, profile_id: &str) -> u64 {
@@ -129,6 +146,9 @@ pub struct ConnectionManager {
     state: Mutex<State>,
     reaper_started: AtomicBool,
     iceberg_deps: OnceLock<IcebergDeps>,
+    /// Test wiring only: where Redshift Data API requests go instead of the regional endpoint.
+    /// Never read from a profile (see `RedshiftEngine::with_endpoint_url`).
+    redshift_endpoint: OnceLock<String>,
 }
 
 impl ConnectionManager {
@@ -144,6 +164,7 @@ impl ConnectionManager {
             state: Mutex::new(State::default()),
             reaper_started: AtomicBool::new(false),
             iceberg_deps: OnceLock::new(),
+            redshift_endpoint: OnceLock::new(),
         })
     }
 
@@ -341,6 +362,10 @@ impl ConnectionManager {
                 // record: `iceberg()` registered Connecting/Connected/Error like pg/valkey do.
                 self.iceberg(profile_id).await?;
             }
+            EngineKind::Redshift => {
+                // `redshift()` verified the target answers and recorded the status.
+                self.redshift(profile_id).await?;
+            }
         }
         let st = self.lock();
         status_of(&st, &profile.id).ok_or_else(|| {
@@ -351,7 +376,7 @@ impl ConnectionManager {
     /// Closes every handle and tunnel of the profile. Idempotent, and works for profiles that
     /// no longer exist in the store (the delete-profile flow calls it first).
     pub async fn disconnect(&self, profile_id: &str) -> Result<()> {
-        let (pg, valkey, iceberg) = {
+        let (pg, valkey, iceberg, redshift) = {
             let mut st = self.lock();
             *st.epochs.entry(profile_id.to_string()).or_insert(0) += 1;
             st.transient.remove(profile_id);
@@ -367,8 +392,11 @@ impl ConnectionManager {
                 pg,
                 st.valkey.remove(profile_id),
                 st.iceberg.remove(profile_id),
+                st.redshift.remove(profile_id),
             )
         };
+        // A Redshift engine holds no connection; dropping it is all there is to close.
+        drop(redshift);
         for entry in pg {
             entry.handle.close().await;
             drop(entry.tunnel);
@@ -402,6 +430,13 @@ impl ConnectionManager {
             if profile.iceberg.is_none() {
                 return Err(CoreError::Invalid(
                     "Iceberg catalog options are required".into(),
+                ));
+            }
+        } else if profile.engine == EngineKind::Redshift {
+            // `host`/`port` are unused; the options are validated by `check_profile` below.
+            if profile.redshift.is_none() {
+                return Err(CoreError::Invalid(
+                    "Redshift connection options are required".into(),
                 ));
             }
         } else {
@@ -461,6 +496,10 @@ impl ConnectionManager {
         if profile.engine == EngineKind::Iceberg {
             return self.test_iceberg(profile, password_override).await;
         }
+        if profile.engine == EngineKind::Redshift {
+            // No password exists for Redshift (IAM-signed Data API), so there is nothing to override.
+            return self.test_redshift(profile).await;
+        }
         let creds = self.credential_fn(profile, password_override);
         match profile.engine {
             EngineKind::Postgres => {
@@ -493,6 +532,9 @@ impl ConnectionManager {
             EngineKind::Iceberg => Err(CoreError::Other(
                 "Iceberg connections are tested by test_iceberg".into(),
             )),
+            EngineKind::Redshift => Err(CoreError::Other(
+                "Redshift connections are tested by test_redshift".into(),
+            )),
         }
     }
 
@@ -518,6 +560,14 @@ impl ConnectionManager {
         Ok(Some(target).filter(|t| !t.is_empty()))
     }
 
+    /// Ephemeral Redshift engine + one `ListDatabases` call, which signs in with the profile's
+    /// identity and authentication and so checks all of it. Nothing is cached.
+    async fn test_redshift(&self, profile: &ConnectionProfile) -> Result<Option<String>> {
+        let engine = self.build_redshift(profile).await?;
+        engine.ping().await?;
+        Ok(Some(engine.describe_target()))
+    }
+
     /// One entry per profile that is connecting, connected or failed. Disconnected profiles
     /// are simply absent. Sorted by profile id.
     pub fn status(&self) -> Vec<ConnectionStatus> {
@@ -526,6 +576,7 @@ impl ConnectionManager {
             .valkey
             .keys()
             .chain(st.iceberg.keys())
+            .chain(st.redshift.keys())
             .chain(st.pg.keys().map(|(id, _)| id))
             .chain(st.transient.keys())
             .collect();
@@ -679,6 +730,114 @@ impl ConnectionManager {
                     old.handle.close().await;
                 }
                 Ok(handle)
+            }
+        }
+    }
+
+    /// Where Redshift Data API requests go instead of the regional endpoint. For tests that wire
+    /// the manager to a mock; the app never calls it and no profile field reaches it. A second
+    /// call is ignored.
+    #[doc(hidden)]
+    pub fn set_redshift_endpoint_url(&self, url: impl Into<String>) {
+        if self.redshift_endpoint.set(url.into()).is_err() {
+            tracing::debug!("Redshift endpoint override was already set; ignoring the second call");
+        }
+    }
+
+    /// A Redshift engine for `profile`: options validated, credentials resolved for its AWS
+    /// target. Makes no request.
+    async fn build_redshift(&self, profile: &ConnectionProfile) -> Result<RedshiftEngine> {
+        let opts = profile.redshift.clone().ok_or_else(|| {
+            CoreError::Invalid(format!(
+                "connection \"{}\" has no Redshift options",
+                profile.name
+            ))
+        })?;
+        // The stored profile may have been edited by hand; the rules a save applies run again.
+        crate::cleartext::check_profile(profile)?;
+        let aws = self
+            .iceberg_deps
+            .get()
+            .map(|d| d.aws.clone())
+            .ok_or_else(|| {
+                CoreError::Invalid(
+                    "AWS support is not initialised: the application never called set_iceberg_deps"
+                        .into(),
+                )
+            })?;
+        let creds = aws.credentials_provider(&opts.aws).await?;
+        let engine = RedshiftEngine::new(opts, creds)?;
+        Ok(match self.redshift_endpoint.get() {
+            Some(url) => engine.with_endpoint_url(url.clone()),
+            None => engine,
+        })
+    }
+
+    /// Lazily created Redshift engine for the profile. The first creation checks that the
+    /// cluster or workgroup answers with the profile's identity (one `ListDatabases` call).
+    /// Single-flight per profile; reused while the profile's Redshift options are unchanged.
+    pub async fn redshift(&self, profile_id: &str) -> Result<Arc<RedshiftEngine>> {
+        let profile = self.profiles.get(profile_id)?;
+        require_engine(&profile, EngineKind::Redshift)?;
+        let signature = connection_signature(&profile);
+
+        if let Some(engine) = self.cached_redshift(&profile.id, &signature) {
+            return Ok(engine);
+        }
+        let lock = self.connect_lock((profile.id.clone(), None));
+        let _single_flight = lock.lock().await;
+        if let Some(engine) = self.cached_redshift(&profile.id, &signature) {
+            return Ok(engine);
+        }
+
+        let epoch = self.lock().epoch(&profile.id);
+        let mut attempt = Attempt::begin(self, &profile);
+        let built = match self.build_redshift(&profile).await {
+            Ok(e) => e.ping().await.map(|()| e),
+            Err(e) => Err(e),
+        };
+        let engine = match built {
+            Ok(e) => Arc::new(e),
+            Err(e) => {
+                attempt.fail(&e);
+                return Err(e);
+            }
+        };
+        let entry = RedshiftEntry {
+            engine: engine.clone(),
+            connected_at: Utc::now(),
+            signature,
+            target: engine.describe_target(),
+        };
+        let inserted = {
+            let mut st = self.lock();
+            if st.epoch(&profile.id) != epoch {
+                false
+            } else {
+                st.transient.remove(&profile.id);
+                st.redshift.insert(profile.id.clone(), entry);
+                true
+            }
+        };
+        if inserted {
+            attempt.succeeded();
+            Ok(engine)
+        } else {
+            // `disconnect()` ran while we were connecting: throw the new engine away.
+            attempt.abandon();
+            Err(CoreError::Cancelled)
+        }
+    }
+
+    fn cached_redshift(&self, profile_id: &str, signature: &str) -> Option<Arc<RedshiftEngine>> {
+        let mut st = self.lock();
+        match st.redshift.get(profile_id) {
+            None => None,
+            Some(e) if e.signature == signature => Some(e.engine.clone()),
+            Some(_) => {
+                tracing::info!(profile_id, "discarding stale Redshift engine");
+                st.redshift.remove(profile_id);
+                None
             }
         }
     }
@@ -928,9 +1087,10 @@ fn dial_target(profile: &ConnectionProfile, tunnel: &Option<TunnelHandle>) -> (S
     }
 }
 
-/// Iceberg connections never use the SSH tunnel, whatever a stale profile field says.
+/// Iceberg and Redshift connections never use the SSH tunnel, whatever a stale profile field says.
 fn is_tunneled(profile: &ConnectionProfile) -> bool {
-    profile.engine != EngineKind::Iceberg && profile.tunnel.is_some()
+    !matches!(profile.engine, EngineKind::Iceberg | EngineKind::Redshift)
+        && profile.tunnel.is_some()
 }
 
 /// A vault that answers one key from memory and defers everything else (and all writes) to the
@@ -985,11 +1145,13 @@ fn require_engine(profile: &ConnectionProfile, wanted: EngineKind) -> Result<()>
         EngineKind::Postgres => "a Postgres",
         EngineKind::Valkey => "a Valkey",
         EngineKind::Iceberg => "an Iceberg",
+        EngineKind::Redshift => "a Redshift",
     };
     let wants = match wanted {
         EngineKind::Postgres => "Postgres",
         EngineKind::Valkey => "Valkey",
         EngineKind::Iceberg => "Iceberg",
+        EngineKind::Redshift => "Redshift",
     };
     Err(CoreError::Invalid(format!(
         "connection \"{}\" is {is} connection, not {wants}",
@@ -1033,11 +1195,14 @@ fn status_of(st: &State, profile_id: &str) -> Option<ConnectionStatus> {
         .collect();
     let valkey = st.valkey.get(profile_id);
     let iceberg = st.iceberg.get(profile_id);
-    if !pg.is_empty() || valkey.is_some() || iceberg.is_some() {
+    let redshift = st.redshift.get(profile_id);
+    if !pg.is_empty() || valkey.is_some() || iceberg.is_some() || redshift.is_some() {
         let engine = if valkey.is_some() {
             EngineKind::Valkey
         } else if iceberg.is_some() {
             EngineKind::Iceberg
+        } else if redshift.is_some() {
+            EngineKind::Redshift
         } else {
             EngineKind::Postgres
         };
@@ -1046,12 +1211,14 @@ fn status_of(st: &State, profile_id: &str) -> Option<ConnectionStatus> {
             .map(|e| e.connected_at)
             .chain(valkey.map(|e| e.connected_at))
             .chain(iceberg.map(|e| e.connected_at))
+            .chain(redshift.map(|e| e.connected_at))
             .min();
         let server_version = pg
             .iter()
             .filter_map(|e| e.server_version.clone())
             .chain(valkey.and_then(|e| e.server_version.clone()))
             .chain(iceberg.map(|e| e.target.clone()).filter(|t| !t.is_empty()))
+            .chain(redshift.map(|e| e.target.clone()))
             .next();
         let tunneled =
             pg.iter().any(|e| e.tunnel.is_some()) || valkey.is_some_and(|e| e.tunnel.is_some());
@@ -1240,6 +1407,11 @@ impl ToolBackend for AppToolBackend {
             let handle = self.connections.iceberg(profile_id).await?;
             return handle.execute_collect(sql, opts).await;
         }
+        if profile.engine == EngineKind::Redshift {
+            opts.timeout_ms = Some(AGENT_REDSHIFT_TIMEOUT_MS);
+            let engine = self.connections.redshift(profile_id).await?;
+            return engine.execute_collect(sql, database, opts).await;
+        }
         // Everything else goes through the Postgres path, which rejects other engines with
         // a clear `Invalid`.
         let pg = self.connections.pg(profile_id, database).await?;
@@ -1258,6 +1430,12 @@ impl ToolBackend for AppToolBackend {
             let handle = self.connections.iceberg(profile_id).await?;
             return handle
                 .schema_metadata(namespace_levels(schema_filter), max_tables)
+                .await;
+        }
+        if profile.engine == EngineKind::Redshift {
+            let engine = self.connections.redshift(profile_id).await?;
+            return engine
+                .schema_metadata(database, schema_filter, max_tables)
                 .await;
         }
         let pg = self.connections.pg(profile_id, database).await?;
@@ -1426,6 +1604,7 @@ mod tests {
             created_at: None,
             updated_at: None,
             iceberg: None,
+            redshift: None,
         }
     }
 
