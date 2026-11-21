@@ -18,6 +18,22 @@ export const isIcebergDialect = (d: SqlDialect | null | undefined): boolean => d
 /** Athena and Trino share a vocabulary (functions, types, time travel, `"table$snapshots"`). */
 export const isTrinoFamily = (d: SqlDialect | null | undefined): boolean => d === "athena" || d === "trino";
 
+/**
+ * Quotes an identifier the way the dialect reads one: backticks (a backtick doubled) for Spark SQL,
+ * where `"x"` is a string literal (`SELECT "user" FROM t` would return the text on every row); double
+ * quotes (a double quote doubled) everywhere else. Shared by completion, the palette and the Iceberg
+ * SQL helpers so they can never disagree.
+ */
+export function quoteIdentFor(name: string, dialect?: SqlDialect | null): string {
+  return dialect === "spark" ? `\`${name.replace(/`/g, "``")}\`` : `"${name.replace(/"/g, '""')}"`;
+}
+
+/**
+ * Trino (and Athena) address a nested Iceberg namespace as ONE schema: `"analytics.daily".orders`.
+ * Written level by level (`analytics.daily.orders`) Trino reads catalog.schema.table.
+ */
+export const nestedNamespaceIsOneIdent = (d: SqlDialect | null | undefined): boolean => isTrinoFamily(d);
+
 /** The catalog family a dialect reads its schema from. */
 export const catalogEngineOf = (d: SqlDialect | null | undefined): "postgres" | "iceberg" | "redshift" => (isIcebergDialect(d) ? "iceberg" : d === "redshift" ? "redshift" : "postgres");
 

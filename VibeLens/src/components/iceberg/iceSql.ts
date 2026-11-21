@@ -1,7 +1,9 @@
 // SQL text helpers for Iceberg tables. Identifiers follow the same rule as the Postgres tree: bare when
 // they are plain lower-case words, quoted otherwise: with double quotes ("" escaping) for DataFusion,
 // Athena and Trino, with backticks (`` escaping) for Spark SQL, where "x" is a string literal.
-import type { SqlDialect } from "../../lib/sqlIntel/dialect";
+// Trino and Athena read a nested namespace as one schema, so `["analytics","daily"]` is written
+// `"analytics.daily"` there (level by level it would be catalog.schema).
+import { nestedNamespaceIsOneIdent, quoteIdentFor, type SqlDialect } from "../../lib/sqlIntel/dialect";
 
 const BARE = /^[a-z_][a-z0-9_]*$/;
 const RESERVED = new Set([
@@ -10,11 +12,18 @@ const RESERVED = new Set([
   "outer", "right", "select", "set", "table", "then", "to", "true", "union", "update", "user", "using", "values", "when", "where", "with",
 ]);
 
-export const quoteAlways = (s: string, dialect?: SqlDialect | null): string => (dialect === "spark" ? `\`${s.replace(/`/g, "``")}\`` : `"${s.replace(/"/g, '""')}"`);
+export const quoteAlways = (s: string, dialect?: SqlDialect | null): string => quoteIdentFor(s, dialect);
 export const quoteIfNeeded = (s: string, dialect?: SqlDialect | null): string => (BARE.test(s) && !RESERVED.has(s) ? s : quoteAlways(s, dialect));
 
-/** `shop.orders`, `lake."Sales".orders` (Spark: ``lake.`Sales`.orders``) */
-export const qualifiedName = (namespace: string[], name: string, dialect?: SqlDialect | null): string => [...namespace, name].map((p) => quoteIfNeeded(p, dialect)).join(".");
+/** A namespace as SQL: `lake.sales` level by level, or `"lake.sales"` as one schema on Trino / Athena. */
+export function namespaceSql(namespace: string[], dialect?: SqlDialect | null): string {
+  if (namespace.length > 1 && nestedNamespaceIsOneIdent(dialect)) return quoteAlways(namespace.join("."), dialect);
+  return namespace.map((p) => quoteIfNeeded(p, dialect)).join(".");
+}
+
+/** `shop.orders`, `lake."Sales".orders` (Spark: ``lake.`Sales`.orders``; Trino: `"lake.sales".orders`) */
+export const qualifiedName = (namespace: string[], name: string, dialect?: SqlDialect | null): string =>
+  namespace.length ? `${namespaceSql(namespace, dialect)}.${quoteIfNeeded(name, dialect)}` : quoteIfNeeded(name, dialect);
 
 export const selectAllSql = (namespace: string[], name: string, limit = 100, dialect?: SqlDialect | null): string => `SELECT * FROM ${qualifiedName(namespace, name, dialect)} LIMIT ${limit};`;
 
@@ -28,6 +37,7 @@ export function selectAsOfSnapshotSql(namespace: string[], name: string, snapsho
   const id = /^-?\d+$/.test(snapshotId) ? snapshotId : null;
   if (id && (dialect === "athena" || dialect === "trino")) return `SELECT * FROM ${qualifiedName(namespace, name, dialect)} FOR VERSION AS OF ${id} LIMIT ${limit};`;
   if (id && dialect === "spark") return `SELECT * FROM ${qualifiedName(namespace, name, dialect)} VERSION AS OF ${id} LIMIT ${limit};`;
-  const parts = [...namespace.map((p) => quoteAlways(p)), quoteAlways(`${name}@${snapshotId}`)];
-  return `SELECT * FROM ${parts.join(".")} LIMIT ${limit};`;
+  // The local engine's form (also the fallback for an id that is not a plain integer).
+  const ns = nestedNamespaceIsOneIdent(dialect) && namespace.length > 1 ? [quoteAlways(namespace.join("."))] : namespace.map((p) => quoteAlways(p));
+  return `SELECT * FROM ${[...ns, quoteAlways(`${name}@${snapshotId}`)].join(".")} LIMIT ${limit};`;
 }

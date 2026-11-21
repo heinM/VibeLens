@@ -117,7 +117,7 @@ describe("Iceberg SQL text per engine", () => {
   it("quotes with backticks for Spark and double quotes elsewhere", () => {
     expect(qualifiedName(["lake", "Sales"], "orders", "spark")).toBe("lake.`Sales`.orders");
     expect(qualifiedName(["lake"], "we`ird", "spark")).toBe("lake.`we``ird`");
-    expect(qualifiedName(["lake", "Sales"], "orders", "trino")).toBe('lake."Sales".orders');
+    expect(qualifiedName(["lake", "Sales"], "orders", "trino")).toBe('"lake.Sales".orders');
     expect(qualifiedName(["lake", "Sales"], "orders")).toBe('lake."Sales".orders');
     expect(selectAllSql(["shop"], "Order", 10, "spark")).toBe("SELECT * FROM shop.`Order` LIMIT 10;");
   });

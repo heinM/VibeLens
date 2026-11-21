@@ -18,6 +18,7 @@ import { copyToClipboard } from "../ui/clipboard";
 import { openErdTab, openTableTab } from "../table/openTableTab";
 import { insertIntoActiveEditor } from "./insertIntoEditor";
 import { openIcebergQueryTab } from "./icebergPalette";
+import { dialectOf } from "../../lib/sqlIntel/dialect";
 import { catalogItems, connectionItems, fileItems, functionItems, historyItems, insertionText, type GoActions, type PaletteItem } from "./items";
 import { usePaletteStore } from "./paletteStore";
 
@@ -101,7 +102,7 @@ export function usePaletteCatalog(): PaletteCatalog {
         openTableTab(p.id, db, schema, name);
       },
       insertName: (p, db, schema, name) => {
-        const text = insertionText(schema, name);
+        const text = insertionText(schema, name, dialectOf(p));
         void insertIntoActiveEditor(text).then((ok) => {
           if (!ok) newSqlTab({ profileId: p.id, database: db, contents: text });
         });
