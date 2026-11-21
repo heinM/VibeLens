@@ -842,6 +842,33 @@ async fn backslash_literals_are_refused_before_any_request_in_every_mode() {
     assert!(server.all().is_empty(), "{:?}", server.all());
 }
 
+/// Re-audit: a non-ASCII dollar-quote tag made the lexers disagree about every string boundary
+/// after it. Both payloads are refused in every mode before any request.
+#[tokio::test]
+async fn non_ascii_dollar_quote_tags_are_refused_before_any_request() {
+    let server = serve(refuse_everything()).await;
+    let e = engine(&server);
+    for sql in [
+        r"SELECT $é$ ' $é$ , '\' , ' AS x INTO public.pwned FROM secrets -- '",
+        "SELECT $é$ ' $é$ , exfil_lambda(ssn) , $é$ ' $é$ FROM customers",
+    ] {
+        for read_only in [false, true] {
+            let events = stream(
+                &e,
+                sql,
+                ExecOptions {
+                    read_only,
+                    ..ExecOptions::default()
+                },
+            )
+            .await;
+            let (idx, code, _) = failure(&events);
+            assert_eq!((idx, code.as_str()), (None, "policy_denied"), "{sql}");
+        }
+    }
+    assert!(server.all().is_empty(), "{:?}", server.all());
+}
+
 /// MEDIUM 2: on Redshift nothing but this check stops a Lambda UDF or a SageMaker function in a
 /// read-only run from sending row data out.
 #[tokio::test]

@@ -256,6 +256,10 @@ plus the statement's own duration and result size where the UI shows them.
   timeout is 120 s, as for Athena.
 - **Retries.** Throttling and transient transport errors, up to 3 times with jittered backoff,
   as in the Athena engine.
+- **What the text check cannot see.** A read-only `SELECT` from an existing view, or from a
+  table under a row-level-security or masking policy, whose definition calls a Lambda or
+  SageMaker UDF still invokes that function; no check of the statement's text can see it. The
+  database role used with the agent should therefore not have `EXECUTE` on external functions.
 
 ---
 
