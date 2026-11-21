@@ -25,6 +25,7 @@ import { SaveAsDialog } from "./SaveAsDialog";
 import { SqlEditor, runnableAtCursor, type CodeEditor, type SqlEditorControls, type SqlEditorHandlers, type TrackedRange } from "./SqlEditor";
 import { splitStatements } from "./sqlSplit";
 import { TargetPicker } from "./TargetPicker";
+import { requestedDatabaseError } from "../connections/redshiftForm";
 import { DropdownMenu, type DropdownItem } from "./ToolbarMenu";
 
 const stripSemicolon = (s: string) => s.trim().replace(/;+\s*$/, "");
@@ -90,6 +91,11 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
       }
       if (!profile) {
         setLocalError({ code: "no_connection", message: "Choose a connection for this tab before running." });
+        return;
+      }
+      const dbProblem = profile.engine === "redshift" ? requestedDatabaseError(tab.database) : null;
+      if (dbProblem) {
+        setLocalError({ code: "invalid", message: dbProblem });
         return;
       }
       if (status?.state !== "connected") {

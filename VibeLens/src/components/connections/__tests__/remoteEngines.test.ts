@@ -4,14 +4,19 @@
 import { describe, expect, it } from "vitest";
 import { newProfile } from "../../../lib/defaults";
 import type { ConnectionProfile, IcebergOptions, IcebergQueryEngine } from "../../../ipc/types";
-import { cleanProfile, icebergSecretArgs, initialDraft, missingIcebergSecrets } from "../draft";
+import { cleanProfile, draftErrors, icebergSecretArgs, initialDraft, missingIcebergSecrets, reconcileDraft } from "../draft";
 import { blankEngine, engineSummary, normalizeIceberg } from "../icebergForm";
 import {
-  CODE_LOADING_CONF,
+  MAX_SESSION_START_TIMEOUT_SECS,
+  SPARK_ALLOWED_CONF,
   cleartextProblem,
   confFromRows,
   confRowError,
+  confRowsError,
+  engineEndpointChanged,
+  engineSecretArg,
   engineSecretKind,
+  engineSecretMissing,
   engineSecretStored,
   engineUrlError,
   isLoopbackHost,
@@ -68,9 +73,15 @@ describe("engine URL", () => {
 });
 
 describe("cleartext (R2)", () => {
-  it("knows the loopback names the Rust side treats as this computer", () => {
-    for (const h of ["localhost", "127.0.0.1", "[::1]", "trino.localhost", "LOCALHOST"]) expect(isLoopbackHost(h), h).toBe(true);
-    for (const h of ["10.0.0.5", "trino.internal", "127.0.0.2.example.com"]) expect(isLoopbackHost(h), h).toBe(false);
+  it("treats as loopback exactly what Rust does: localhost and literal loopback IPs (127.0.0.0/8, ::1)", () => {
+    for (const h of ["localhost", "LOCALHOST", "127.0.0.1", "127.0.0.2", "127.255.255.254", "[::1]", "::1"]) expect(isLoopbackHost(h), h).toBe(true);
+    for (const h of ["trino.localhost", "localhost.example.com", "10.0.0.5", "trino.internal", "127.0.0.2.example.com", "127.0.0.256", "128.0.0.1", "[::2]"]) expect(isLoopbackHost(h), h).toBe(false);
+    // As URL gives hostnames: an IPv6 loopback written in full is normalised to [::1].
+    expect(isLoopbackHost(new URL("http://[0:0:0:0:0:0:0:1]:8080").hostname)).toBe(true);
+  });
+  it("sends no credential over http:// to a *.localhost name (Rust resolves those like any other)", () => {
+    expect(cleartextProblem("http://trino.localhost:8080", { kind: "bearer" })?.level).toBe("error");
+    expect(cleartextProblem("http://127.0.0.9:8080", { kind: "bearer" })).toBeNull();
   });
   it("is an error to send a password or token over http:// to another machine", () => {
     expect(cleartextProblem("http://trino.internal:8080", { kind: "basic", username: "u" })).toMatchObject({ level: "error", message: expect.stringMatching(/password.*unencrypted/) });
@@ -90,52 +101,75 @@ describe("cleartext (R2)", () => {
   });
 });
 
-describe("Spark session configuration (design 2.4)", () => {
-  it("refuses every setting that loads code into the cluster", () => {
-    expect([...CODE_LOADING_CONF].sort()).toEqual(
+describe("Spark session configuration: Rust's allow-list", () => {
+  const ok = (k: string, v: string) => sessionConfError(k, v, "lake");
+  it("allows the catalog implementation only with an Iceberg Spark catalog class", () => {
+    expect(ok("spark.sql.catalog.lake", "org.apache.iceberg.spark.SparkCatalog")).toBeNull();
+    expect(ok("spark.sql.catalog.lake", " org.apache.iceberg.spark.SparkSessionCatalog ")).toBeNull();
+    expect(ok("spark.sql.catalog.lake", "com.evil.Catalog")).toMatch(/must be org\.apache\.iceberg\.spark\.SparkCatalog/);
+  });
+  it("allows the listed catalog options, for the engine's own catalog only", () => {
+    for (const o of ["type", "warehouse", "default-namespace", "cache-enabled", "cache.expiration-interval-ms"]) expect(ok(`spark.sql.catalog.lake.${o}`, "x"), o).toBeNull();
+    expect(ok("spark.sql.catalog.lake.uri", "thrift://x")).toMatch(/set this on the cluster instead/);
+    expect(ok("spark.sql.catalog.other.type", "glue")).toMatch(/set this on the cluster instead/);
+    expect(ok("spark.sql.catalog.other", "org.apache.iceberg.spark.SparkCatalog")).toMatch(/set this on the cluster instead/);
+    expect(sessionConfError("spark.sql.catalog.lake.type", "glue", "Lake")).toMatch(/cluster/); // case-sensitive
+  });
+  it("allows exactly the listed session settings", () => {
+    expect([...SPARK_ALLOWED_CONF].sort()).toEqual(
       [
-        "spark.driver.extraClassPath",
-        "spark.driver.extraJavaOptions",
-        "spark.executor.extraClassPath",
-        "spark.executor.extraJavaOptions",
-        "spark.files",
-        "spark.jars",
-        "spark.jars.packages",
-        "spark.submit.pyFiles",
+        "spark.sql.shuffle.partitions",
+        "spark.sql.session.timeZone",
+        "spark.sql.adaptive.enabled",
+        "spark.sql.adaptive.coalescePartitions.enabled",
+        "spark.executor.memory",
+        "spark.executor.cores",
+        "spark.executor.instances",
+        "spark.driver.memory",
+        "spark.driver.cores",
+        "spark.dynamicAllocation.enabled",
+        "spark.dynamicAllocation.minExecutors",
+        "spark.dynamicAllocation.maxExecutors",
+        "spark.dynamicAllocation.initialExecutors",
       ].sort(),
     );
-    for (const k of CODE_LOADING_CONF) expect(sessionConfError(k, "x"), k).toMatch(/loads code/);
+    for (const k of SPARK_ALLOWED_CONF) expect(ok(k, "4"), k).toBeNull();
+    expect(ok(" spark.sql.shuffle.partitions ", "8")).toBeNull(); // after trim
+    expect(ok("spark.sql.Shuffle.partitions", "8")).toMatch(/cluster/); // case-sensitive
   });
-  it("refuses keys and values that look like credentials, saying to configure them on the cluster", () => {
-    for (const k of ["spark.hadoop.fs.s3a.secret.key", "spark.sql.catalog.lake.client-secret", "my.password", "x.token.value", "aws.credentials.provider", "fs.s3a.access.key", "ssl.trustStore.key"]) {
-      expect(sessionConfError(k, "v"), k).toMatch(/credential.*cluster/);
+  it("refuses everything else with 'set this on the cluster instead', code loading and credentials included", () => {
+    for (const k of ["spark.jars", "spark.jars.packages", "spark.files", "spark.submit.pyFiles", "spark.driver.extraJavaOptions", "spark.executor.extraClassPath", "spark.sql.extensions", "spark.hadoop.fs.s3a.secret.key", "spark.sql.catalog.lake.client-secret"]) {
+      expect(ok(k, "x"), k).toMatch(/set this on the cluster instead/);
     }
-    expect(sessionConfError("spark.sql.catalog.lake.header.Authorization", "Bearer abc")).toMatch(/bearer token/);
-    expect(sessionConfError("spark.sql.catalog.lake.header.x", "bearer abc")).toMatch(/bearer token/);
   });
-  it("accepts ordinary catalog settings", () => {
-    expect(sessionConfError("spark.sql.catalog.lake", "org.apache.iceberg.spark.SparkCatalog")).toBeNull();
-    expect(sessionConfError("spark.sql.catalog.lake.type", "glue")).toBeNull();
-    expect(sessionConfError("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")).toBeNull();
-    expect(sessionConfError("", "")).toBeNull();
+  it("checks values: no control characters, at most 512 characters, no ${, not a credential", () => {
+    expect(ok("spark.executor.memory", "4g\n")).toMatch(/control character/);
+    expect(ok("spark.executor.memory", "x".repeat(512))).toBeNull();
+    expect(ok("spark.executor.memory", "x".repeat(513))).toMatch(/512/);
+    expect(ok("spark.sql.catalog.lake.warehouse", "${env:HOME}")).toMatch(/\$\{/);
+    expect(ok("spark.sql.session.timeZone", "Bearer abc")).toMatch(/credential.*cluster instead/);
+    expect(ok("spark.sql.session.timeZone", "bearer abc")).toMatch(/credential/);
   });
-  it("needs a name for a value, and no spaces in names", () => {
-    expect(sessionConfError("", "x")).toMatch(/name/);
-    expect(sessionConfError("spark sql", "x")).toMatch(/spaces/);
+  it("ignores an empty row but refuses a value without a name", () => {
+    expect(ok("", "")).toBeNull();
+    expect(ok("", "x")).toMatch(/name/);
   });
-  it("flags duplicates per row and drops blank rows when saving", () => {
+  it("flags duplicates and nameless values per row, and over all rows", () => {
     const rows = [
-      { key: "a", value: "1" },
-      { key: "a", value: "2" },
+      { key: "spark.executor.cores", value: "1" },
+      { key: "spark.executor.cores", value: "2" },
       { key: " ", value: "" },
     ];
-    expect(confRowError(rows, 0)).toBeNull();
-    expect(confRowError(rows, 1)).toMatch(/twice/);
+    expect(confRowError(rows, 0, "lake")).toBeNull();
+    expect(confRowError(rows, 1, "lake")).toMatch(/twice/);
+    expect(confRowsError(rows, "lake")).toMatch(/twice/);
+    expect(confRowsError([{ key: "", value: "4" }], "lake")).toMatch(/name/);
+    expect(confRowsError([{ key: "", value: "" }], "lake")).toBeNull();
     expect(confFromRows([{ key: " b ", value: "x" }, { key: "", value: "" }])).toEqual({ b: "x" });
   });
   it("feeds validation under ice.engine.sessionConf (Query engine section)", () => {
     const e = validateRemoteEngine(spark({ sessionConf: { "spark.jars": "s3://bucket/evil.jar" } }));
-    expect(e["ice.engine.sessionConf"]).toMatch(/spark\.jars.*loads code/);
+    expect(e["ice.engine.sessionConf"]).toMatch(/spark\.jars.*cluster instead/);
     expect(sectionOf("ice.engine.sessionConf")).toBe("queryEngine");
   });
 });
@@ -143,7 +177,7 @@ describe("Spark session configuration (design 2.4)", () => {
 describe("validateRemoteEngine", () => {
   it("accepts a complete Trino and a complete Spark engine", () => {
     expect(validateRemoteEngine(trino())).toEqual({});
-    expect(validateRemoteEngine(spark({ proxyUser: "etl", sessionConf: { "spark.sql.catalog.lake.type": "glue" }, sessionStartTimeoutSecs: 600 }))).toEqual({});
+    expect(validateRemoteEngine(spark({ proxyUser: "etl", sessionConf: { "spark.sql.catalog.lake": "org.apache.iceberg.spark.SparkCatalog", "spark.sql.catalog.lake.type": "glue" }, sessionStartTimeoutSecs: 600 }))).toEqual({});
   });
   it("requires the URL, the catalog and (Trino) the user", () => {
     const e = validateRemoteEngine(trino({ url: "", catalog: " ", user: "" }));
@@ -156,11 +190,23 @@ describe("validateRemoteEngine", () => {
     expect(validateRemoteEngine(spark({ auth: { kind: "bearer" } }), true)["ice.engine.secret"]).toMatch(/token/);
     expect(validateRemoteEngine(spark(), true)["ice.engine.secret"]).toBeUndefined();
   });
-  it("checks the catalog name, the timeout and the proxy user", () => {
-    expect(validateRemoteEngine(trino({ catalog: "a.b" }))["ice.engine.catalogName"]).toBeDefined();
+  it("checks names as Rust's plain_name does (no control characters, at most 256 bytes), no more", () => {
+    expect(validateRemoteEngine(trino({ catalog: "a.b" }))["ice.engine.catalogName"]).toBeUndefined();
+    expect(validateRemoteEngine(trino({ catalog: "a\tb" }))["ice.engine.catalogName"]).toMatch(/control/);
+    expect(validateRemoteEngine(trino({ user: "x".repeat(257) }))["ice.engine.user"]).toMatch(/256/);
+    expect(validateRemoteEngine(spark({ proxyUser: "a b" }))["ice.engine.proxyUser"]).toBeUndefined();
+    expect(validateRemoteEngine(spark({ proxyUser: "a\u0007" }))["ice.engine.proxyUser"]).toMatch(/control/);
+  });
+  it("bounds the session start timeout to 1-3600 seconds, as Rust does", () => {
+    expect(MAX_SESSION_START_TIMEOUT_SECS).toBe(3600);
+    expect(validateRemoteEngine(spark({ sessionStartTimeoutSecs: 3600 }))["ice.engine.timeout"]).toBeUndefined();
+    expect(validateRemoteEngine(spark({ sessionStartTimeoutSecs: 3601 }))["ice.engine.timeout"]).toMatch(/1-3600/);
     expect(validateRemoteEngine(spark({ sessionStartTimeoutSecs: 0 }))["ice.engine.timeout"]).toBeDefined();
     expect(validateRemoteEngine(spark({ sessionStartTimeoutSecs: 1.5 }))["ice.engine.timeout"]).toBeDefined();
-    expect(validateRemoteEngine(spark({ proxyUser: "a b" }))["ice.engine.proxyUser"]).toBeDefined();
+  });
+  it("refuses a basic-auth user name with ':' (HTTP basic cannot carry it)", () => {
+    expect(validateRemoteEngine(trino({ auth: { kind: "basic", username: "dom:bob" } }))["ice.engine.username"]).toMatch(/':'/);
+    expect(validateRemoteEngine(trino({ auth: { kind: "basic", username: "bob" } }))["ice.engine.username"]).toBeUndefined();
   });
   it("has no switch to skip TLS verification (R4): the engine has no such field", () => {
     expect(Object.keys(trino()).sort()).toEqual(["auth", "caCertPath", "catalog", "kind", "url", "user"]);
@@ -274,5 +320,89 @@ describe("engine secret (saveProfile engineSecret: undefined keeps, \"\" deletes
     d.icebergSecret = { mode: "set", value: "catalog-token" };
     d.engineSecret = { mode: "set", value: "engine-token" };
     expect(icebergSecretArgs(null, d)).toMatchObject({ icebergSecret: "catalog-token", engineSecret: "engine-token" });
+  });
+});
+
+describe("a typed engine secret never follows an engine or sign-in switch (reconcileDraft)", () => {
+  const typed = (profile: ConnectionProfile) => {
+    const d = initialDraft(null, "iceberg");
+    d.profile = profile;
+    d.engineSecret = { mode: "set", value: "trino-password" };
+    return d;
+  };
+  it("clears it when the engine kind changes (Trino basic -> Spark basic)", () => {
+    const d = reconcileDraft(typed(lake(trino({ auth: { kind: "basic", username: "bob" } }))), lake(spark({ auth: { kind: "basic", username: "bob" } })));
+    expect(d.engineSecret).toEqual({ mode: "set", value: "" });
+    expect(icebergSecretArgs(null, d).engineSecret).toBeUndefined();
+  });
+  it("clears it when the sign-in kind changes (basic -> bearer)", () => {
+    const d = reconcileDraft(typed(lake(trino({ auth: { kind: "basic", username: "bob" } }))), lake(trino({ auth: { kind: "bearer" } })));
+    expect(d.engineSecret.value).toBe("");
+  });
+  it("keeps it for any other edit (URL, catalog, user name)", () => {
+    const before = typed(lake(trino({ auth: { kind: "basic", username: "bob" } })));
+    const d = reconcileDraft(before, lake(trino({ url: "https://other:8443", catalog: "x", auth: { kind: "basic", username: "alice" } })));
+    expect(d.engineSecret).toEqual({ mode: "set", value: "trino-password" });
+  });
+  it("forgets the Spark rows typed for another engine", () => {
+    const before = { ...typed(lake(spark())), sessionConfRows: [{ key: "", value: "x" }] };
+    expect(reconcileDraft(before, lake(trino())).sessionConfRows).toBeNull();
+    expect(reconcileDraft(before, lake(spark({ url: "https://x" }))).sessionConfRows).toEqual([{ key: "", value: "x" }]);
+  });
+});
+
+describe("Spark rows the saved map cannot hold block Save (draftErrors)", () => {
+  it("refuses a value without a name and a name set twice, which the map would silently drop", () => {
+    const d = initialDraft(null, "iceberg");
+    d.profile = lake(spark());
+    expect(draftErrors(d)).toEqual({});
+    d.sessionConfRows = [{ key: "", value: "8" }];
+    expect(draftErrors(d)["ice.engine.sessionConf"]).toMatch(/name/);
+    d.sessionConfRows = [
+      { key: "spark.executor.cores", value: "1" },
+      { key: "spark.executor.cores", value: "2" },
+    ];
+    expect(draftErrors(d)["ice.engine.sessionConf"]).toMatch(/twice/);
+    expect(firstErrorSection(draftErrors(d))).toBe("queryEngine");
+    d.sessionConfRows = [{ key: "spark.executor.cores", value: "2" }, { key: "", value: "" }];
+    expect(draftErrors(d)).toEqual({});
+  });
+  it("ignores rows once the engine is not Spark", () => {
+    const d = initialDraft(null, "iceberg");
+    d.profile = lake(trino());
+    d.sessionConfRows = [{ key: "", value: "8" }];
+    expect(draftErrors(d)).toEqual({});
+  });
+});
+
+describe("a stored engine secret is bound to its endpoint (Rust deletes it when the endpoint moves)", () => {
+  const saved = { ...lake(trino({ url: "https://trino.example.com:8443/base", auth: { kind: "basic", username: "bob" }, caCertPath: "/ca.pem" })), id: "p" };
+  const edited = (over: Partial<Extract<RemoteEngine, { kind: "trino" }>>) => ({ ...lake(trino({ url: "https://trino.example.com:8443/base", auth: { kind: "basic", username: "bob" }, caCertPath: "/ca.pem", ...over })), id: "p" });
+  const keep = { mode: "keep" as const, value: "" };
+
+  it("is unchanged by edits that keep scheme, host, port, path and CA (incl. a trailing slash or default port spelled out)", () => {
+    expect(engineEndpointChanged(saved, edited({}))).toBe(false);
+    expect(engineEndpointChanged(saved, edited({ url: "https://TRINO.example.com:8443/base/", user: "alice" }))).toBe(false);
+    const std = { ...lake(trino({ url: "https://h", auth: { kind: "bearer" } })), id: "p" };
+    expect(engineEndpointChanged(std, { ...lake(trino({ url: "https://h:443", auth: { kind: "bearer" } })), id: "p" })).toBe(false);
+    expect(engineSecretStored(saved, edited({}), true)).toBe(true);
+    expect(engineSecretArg(saved, edited({}), keep)).toBeUndefined();
+  });
+  it("moves with the scheme, host, port, path prefix or CA path", () => {
+    for (const over of [{ url: "http://localhost:8443/base" }, { url: "https://other.example.com:8443/base" }, { url: "https://trino.example.com:9443/base" }, { url: "https://trino.example.com:8443/other" }, { caCertPath: "/other.pem" }, { caCertPath: null }]) {
+      expect(engineEndpointChanged(saved, edited(over)), JSON.stringify(over)).toBe(true);
+    }
+  });
+  it("then asks for the secret again instead of showing it as stored, and deletes the old one if none is typed", () => {
+    const moved = edited({ url: "https://other.example.com:8443/base" });
+    expect(engineSecretStored(saved, moved, true)).toBe(false);
+    expect(engineSecretMissing(saved, moved, keep, true)).toBe(true);
+    expect(engineSecretArg(saved, moved, keep)).toBe("");
+    expect(engineSecretArg(saved, moved, { mode: "set", value: "new" })).toBe("new");
+    expect(engineSecretMissing(saved, moved, { mode: "set", value: "new" }, true)).toBe(false);
+  });
+  it("treats Trino -> Spark at the same URL as a new endpoint too", () => {
+    const spk = { ...lake(spark({ url: "https://trino.example.com:8443/base", auth: { kind: "basic", username: "bob" }, caCertPath: "/ca.pem" })), id: "p" };
+    expect(engineSecretStored(saved, spk, true)).toBe(false);
   });
 });

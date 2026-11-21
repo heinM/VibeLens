@@ -2,7 +2,7 @@ import { newProfile, usesHostPort } from "../../lib/defaults";
 import type { AuthMethod, ConnectionProfile, EngineKind } from "../../ipc/types";
 import { cleanIceberg, secretKind, secretRequired } from "./icebergForm";
 import { cleanRedshift, normalizeRedshift } from "./redshiftForm";
-import { engineSecretArg, engineSecretMissing } from "./remoteEngineForm";
+import { confRowsError, engineSecretArg, engineSecretMissing, isRemoteEngine, type ConfRow } from "./remoteEngineForm";
 
 /** How a write-only secret (password, SSH passphrase) is treated on save. */
 export interface SecretEdit {
@@ -26,6 +26,38 @@ export interface Draft {
   s3Keys: S3KeysEdit;
   /** Trino / Spark (Livy) password or bearer token (`saveProfile`'s `engineSecret`). */
   engineSecret: SecretEdit;
+  /**
+   * The Spark session-configuration rows as typed, once edited. The saved map cannot hold a value
+   * without a name or a name set twice, so those are validated here, not silently dropped on save.
+   */
+  sessionConfRows?: ConfRow[] | null;
+}
+
+/** The engine kind and sign-in kind a typed engine secret was meant for (`trino:basic`), or null. */
+function engineAuthOf(p: ConnectionProfile): string | null {
+  const q = p.engine === "iceberg" ? p.iceberg?.queryEngine : null;
+  return isRemoteEngine(q) ? `${q.kind}:${q.auth.kind}` : null;
+}
+
+/**
+ * Applies a profile edit to the draft. When the query engine or its sign-in kind changes, a secret typed
+ * for the old one is cleared (a Trino password must never become the Spark password or a bearer token
+ * for the next URL), and the Spark rows are forgotten when the engine changes.
+ */
+export function reconcileDraft(d: Draft, profile: ConnectionProfile): Draft {
+  const before = engineAuthOf(d.profile);
+  const after = engineAuthOf(profile);
+  if (before === after) return { ...d, profile };
+  const engineChanged = before?.split(":")[0] !== after?.split(":")[0];
+  return { ...d, profile, engineSecret: newSecret(), ...(engineChanged ? { sessionConfRows: null } : {}) };
+}
+
+/** Errors that live in the draft rather than the profile (the Spark rows the saved map cannot hold). */
+export function draftErrors(d: Draft): Record<string, string> {
+  const q = d.profile.engine === "iceberg" ? d.profile.iceberg?.queryEngine : null;
+  if (q?.kind !== "spark" || !d.sessionConfRows) return {};
+  const e = confRowsError(d.sessionConfRows, q.catalog);
+  return e ? { "ice.engine.sessionConf": e } : {};
 }
 
 export const keepSecret = (): SecretEdit => ({ mode: "keep", value: "" });

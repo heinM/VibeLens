@@ -8,10 +8,11 @@ import { useUIStore } from "../../store/useUIStore";
 import { Button, ConfirmDialog, Dialog, EmptyState, EnvBadge, ErrorBox, Spinner } from "../ui";
 import { FocusScope } from "../ui/formKit";
 import { aiAccessMeta } from "./aiAccess";
-import { cleanProfile, icebergSecretArgs, initialDraft, missingIcebergSecrets, secretArgs, testEngineSecretArg, testPasswordArg, type Draft, type S3KeysEdit, type SecretEdit } from "./draft";
+import { cleanProfile, draftErrors, icebergSecretArgs, initialDraft, reconcileDraft, missingIcebergSecrets, secretArgs, testEngineSecretArg, testPasswordArg, type Draft, type S3KeysEdit, type SecretEdit } from "./draft";
 import { HostKeyTrustDialog } from "./HostKeyDialog";
 import { isHostKeyFingerprint, withTrustedHostKey } from "./hostKey";
 import { catalogSummary, engineSummary, normalizeIceberg, storageSummary } from "./icebergForm";
+import type { ConfRow } from "./remoteEngineForm";
 import { normalizeRedshift, redshiftTargetName } from "./redshiftForm";
 import { RedshiftSection } from "./sections/RedshiftSection";
 import { AdvancedSection } from "./sections/AdvancedSection";
@@ -117,7 +118,7 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
   const profile = draft.profile;
   const storedSecrets = useSecretStatus(editing ? existing?.id : null).data;
   const missing = useMemo(() => missingIcebergSecrets(existing, draft, storedSecrets), [existing, draft, storedSecrets]);
-  const errors = useMemo(() => validateProfile(cleanProfile(profile), others, missing), [profile, others, missing]);
+  const errors = useMemo(() => ({ ...validateProfile(cleanProfile(profile), others, missing), ...draftErrors(draft) }), [profile, others, missing, draft]);
   const counts = useMemo(() => errorCountBySection(errors), [errors]);
 
   const touch = useCallback(() => {
@@ -128,7 +129,7 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
   const patch = useCallback(
     (fn: (p: ConnectionProfile) => ConnectionProfile) => {
       touch();
-      setDraft((d) => ({ ...d, profile: fn(d.profile) }));
+      setDraft((d) => reconcileDraft(d, fn(d.profile)));
     },
     [touch],
   );
@@ -162,6 +163,13 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
     (s3Keys: S3KeysEdit) => {
       touch();
       setDraft((d) => ({ ...d, s3Keys }));
+    },
+    [touch],
+  );
+  const setSessionConfRows = useCallback(
+    (sessionConfRows: ConfRow[]) => {
+      touch();
+      setDraft((d) => ({ ...d, sessionConfRows }));
     },
     [touch],
   );
@@ -267,7 +275,7 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
   });
 
   const err = useCallback((field: string) => (submitted ? errors[field] : undefined), [submitted, errors]);
-  const props: SectionProps = { draft, profile, editing, original: existing, patch, patchIceberg, patchRedshift, setPassword, setSshSecret, setIcebergSecret, setS3Keys, setEngineSecret, err };
+  const props: SectionProps = { draft, profile, editing, original: existing, patch, patchIceberg, patchRedshift, setPassword, setSshSecret, setIcebergSecret, setS3Keys, setEngineSecret, setSessionConfRows, err };
   const visible = ENGINE_SECTIONS[profile.engine];
   const current: SectionId = visible.includes(section) ? section : "general";
 

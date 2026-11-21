@@ -9,11 +9,14 @@ import { SecretField } from "../SecretField";
 import { useSecretStatus } from "../useSecretStatus";
 import {
   DEFAULT_SESSION_START_TIMEOUT_SECS,
+  MAX_SESSION_START_TIMEOUT_SECS,
   blankHttpAuth,
   cleartextProblem,
   confFromRows,
   confRowError,
   confRows,
+  engineEndpointChanged,
+  engineSecretKind,
   engineSecretStored,
   validateRemoteEngine,
   type ConfRow,
@@ -24,10 +27,12 @@ import type { SectionProps } from "./types";
 
 const mono = (invalid: boolean) => cn("font-mono", invalid && invalidRing);
 
-export function RemoteEngineFields({ engine: q, setEngine, draft, setEngineSecret, original, editing, profile, err }: SectionProps & { engine: RemoteEngine; setEngine: (q: RemoteEngine) => void }) {
+export function RemoteEngineFields({ engine: q, setEngine, draft, setEngineSecret, setSessionConfRows, original, editing, profile, err }: SectionProps & { engine: RemoteEngine; setEngine: (q: RemoteEngine) => void }) {
   const uid = useId();
   const secrets = useSecretStatus(editing ? original?.id : null);
   const hasStored = engineSecretStored(original, profile, secrets.data?.hasEngineSecret);
+  // Rust binds a stored secret to the endpoint it was saved for: a new endpoint means typing it again.
+  const rebound = editing && !!secrets.data?.hasEngineSecret && engineSecretKind(original) === engineSecretKind(profile) && engineEndpointChanged(original, profile);
   const live = validateRemoteEngine(q);
   // Required-field messages wait for a save or test; a URL that is wrong (or would leak a secret) shows at once.
   const urlErr = err("ice.engine.url") ?? (q.url.trim() ? live["ice.engine.url"] : undefined);
@@ -94,6 +99,11 @@ export function RemoteEngineFields({ engine: q, setEngine, draft, setEngineSecre
         {q.auth.kind === "bearer" && (
           <SecretField label={trino ? "JWT" : "Bearer token"} edit={draft.engineSecret} onChange={setEngineSecret} hasStored={hasStored} hint="Sent as Authorization: Bearer over TLS. Saved to the OS keychain, never shown again." />
         )}
+        {rebound && q.auth.kind !== "none" && (
+          <p className="text-[11.5px] leading-snug text-warn" role="note">
+            The endpoint changed, so the saved {q.auth.kind === "basic" ? "password" : "token"} will not be sent to it. Enter it again.
+          </p>
+        )}
         {err("ice.engine.secret") && (
           <span role="alert" className="block text-[11px] text-danger">
             {err("ice.engine.secret")}
@@ -116,6 +126,7 @@ export function RemoteEngineFields({ engine: q, setEngine, draft, setEngineSecre
                 value={q.sessionStartTimeoutSecs}
                 allowEmpty
                 min={1}
+                max={MAX_SESSION_START_TIMEOUT_SECS}
                 placeholder={String(DEFAULT_SESSION_START_TIMEOUT_SECS)}
                 suffix="sec"
                 invalid={!!err("ice.engine.timeout")}
@@ -123,9 +134,21 @@ export function RemoteEngineFields({ engine: q, setEngine, draft, setEngineSecre
               />
             </FormField>
           </div>
-          {/* Each row shows its own problem while typing (confRowError), so the field carries only the hint. */}
-          <FormField label="Session configuration" optional hint="Spark settings for the session, such as spark.sql.catalog.lake. Stored in plain text: no secrets, and nothing that loads code (spark.jars, extraJavaOptions, …).">
-            <ConfEditor key={`${uid}-conf`} initial={q.sessionConf} onChange={(sessionConf) => setEngine({ ...q, sessionConf })} />
+          {/* Each row shows its own problem while typing (confRowError); the draft validates the rows so Save is blocked too. */}
+          <FormField
+            label="Session configuration"
+            optional
+            hint={`Only the Iceberg catalog settings (spark.sql.catalog.${q.catalog.trim() || "<catalog>"} and its type, warehouse, default-namespace, cache options) and session sizing (shuffle partitions, time zone, adaptive execution, executor and driver memory and cores, dynamic allocation). Anything else is set on the cluster.`}
+          >
+            <ConfEditor
+              key={`${uid}-conf`}
+              initial={draft.sessionConfRows ?? confRows(q.sessionConf)}
+              catalog={q.catalog}
+              onChange={(rows, sessionConf) => {
+                setSessionConfRows(rows);
+                setEngine({ ...q, sessionConf });
+              }}
+            />
           </FormField>
         </Group>
       )}
@@ -133,21 +156,24 @@ export function RemoteEngineFields({ engine: q, setEngine, draft, setEngineSecre
   );
 }
 
-/** Key/value rows for the Spark session configuration. Rows are local so blanks and duplicates survive typing. */
-function ConfEditor({ initial, onChange }: { initial: Record<string, string>; onChange: (c: Record<string, string>) => void }) {
-  const [rows, setRowsState] = useState<ConfRow[]>(() => confRows(initial));
+/**
+ * Key/value rows for the Spark session configuration. Rows are kept as typed (blank names and duplicates
+ * included) and handed to the draft, which refuses them on Save instead of dropping them.
+ */
+function ConfEditor({ initial, catalog, onChange }: { initial: ConfRow[]; catalog: string; onChange: (rows: ConfRow[], c: Record<string, string>) => void }) {
+  const [rows, setRowsState] = useState<ConfRow[]>(() => initial);
   const setRows = (next: ConfRow[]) => {
     setRowsState(next);
-    // Duplicates collapse in the saved map; keep the first so the row error and the saved value agree.
+    // The map keeps the first of duplicates; the row error (and the draft) still block Save until it is fixed.
     const firstWins = next.filter((r, i) => next.findIndex((x) => x.key.trim() === r.key.trim()) === i);
-    onChange(confFromRows(firstWins));
+    onChange(next, confFromRows(firstWins));
   };
   const set = (i: number, patch: Partial<ConfRow>) => setRows(rows.map((r, j) => (j === i ? { ...r, ...patch } : r)));
   return (
     <div className="space-y-1.5">
       {rows.length === 0 && <p className="text-[12px] text-muted">None. The cluster's own defaults apply.</p>}
       {rows.map((r, i) => {
-        const rowErr = confRowError(rows, i);
+        const rowErr = confRowError(rows, i, catalog);
         return (
           <div key={i} className="space-y-0.5">
             <div className="grid grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_auto] items-center gap-1.5">

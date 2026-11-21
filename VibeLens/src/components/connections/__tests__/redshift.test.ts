@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { newProfile, newRedshiftOptions, usesHostPort } from "../../../lib/defaults";
 import type { ConnectionProfile, RedshiftOptions } from "../../../ipc/types";
 import { cleanProfile, icebergSecretArgs, initialDraft, secretArgs, switchEngine, testPasswordArg } from "../draft";
-import { authAllowed, blankRedshiftAuth, blankTarget, clusterIdError, databaseError, dbUserError, normalizeRedshift, redshiftSummary, validateRedshift, workgroupError } from "../redshiftForm";
+import { authAllowed, blankRedshiftAuth, blankTarget, clusterIdError, databaseError, dbUserError, isRedshiftDatabaseName, normalizeRedshift, requestedDatabaseError, redshiftSummary, validateRedshift, workgroupError } from "../redshiftForm";
 import { errorCountBySection, firstErrorSection, sectionOf, validateProfile } from "../validation";
 
 const aws = { identity: { kind: "profile", profileName: "dev" } as const, region: "eu-west-1" };
@@ -119,5 +119,26 @@ describe("target and sign-in consistency", () => {
     expect(redshiftSummary(opts())).toBe("Redshift · analytics · dev · eu-west-1");
     expect(redshiftSummary(opts({ target: { kind: "serverless", workgroupName: "" } }))).toBe("Redshift · no workgroup · dev · eu-west-1");
     expect(redshiftSummary(null)).toBe("Amazon Redshift");
+  });
+});
+
+describe("parity with Rust's Redshift checks", () => {
+  const arn = (region: string, name: string) => `arn:aws:secretsmanager:${region}:123456789012:secret:${name}`;
+  it("limits the secret name to [A-Za-z0-9/_+=.@-]", () => {
+    expect(validateRedshift(opts({ auth: { kind: "secret", secretArn: arn("eu-west-1", "team/rs_ro+1=a.b@c-AbCdEf") } }))).toEqual({});
+    for (const bad of ["rs ro", "rs;ro", "rs*", "rs:ro", "ré"]) {
+      expect(validateRedshift(opts({ auth: { kind: "secret", secretArn: arn("eu-west-1", bad) } }))["rs.secretArn"], bad).toMatch(/Expected arn/);
+    }
+  });
+  it("requires the secret's region to be the connection's AWS region", () => {
+    expect(validateRedshift(opts({ auth: { kind: "secret", secretArn: arn("us-east-1", "rs") } }))["rs.secretArn"]).toMatch(/us-east-1.*eu-west-1/);
+    expect(validateRedshift(opts({ aws: { ...aws, region: "us-east-1" }, auth: { kind: "secret", secretArn: arn("us-east-1", "rs") } }))).toEqual({});
+  });
+  it("only sends a requested database name of ASCII letters, digits, _ and $", () => {
+    for (const ok of ["dev", "Sales_2026", "a$b"]) expect(isRedshiftDatabaseName(ok), ok).toBe(true);
+    for (const bad of ["", "my-db", "a b", "db;drop", "dév"]) expect(isRedshiftDatabaseName(bad), bad).toBe(false);
+    expect(requestedDatabaseError(null)).toBeNull();
+    expect(requestedDatabaseError("dev")).toBeNull();
+    expect(requestedDatabaseError("my-db")).toMatch(/ASCII letters/);
   });
 });
