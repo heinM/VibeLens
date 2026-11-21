@@ -487,7 +487,18 @@ fn assess_sql(f: &ProfileFacts, database: Option<&str>, sql: &str, purpose: &str
             return denied;
         }
     }
-    let mut c = crate::remote::classify_on(f.remote.as_ref().map(|r| &r.engine), sql);
+    let (mut c, engine_refusal) =
+        crate::remote::classify_on_explained(f.remote.as_ref().map(|r| &r.engine), sql);
+    // A statement the PostgreSQL classifier calls a read but the Trino or Spark read-only check
+    // refuses (`java_method(…)`, `TABLE(pg.system.query(…))`) is refused outright with the
+    // engine's reason. Asking for approval instead would run it with read_only = false, which
+    // skips that very check.
+    if let Some(reason) = engine_refusal {
+        return Assessment::denied(format!(
+            "{reason}. This connection's query engine refuses it in a read-only run, and the agent \
+             does not run it as a write either"
+        ));
+    }
     // A Redshift query that calls a function that is not a read-only built-in is not run
     // read-only (the engine would refuse it): it is shown for approval like any unverified
     // statement.
@@ -1579,6 +1590,17 @@ mod tests {
         ] {
             let r = assess(&sql(s), Some(&f), false);
             assert!(r.risk != Safe || !r.allow_write, "{s}: {r:?}");
+        }
+        // Re-audit item 6: a PostgreSQL "read" the Spark check refuses is refused outright with
+        // the engine's reason; approving it would run it with read_only = false and skip the
+        // check.
+        for s in [
+            "SELECT java_method('java.lang.Runtime', 'getRuntime')",
+            "SELECT reflect('java.lang.Runtime', 'getRuntime')",
+        ] {
+            let r = assess(&sql(s), Some(&f), false);
+            assert_eq!(r.risk, Denied, "{s}: {r:?}");
+            assert!(r.reason.unwrap().contains("read-only run"), "{s}");
         }
         for s in [
             "DELETE FROM lake.shop.orders",

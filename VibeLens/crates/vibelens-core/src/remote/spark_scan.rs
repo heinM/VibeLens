@@ -349,10 +349,37 @@ fn refusal_as(stmt: &str, escapes: bool) -> Option<String> {
                     );
                 }
             }
+            // `text.passwd`, `` `csv`.x ``: with `spark.sql.runSQLOnFiles` a two-part name whose
+            // table does not exist is read as a file, so a two-part name that starts with a
+            // file format is refused, quoted or not.
+            Tok::Word(_) | Tok::Quoted(_)
+                if matches!(next, Some(Tok::Punct('.')))
+                    && !matches!(prev, Some(Tok::Punct('.')))
+                    && !matches!(toks.get(i + 3), Some(Tok::Punct('.')))
+                    && is_format_name(t) =>
+            {
+                let name = match t {
+                    Tok::Word(w) | Tok::Quoted(w) => w.to_ascii_lowercase(),
+                    _ => String::new(),
+                };
+                return Some(format!(
+                    "it names a two-part relation starting with '{name}', which Spark can read as a \
+                     file. A namespace called '{name}' must be written with its catalog in front \
+                     (catalog.{name}.table)"
+                ));
+            }
             _ => {}
         }
     }
     None
+}
+
+fn is_format_name(t: &Tok) -> bool {
+    match t {
+        Tok::Word(w) => FILE_FORMATS.contains(&w.as_str()),
+        Tok::Quoted(q) => FILE_FORMATS.contains(&q.to_ascii_uppercase().as_str()),
+        _ => false,
+    }
 }
 
 /// Refuses every statement of `statements` that is not provably a read, before any is sent.
@@ -376,29 +403,57 @@ pub fn check_spark_read_only(statements: &[String]) -> Result<()> {
 /// Fails closed: when the statement cannot be tokenised (a backslash in a `--` comment, a nested
 /// block comment, a hint, …) it is refused if it starts with a comment, and otherwise judged by
 /// its first word.
+///
+/// Session-scoped objects are refused for the same reason: one Livy session serves approved
+/// writes and unapproved read-only runs, and the read-only scan knows names, not what a name
+/// was bound to. A temporary function bound to `GenericUDFReflect`, or a temporary view that
+/// shadows a table, created by an approved run would be used by every later unapproved read.
 pub(crate) fn session_statement(stmt: &str) -> Option<&'static str> {
-    let first = match tokenize(stmt, true) {
-        Ok(l) => match l.toks.first() {
-            Some(Tok::Word(w)) => w.clone(),
-            _ => return None,
-        },
+    let words: Vec<String> = match tokenize(stmt, true) {
+        Ok(l) => l
+            .toks
+            .iter()
+            .take(6)
+            .map_while(|t| match t {
+                Tok::Word(w) => Some(w.clone()),
+                _ => None,
+            })
+            .collect(),
         Err(_) => {
             let t = stmt.trim_start();
             if t.starts_with("--") || t.starts_with("/*") {
                 return Some("a statement that starts with a comment the check cannot read");
             }
             t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .next()
-                .unwrap_or("")
-                .to_ascii_uppercase()
+                .filter(|w| !w.is_empty())
+                .take(6)
+                .map(str::to_ascii_uppercase)
+                .collect()
         }
     };
-    match first.as_str() {
-        "USE" => Some("USE"),
-        "SET" => Some("SET"),
-        "RESET" => Some("RESET"),
-        _ => None,
-    }
+    let w: Vec<&str> = words.iter().map(String::as_str).collect();
+    let temporary = |rest: &[&str]| {
+        let rest: Vec<&str> = rest
+            .iter()
+            .copied()
+            .filter(|w| !matches!(*w, "OR" | "REPLACE" | "GLOBAL"))
+            .collect();
+        matches!(rest.first(), Some(&("TEMPORARY" | "TEMP")))
+    };
+    Some(match w.as_slice() {
+        ["USE", ..] => "USE",
+        ["SET", ..] => "SET",
+        ["RESET", ..] => "RESET",
+        ["CREATE", rest @ ..] if temporary(rest) => "CREATE TEMPORARY …",
+        ["DROP", rest @ ..] if temporary(rest) => "DROP TEMPORARY …",
+        ["ADD", ..] => "ADD",
+        ["DECLARE", ..] => "DECLARE",
+        ["EXECUTE", ..] => "EXECUTE IMMEDIATE",
+        ["CACHE", ..] => "CACHE",
+        ["UNCACHE", ..] => "UNCACHE",
+        ["CLEAR", ..] => "CLEAR CACHE",
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -570,6 +625,68 @@ mod tests {
         assert_eq!(session_statement("SET $x = 1"), Some("SET"));
         assert_eq!(session_statement("SELECT $x"), None);
         assert_eq!(session_statement("INSERT INTO t SELECT 1 -- note"), None);
+    }
+
+    /// Re-audit item 1: state an approved run leaves in the shared Livy session would be used
+    /// by later unapproved reads, which the read-only scan checks by name only.
+    #[test]
+    fn session_scoped_state_is_refused() {
+        for s in [
+            "CREATE TEMPORARY FUNCTION f AS 'org.apache.hadoop.hive.ql.udf.generic.GenericUDFReflect'",
+            "CREATE OR REPLACE TEMPORARY VIEW orders AS SELECT 1",
+            "create or replace global temporary view v as select 1",
+            "CREATE TEMP VIEW v AS SELECT 1",
+            "CREATE TEMPORARY TABLE t USING parquet",
+            "CREATE TEMPORARY VARIABLE x INT",
+            "DROP TEMPORARY FUNCTION f",
+            "DROP TEMPORARY VARIABLE x",
+            "ADD JAR s3://b/x.jar",
+            "DECLARE x INT DEFAULT 1",
+            "SET VAR x = 2",
+            "SET VARIABLE x = 2",
+            "EXECUTE IMMEDIATE 'USE other.ns'",
+            "EXECUTE IMMEDIATE 'SET spark.sql.ansi.enabled=false'",
+            "CACHE TABLE t",
+            "UNCACHE TABLE t",
+            "CLEAR CACHE",
+        ] {
+            assert!(session_statement(s).is_some(), "{s}");
+        }
+        for s in [
+            "CREATE TABLE lake.shop.t (a INT)",
+            "CREATE OR REPLACE VIEW lake.shop.v AS SELECT 1",
+            "DROP TABLE lake.shop.t",
+            "INSERT INTO t SELECT 1",
+        ] {
+            assert_eq!(session_statement(s), None, "{s}");
+        }
+    }
+
+    /// Re-audit item 3: with `spark.sql.runSQLOnFiles` a two-part name whose table is not
+    /// found resolves as a file.
+    #[test]
+    fn unquoted_file_relations_are_refused() {
+        for s in [
+            "SELECT * FROM text.passwd",
+            "SELECT * FROM csv.__spark_conf__",
+            "SELECT * FROM `text`.somefile",
+            "SELECT * FROM t JOIN json.x ON true",
+        ] {
+            let why = refusal(s).unwrap_or_default();
+            assert!(
+                why.contains("catalog.text")
+                    || why.contains("catalog.csv")
+                    || why.contains("catalog.json"),
+                "{s}: {why}"
+            );
+        }
+        for s in [
+            "SELECT * FROM lake.text.passwd",
+            "SELECT * FROM iceberg.shop.orders",
+            "SELECT * FROM shop.orders",
+        ] {
+            assert!(ok(s), "{s}: {:?}", refusal(s));
+        }
     }
 
     #[test]

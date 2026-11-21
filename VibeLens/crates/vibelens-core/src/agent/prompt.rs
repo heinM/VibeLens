@@ -100,7 +100,7 @@ fn remote_engine_note(engine: &IcebergQueryEngine) -> Option<&'static str> {
         }
         IcebergQueryEngine::Spark { .. } => {
             "- Query engine: Apache Spark through Apache Livy (remote, Spark SQL, full DML on Iceberg: INSERT, UPDATE, DELETE, MERGE INTO). Queries run on the user's cluster, so select only the columns you need, filter on partition columns and always add LIMIT to exploratory queries. \
-             Name tables as namespace.table or catalog.namespace.table. USE, SET and RESET are refused: they would change the shared session. \
+             Name tables as namespace.table or catalog.namespace.table. USE, SET, RESET, temporary objects (CREATE TEMPORARY VIEW/FUNCTION/TABLE/VARIABLE, DROP TEMPORARY), ADD, DECLARE, EXECUTE IMMEDIATE and CACHE/UNCACHE/CLEAR CACHE are refused in every mode: they would change the shared session; write a script with permanent objects instead. Variable references (${…}) are refused too, and a two-part name starting with a file format (text.x, csv.x) must be written with its catalog (catalog.text.x). \
              Read-only checks are strict on Spark: reflect/java_method, file paths such as parquet.`/path`, TRANSFORM and IDENTIFIER() are refused, as is a string literal with an odd backslash before a quote. \
              Time travel uses VERSION AS OF <snapshot_id> or TIMESTAMP AS OF '<timestamp>'; metadata tables are namespace.table.snapshots, .history and .files.\n"
         }

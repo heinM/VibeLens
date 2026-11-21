@@ -775,3 +775,77 @@ async fn table_functions_are_refused_before_any_request() {
     assert_eq!(failure(&events).1, "policy_denied");
     assert_eq!(server.count(), 0);
 }
+
+// ---- Re-audit 2026-11-21 ------------------------------------------------------------------
+
+/// Item 5: a gateway may decode `..%2f` or `..;/` and route the credentialed GET and DELETE
+/// elsewhere. Trino's nextUri has plain path segments and no query string.
+#[tokio::test]
+async fn a_next_uri_with_encoded_or_odd_path_parts_is_never_requested() {
+    for tail in [
+        "/trino/v1/statement/..%2f..%2fadmin/x",
+        "/trino/v1/statement/..;/..;/admin/x",
+        "/trino/v1/statement/x\\..\\admin",
+        "/trino/v1/statement/x/1?slug=a",
+        "/trino/v1/statement/x/1#f",
+        "/trino/v1/statement/x//1",
+        "/trino/v1/statement/x/1/",
+        "/trino/v1/statement/",
+    ] {
+        let t = tail.to_string();
+        let (server, _) = trino(move |base, req| match req.method.as_str() {
+            "POST" if req.path == "/trino/v1/statement" => {
+                Resp::ok(&page("q", Some(format!("{base}{t}")), "QUEUED"))
+            }
+            _ => Resp::ok(&page("q", None, "FINISHED")),
+        })
+        .await;
+        let e = engine(&format!("{}/trino/", server.url));
+        let events = stream(&e, "SELECT 1", opts()).await;
+        let (_, _, msg) = failure(&events);
+        assert!(msg.contains("nextUri"), "{tail}: {msg}");
+        assert_eq!(server.count(), 1, "{tail}: only the POST");
+    }
+}
+
+/// Item 8: Stop while the POST is in flight. Without the submit task the query Trino created
+/// when the answer finally came would keep running with no client and no id held.
+#[tokio::test]
+async fn a_query_whose_submission_was_cancelled_is_deleted_when_the_answer_arrives() {
+    let (server, _) = trino(|base, req| match req.method.as_str() {
+        "POST" => Resp::ok(&page(
+            "q",
+            Some(format!("{base}/v1/statement/x/1")),
+            "QUEUED",
+        ))
+        .after(Duration::from_millis(300)),
+        "DELETE" => Resp::text(204, ""),
+        _ => Resp::ok(&page("q", None, "FINISHED")),
+    })
+    .await;
+    let e = engine(&server.url);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let c = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        c.cancel();
+    });
+    let t0 = std::time::Instant::now();
+    let err = e
+        .execute_collect_cancellable("SELECT * FROM big", ExecOptions::default(), cancel)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CoreError::Cancelled), "{err:?}");
+    assert!(
+        t0.elapsed() < Duration::from_millis(250),
+        "the caller did not wait for the POST"
+    );
+    for _ in 0..200 {
+        if !server.calls("DELETE", "/v1/statement/x/1").is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(server.calls("DELETE", "/v1/statement/x/1").len(), 1);
+    assert_eq!(server.calls("GET", "/v1/statement/x/1").len(), 0);
+}

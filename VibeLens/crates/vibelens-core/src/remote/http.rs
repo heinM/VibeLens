@@ -281,6 +281,49 @@ impl HttpClient {
             .await
     }
 
+    /// Sends a request that creates something on the server (a query, a session, a statement)
+    /// so that it is never orphaned. The request runs in a task of its own. If the caller is
+    /// cancelled, or its future is dropped, before the answer arrives, the task still waits for
+    /// it and hands a successful answer to `undo`, which deletes or cancels what was created.
+    /// The hand-over goes through a channel, so an answer is either received by the caller or
+    /// undone, never neither.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn submit<F, Fut>(
+        &self,
+        method: reqwest::Method,
+        url: url::Url,
+        headers: Vec<(&'static str, String)>,
+        body: Option<Body>,
+        max_body: usize,
+        cancel: &tokio_util::sync::CancellationToken,
+        undo: F,
+    ) -> Result<Response>
+    where
+        F: FnOnce(HttpClient, Response) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let client = self.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let r = client
+                .send_capped(method, &url, &headers, body, max_body)
+                .await;
+            if let Err(Ok(resp)) = tx.send(r)
+                && resp.is_success()
+            {
+                // Nobody is waiting for it any more.
+                undo(client, resp).await;
+            }
+        });
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(CoreError::Cancelled),
+            r = rx => r.unwrap_or_else(|_| {
+                Err(CoreError::Other(format!("the {} request task ended early", self.label)))
+            }),
+        }
+    }
+
     /// [`send`](Self::send) with a smaller body limit (`max_body`, never above the client's).
     pub(crate) async fn send_capped(
         &self,

@@ -582,11 +582,12 @@ impl ConnectionManager {
             });
         }
         // A secret typed for the test is bound to the endpoint being tested, and only there.
+        let origin = match (&engine_secret_override, profile.iceberg.as_ref()) {
+            (Some(_), Some(o)) => crate::remote::secret::engine_origin(&o.query_engine)?,
+            _ => None,
+        };
         if let Some(secret) = engine_secret_override
-            && let Some(origin) = profile
-                .iceberg
-                .as_ref()
-                .and_then(|o| crate::remote::config::engine_origin(&o.query_engine))
+            && let Some(origin) = origin
         {
             deps.vault = Arc::new(OverlayVault {
                 inner: deps.vault.clone(),

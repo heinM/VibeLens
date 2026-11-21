@@ -299,9 +299,28 @@ impl SparkEngine {
         if let Some(p) = self.proxy_user() {
             body["proxyUser"] = json!(p);
         }
-        // Not raced against cancellation: abandoning it could leave a session behind that we
-        // have no id for. The request timeout bounds it.
-        let resp = self.request(Method::POST, "/sessions", Some(body)).await?;
+        // Raced against cancellation without orphaning the session: if the answer arrives after
+        // the caller has gone, the submit task deletes the session it names.
+        let url = self.url("/sessions")?;
+        let resp = self
+            .client
+            .submit(
+                Method::POST,
+                url,
+                Vec::new(),
+                Some(Body::Json(body)),
+                SMALL_BODY,
+                cancel,
+                |client, resp| async move {
+                    if let Some(id) = parse(&resp.body)
+                        .ok()
+                        .and_then(|v| livy_id(&v, "session").ok())
+                    {
+                        undo(&client, Method::DELETE, &format!("/sessions/{id}")).await;
+                    }
+                },
+            )
+            .await?;
         if !resp.is_success() {
             return Err(self
                 .client
@@ -395,7 +414,7 @@ impl SparkEngine {
             }
         }
         let code = format!("USE {target}");
-        let n = match self.submit(id, &code).await? {
+        let n = match self.submit(id, &code, cancel).await? {
             Submitted::Id(n) => n,
             Submitted::SessionGone => {
                 return Err(CoreError::Database(
@@ -418,12 +437,36 @@ impl SparkEngine {
         }
     }
 
-    async fn submit(&self, session: u64, code: &str) -> Run<Submitted> {
+    async fn submit(&self, session: u64, code: &str, cancel: &CancellationToken) -> Run<Submitted> {
+        // Nothing reaches Livy unchecked for `${`, including the `USE` built from the profile.
+        if let Some(why) = super::spark_scan::substitution_refusal(code) {
+            return Err(CoreError::PolicyDenied(format!("not sent to Spark because {why}")).into());
+        }
+        let url = self.url(&format!("/sessions/{session}/statements"))?;
+        // Raced against cancellation without orphaning the statement: if the answer arrives
+        // after the caller has gone, the submit task cancels the statement it names.
         let resp = self
-            .request(
+            .client
+            .submit(
                 Method::POST,
-                &format!("/sessions/{session}/statements"),
-                Some(json!({ "kind": "sql", "code": code })),
+                url,
+                Vec::new(),
+                Some(Body::Json(json!({ "kind": "sql", "code": code }))),
+                SMALL_BODY,
+                cancel,
+                move |client, resp| async move {
+                    if let Some(n) = parse(&resp.body)
+                        .ok()
+                        .and_then(|v| livy_id(&v, "statement").ok())
+                    {
+                        undo(
+                            &client,
+                            Method::POST,
+                            &format!("/sessions/{session}/statements/{n}/cancel"),
+                        )
+                        .await;
+                    }
+                },
             )
             .await?;
         if resp.status == 404 {
@@ -555,7 +598,7 @@ impl SparkEngine {
         let (session, n, t0) = loop {
             let session = self.ensure_session(cancel).await?;
             let t0 = Instant::now();
-            match self.submit(session, stmt).await? {
+            match self.submit(session, stmt, cancel).await? {
                 Submitted::Id(n) => break (session, n, t0),
                 Submitted::SessionGone if !replaced => {
                     // Died or garbage-collected since the last query: start a new one, once.
@@ -729,8 +772,9 @@ impl Script for SparkEngine {
                 return End::Failed {
                     statement_index: None,
                     error: CoreError::PolicyDenied(format!(
-                        "{}{kind} is not available on Spark here: it would change the shared \
-                         session for every later statement. Qualify names as \
+                        "{}{kind} is not available on Spark here: it would change or add to \
+                         the shared session that every later statement uses, including \
+                         read-only runs nobody approved. Qualify names as \
                          catalog.namespace.table instead; session settings belong in the \
                          connection's Spark configuration",
                         which(i, statements.len())
@@ -791,6 +835,15 @@ impl Script for SparkEngine {
             }
         }
         End::Finished
+    }
+}
+
+/// Deletes or cancels something a submit task created for a caller that has gone. Best effort.
+async fn undo(client: &HttpClient, method: Method, path: &str) {
+    if let Ok(url) = client.url(path) {
+        let body = (method == Method::POST).then(|| Body::Json(json!({})));
+        let req = client.send_capped(method, &url, &[], body, SMALL_BODY);
+        let _ = tokio::time::timeout(Duration::from_secs(10), req).await;
     }
 }
 

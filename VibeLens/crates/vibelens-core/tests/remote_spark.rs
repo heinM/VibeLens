@@ -724,3 +724,166 @@ async fn columns_rows_and_status_answers_are_bounded() {
         .unwrap_err();
     assert!(err.to_string().contains("larger than 8 MiB"), "{err}");
 }
+
+// ---- Re-audit 2026-11-21 ------------------------------------------------------------------
+
+/// Item 1: one Livy session serves approved writes and unapproved reads. Without the refusal,
+/// an approved temporary function bound to GenericUDFReflect would let every later read-only
+/// `SELECT f('java.lang.Runtime', …)` through, and a temporary view would shadow a table.
+#[tokio::test]
+async fn session_scoped_state_is_refused_in_every_mode() {
+    let (server, _) = livy(Livy::new(|_| empty_ok())).await;
+    let e = engine(&server.url);
+    for sql in [
+        "CREATE TEMPORARY FUNCTION f AS 'org.apache.hadoop.hive.ql.udf.generic.GenericUDFReflect'",
+        "CREATE OR REPLACE TEMPORARY VIEW orders AS SELECT 1 AS id",
+        "CREATE GLOBAL TEMPORARY VIEW v AS SELECT 1",
+        "DROP TEMPORARY FUNCTION f",
+        "DECLARE VARIABLE v INT",
+        "SET VAR v = 1",
+        "EXECUTE IMMEDIATE 'USE other.ns'",
+        "EXECUTE IMMEDIATE 'SET spark.sql.ansi.enabled=false'",
+        "ADD JAR s3://b/x.jar",
+        "CACHE TABLE t",
+        "UNCACHE TABLE t",
+        "CLEAR CACHE",
+    ] {
+        let events = stream(&e, sql, opts()).await;
+        let (_, code, msg) = failure(&events);
+        assert_eq!(code, "policy_denied", "{sql}: {msg}");
+        assert!(msg.contains("shared session"), "{sql}: {msg}");
+    }
+    // Item 3: unquoted file relations in read-only runs.
+    let ro = ExecOptions {
+        read_only: true,
+        ..opts()
+    };
+    for sql in [
+        "SELECT * FROM text.passwd",
+        "SELECT * FROM csv.__spark_conf__",
+        "SELECT * FROM `text`.somefile",
+    ] {
+        let events = stream(&e, sql, ro.clone()).await;
+        assert_eq!(failure(&events).1, "policy_denied", "{sql}");
+    }
+    assert_eq!(server.count(), 0);
+}
+
+/// Item 2: the `USE` built from the profile goes through the same `${` check as everything
+/// else. Without it a hand-edited namespace `${env:AWS_SECRET_ACCESS_KEY}` is substituted by
+/// Spark and comes back in the "could not switch" error.
+#[tokio::test]
+async fn the_use_statement_built_from_the_profile_is_checked_too() {
+    let (server, _) = livy(Livy::new(|_| empty_ok())).await;
+    let e = engine_with(SparkConfig {
+        namespace: Some("${env:AWS_SECRET_ACCESS_KEY}".into()),
+        ..config(&server.url)
+    });
+    let events = stream(&e, "SELECT 1", opts()).await;
+    let (_, code, msg) = failure(&events);
+    assert_eq!(code, "policy_denied", "{msg}");
+    assert!(server.calls("POST", "/sessions/3/statements").is_empty());
+    // The session it had started is not left behind.
+    assert_eq!(server.calls("DELETE", "/sessions/3").len(), 1);
+}
+
+/// Item 8: Stop while `POST /sessions` is in flight. Without the submit task the session
+/// created when the answer finally came would be orphaned.
+#[tokio::test]
+async fn a_session_whose_creation_was_cancelled_is_deleted_when_the_answer_arrives() {
+    let s = serve(Arc::new(|req: &Req| {
+        match (req.method.as_str(), req.path.as_str()) {
+            ("POST", "/sessions") => Resp::json(201, &json!({"id": 7, "state": "starting"}))
+                .after(Duration::from_millis(300)),
+            _ => Resp::ok(&json!({"msg": "ok"})),
+        }
+    }))
+    .await;
+    let e = engine(&s.url);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let c = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        c.cancel();
+    });
+    let err = e
+        .execute_collect_cancellable("SELECT 1", ExecOptions::default(), cancel)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CoreError::Cancelled), "{err:?}");
+    for _ in 0..200 {
+        if !s.calls("DELETE", "/sessions/7").is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(s.calls("DELETE", "/sessions/7").len(), 1);
+}
+
+/// Item 8: Stop while `POST …/statements` is in flight: the statement created when the answer
+/// arrives is cancelled.
+#[tokio::test]
+async fn a_statement_whose_submission_was_cancelled_is_cancelled_when_the_answer_arrives() {
+    let name = Arc::new(Mutex::new(String::new()));
+    let n2 = name.clone();
+    let s = serve(Arc::new(move |req: &Req| {
+        let code = req.json()["code"].as_str().unwrap_or("").to_string();
+        match (req.method.as_str(), req.path.as_str()) {
+            ("POST", "/sessions") => {
+                *n2.lock().unwrap() = req.json()["name"].as_str().unwrap_or("").to_string();
+                Resp::json(201, &json!({"id": 7, "state": "starting"}))
+            }
+            ("GET", "/sessions/7") => Resp::ok(&json!({
+                "id": 7, "state": "idle", "name": n2.lock().unwrap().clone(), "proxyUser": "ana"
+            })),
+            ("POST", "/sessions/7/statements") if code.starts_with("USE ") => {
+                Resp::json(201, &json!({"id": 0, "state": "waiting"}))
+            }
+            ("GET", "/sessions/7/statements/0") => {
+                Resp::ok(&json!({"id": 0, "state": "available", "output": empty_ok()}))
+            }
+            ("POST", "/sessions/7/statements") => {
+                Resp::json(201, &json!({"id": 1, "state": "waiting"}))
+                    .after(Duration::from_millis(300))
+            }
+            _ => Resp::ok(&json!({"msg": "ok"})),
+        }
+    }))
+    .await;
+    let e = engine(&s.url);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let c = cancel.clone();
+    let probe = s.requests.clone();
+    tokio::spawn(async move {
+        // Cancel once the user's statement has been sent.
+        for _ in 0..400 {
+            let sent = probe
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.method == "POST" && r.path == "/sessions/7/statements")
+                .count();
+            if sent >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        c.cancel();
+    });
+    let err = e
+        .execute_collect_cancellable("SELECT * FROM big", ExecOptions::default(), cancel)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CoreError::Cancelled), "{err:?}");
+    for _ in 0..200 {
+        if !s
+            .calls("POST", "/sessions/7/statements/1/cancel")
+            .is_empty()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(s.calls("POST", "/sessions/7/statements/1/cancel").len(), 1);
+}
