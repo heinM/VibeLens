@@ -21,11 +21,13 @@ pub(crate) const MAX_SESSION_START_TIMEOUT_SECS: u64 = 3600;
 /// [`SPARK_CATALOG_CLASSES`]. Values: no control characters, at most
 /// [`MAX_SESSION_CONF_VALUE`] characters, nothing that looks like a credential and no `${`.
 ///
+/// Not allowed, among others: `spark.sql.catalog.<C>.type` and `.warehouse` (a hand-edited
+/// profile could repoint the catalog at `type=hadoop`, `warehouse=file:///` or another bucket
+/// the cluster role can read), `catalog-impl`, `io-impl`, `uri`.
+///
 /// The UI mirrors this list; change both together.
 pub const SPARK_SESSION_CONF_ALLOWED: &[&str] = &[
     "spark.sql.catalog.<C>",
-    "spark.sql.catalog.<C>.type",
-    "spark.sql.catalog.<C>.warehouse",
     "spark.sql.catalog.<C>.default-namespace",
     "spark.sql.catalog.<C>.cache-enabled",
     "spark.sql.catalog.<C>.cache.expiration-interval-ms",
@@ -210,13 +212,11 @@ pub(crate) fn engine_target(engine: &IcebergQueryEngine) -> Option<String> {
     Some(format!("{name} at {place}, catalog '{}'", catalog.trim()))
 }
 
-/// The endpoint an engine secret belongs to:
-/// `"{kind}|{scheme}://{host}:{port}{path prefix}|{caCertPath or empty}"`. Stored in the vault
-/// next to the secret (`vault_keys::engine_secret_origin`) when the secret is written, and
-/// compared before the secret is used, so that a hand-edited URL, CA file or engine kind (or a
-/// test call naming another endpoint) never receives the stored password or token. `None` for
+/// The endpoint part of an engine secret's origin:
+/// `"{kind}|{scheme}://{host}:{port}{path prefix}|{caCertPath or empty}"`. Pure; the full origin
+/// (`remote::secret::engine_origin`) adds a hash of the CA bundle's contents. `None` for
 /// engines without an HTTP endpoint, or a URL that does not parse.
-pub fn engine_origin(engine: &IcebergQueryEngine) -> Option<String> {
+pub fn endpoint_origin(engine: &IcebergQueryEngine) -> Option<String> {
     let (kind, url, ca) = match engine {
         IcebergQueryEngine::Trino {
             url, ca_cert_path, ..
@@ -284,6 +284,41 @@ pub fn engine_detail(opts: &crate::model::IcebergOptions) -> Option<String> {
     Some(parts.join(" · "))
 }
 
+/// A Spark catalog name: `^[A-Za-z_][A-Za-z0-9_]*$`. It is put into `USE` and into the
+/// `spark.sql.catalog.<C>` keys of the allow-list, where a `.` would widen the match (a catalog
+/// called `lake.rest.auth` would allow `spark.sql.catalog.lake.rest.auth`).
+pub fn is_spark_catalog_name(name: &str) -> bool {
+    let mut b = name.bytes();
+    b.next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
+        && b.all(|c| c.is_ascii_alphanumeric() || c == b'_')
+}
+
+/// [`check_query_engine`] plus the rules on the connection's default namespace that the
+/// engine uses: Spark puts it into `USE`, Trino into `X-Trino-Schema`. No control characters,
+/// and no `${` (Spark substitutes it before parsing, and the value would come back in the error
+/// for a namespace that does not exist). Called by `cleartext::check_profile`.
+pub(crate) fn check_iceberg_engine(opts: &crate::model::IcebergOptions) -> Result<()> {
+    check_query_engine(&opts.query_engine)?;
+    if matches!(
+        opts.query_engine,
+        IcebergQueryEngine::Trino { .. } | IcebergQueryEngine::Spark { .. }
+    ) && let Some(ns) = opts.default_namespace.as_deref()
+    {
+        if ns.chars().any(char::is_control) {
+            return invalid("the default namespace contains a control character".into());
+        }
+        if ns.contains("${") {
+            return invalid(
+                "the default namespace contains '${', which Spark would substitute; write the \
+                 name out"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The rules for the query engine of an Iceberg connection. Only Trino and Spark have any.
 pub(crate) fn check_query_engine(engine: &IcebergQueryEngine) -> Result<()> {
     match engine {
@@ -311,6 +346,13 @@ pub(crate) fn check_query_engine(engine: &IcebergQueryEngine) -> Result<()> {
         } => {
             let url = parse_engine_url(url, "Livy URL")?;
             plain_name(catalog, "Spark catalog")?;
+            if !is_spark_catalog_name(catalog.trim()) {
+                return invalid(
+                    "the Spark catalog name may hold only letters, digits and '_', and must not \
+                     start with a digit"
+                        .into(),
+                );
+            }
             if let Some(p) = proxy_user.as_deref().filter(|p| !p.trim().is_empty()) {
                 plain_name(p, "Livy proxy user")?;
             }
@@ -449,6 +491,9 @@ mod tests {
             ("spark.sql.catalog.lake.uri", "https://attacker.example"),
             ("spark.sql.catalog.lake.catalog-impl", "x"),
             ("spark.sql.catalog.lake.io-impl", "x"),
+            // Re-audit item 4.
+            ("spark.sql.catalog.lake.type", "hadoop"),
+            ("spark.sql.catalog.lake.warehouse", "file:///"),
             ("spark.hadoop.fs.s3a.endpoint", "https://attacker.example"),
             ("spark.jars", "s3://bucket/evil.jar"),
             ("spark.driver.extraJavaOptions", "-javaagent:x"),
@@ -542,27 +587,27 @@ mod tests {
     }
 
     #[test]
-    fn origins_change_with_endpoint_ca_and_kind() {
-        let o = engine_origin(&trino("https://T.example/trino/", basic())).unwrap();
+    fn endpoint_origins_change_with_endpoint_ca_and_kind() {
+        let o = endpoint_origin(&trino("https://T.example/trino/", basic())).unwrap();
         assert_eq!(o, "trino|https://t.example:443/trino|");
         assert_ne!(
             Some(o.clone()),
-            engine_origin(&trino("https://t.example/other/", basic()))
+            endpoint_origin(&trino("https://t.example/other/", basic()))
         );
         assert_ne!(
             Some(o.clone()),
-            engine_origin(&trino("https://t.example:8443/trino", basic()))
+            endpoint_origin(&trino("https://t.example:8443/trino", basic()))
         );
         let mut with_ca = trino("https://t.example/trino", basic());
         if let IcebergQueryEngine::Trino { ca_cert_path, .. } = &mut with_ca {
             *ca_cert_path = Some("/tmp/evil.pem".into());
         }
-        assert_ne!(Some(o.clone()), engine_origin(&with_ca));
+        assert_ne!(Some(o.clone()), endpoint_origin(&with_ca));
         assert_ne!(
             Some(o),
-            engine_origin(&spark("https://t.example/trino", basic(), &[]))
+            endpoint_origin(&spark("https://t.example/trino", basic(), &[]))
         );
-        assert_eq!(engine_origin(&IcebergQueryEngine::Local), None);
+        assert_eq!(endpoint_origin(&IcebergQueryEngine::Local), None);
     }
 
     #[test]
@@ -592,6 +637,37 @@ mod tests {
                 "Spark (Livy) · livy.example:8998 · catalog lake · namespace shop · as etl (proxy user)"
             )
         );
+    }
+
+    /// Re-audit item 2: the profile's catalog and namespace go into `USE`, which Spark
+    /// substitutes `${…}` in; a hand-edited namespace `${env:AWS_SECRET_ACCESS_KEY}` came back
+    /// in the "could not switch" error. Item 4 (catalog shape): a `.` would widen the
+    /// sessionConf allow-list.
+    #[test]
+    fn spark_catalog_and_namespace_are_plain() {
+        let with = |catalog: &str, ns: Option<&str>| {
+            let mut e = spark("https://l", HttpEngineAuth::None, &[]);
+            if let IcebergQueryEngine::Spark { catalog: c, .. } = &mut e {
+                *c = catalog.into();
+            }
+            check_iceberg_engine(&crate::model::IcebergOptions {
+                catalog: crate::model::IcebergCatalog::Hms {
+                    address: "h".into(),
+                    warehouse: "w".into(),
+                },
+                storage: Default::default(),
+                query_engine: e,
+                default_namespace: ns.map(String::from),
+            })
+        };
+        for c in ["lake.rest.auth", "1lake", "la-ke", "${env:X}", "la ke", ""] {
+            refused(with(c, None));
+        }
+        refused(with("lake", Some("${env:AWS_SECRET_ACCESS_KEY}")));
+        refused(with("lake", Some("shop\nx")));
+        with("lake", Some("shop.daily")).unwrap();
+        with("_Lake_2", None).unwrap();
+        assert!(is_spark_catalog_name("glue") && !is_spark_catalog_name("a.b"));
     }
 
     #[test]

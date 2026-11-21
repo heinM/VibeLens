@@ -161,16 +161,35 @@ impl TrinoEngine {
         let t0 = Instant::now();
         let deadline = opts.timeout_ms.map(|ms| t0 + Duration::from_millis(ms));
         let mut q = Query::default();
-        // Not raced against cancellation: abandoning the submission could leave a query running
-        // that we have no URL for. The request timeout bounds it.
+        // Raced against cancellation without orphaning the query: if the answer arrives after
+        // the caller has gone, the submit task deletes the query through its `nextUri`.
         let url = self.client.url("/v1/statement").map_err(Stop::Err)?;
+        let headers = self.headers();
+        let undo_headers = headers.clone();
         let resp = self
             .client
-            .send(
+            .submit(
                 Method::POST,
-                &url,
-                &self.headers(),
+                url,
+                headers,
                 Some(Body::Text(stmt.to_string())),
+                usize::MAX,
+                cancel,
+                move |client, resp| async move {
+                    let next = serde_json::from_slice::<Value>(&resp.body)
+                        .ok()
+                        .and_then(|page| check_next_uri(&client, &page).ok().flatten());
+                    if let Some(next) = next {
+                        let del = client.send_capped(
+                            Method::DELETE,
+                            &next,
+                            &undo_headers,
+                            None,
+                            SMALL_BODY,
+                        );
+                        let _ = tokio::time::timeout(Duration::from_secs(10), del).await;
+                    }
+                },
             )
             .await?;
         if !resp.is_success() {
@@ -444,47 +463,70 @@ impl TrinoEngine {
         format!("Trino query failed: {}", self.client.redact(&text))
     }
 
-    /// The `nextUri` of `page`, when it is on the configured endpoint.
+    /// The `nextUri` of `page`, when it passes [`check_next_uri`].
     fn next_uri(&self, page: &Value) -> Result<Option<url::Url>> {
-        let Some(raw) = page.get("nextUri").and_then(Value::as_str) else {
-            return Ok(None);
-        };
-        let next = url::Url::parse(raw).map_err(|_| {
-            CoreError::Other("Trino returned a nextUri that is not a valid URL".into())
-        })?;
-        if !next.username().is_empty() || next.password().is_some() {
-            return Err(CoreError::Other(
-                "Trino returned a nextUri with a user name or password in it; VibeLens does not \
-                 follow it"
-                    .into(),
-            ));
-        }
-        if !same_endpoint(self.client.base(), &next) {
-            return Err(CoreError::Other(format!(
-                "Trino returned a nextUri on {}, which is not the configured endpoint {}. \
-                 VibeLens does not follow it, because the credential would be sent there. \
-                 Behind a load balancer that terminates TLS, set \
-                 http-server.process-forwarded=true on the coordinator so it builds its URLs \
-                 from the address the client used",
-                self.client.redact(&shown(&next)),
-                shown(self.client.base())
-            )));
-        }
-        // Same origin is not enough when the coordinator sits under a path on a shared
-        // gateway: only the statement protocol's own URLs are followed.
-        let prefix = format!(
-            "{}/v1/statement/",
-            self.client.base().path().trim_end_matches('/')
-        );
-        if !next.path().starts_with(&prefix) {
-            return Err(CoreError::Other(format!(
-                "Trino returned a nextUri outside {prefix} ({}); VibeLens follows only the \
-                 statement protocol's URLs, because the credential is sent with each request",
-                self.client.redact(&shown(&next))
-            )));
-        }
-        Ok(Some(next))
+        check_next_uri(&self.client, page)
     }
+}
+
+/// The `nextUri` of `page`, when it is one of the statement protocol's own URLs on the
+/// configured endpoint. Trino's are `{base}/v1/statement/queued/{id}/{slug}/{token}` and
+/// `…/executing/…`: plain path segments, no query string, no fragment. Anything else (another
+/// origin, user info, `%`, `;` or `\\` that a gateway might decode or route on, `.`/`..`
+/// segments, a query or fragment) is refused before it is requested.
+pub(crate) fn check_next_uri(client: &HttpClient, page: &Value) -> Result<Option<url::Url>> {
+    let Some(raw) = page.get("nextUri").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let refuse = |why: &str| {
+        Err(CoreError::Other(format!(
+            "Trino returned a nextUri that {why}; VibeLens follows only the statement \
+             protocol's own URLs, because the credential is sent with each request"
+        )))
+    };
+    if raw.contains(['%', ';', '\\', '#', '?']) {
+        return refuse("contains '%', ';', '\\', '?' or '#'");
+    }
+    let next = url::Url::parse(raw)
+        .map_err(|_| CoreError::Other("Trino returned a nextUri that is not a valid URL".into()))?;
+    if !next.username().is_empty() || next.password().is_some() {
+        return refuse("has a user name or password in it");
+    }
+    if next.query().is_some() || next.fragment().is_some() {
+        return refuse("has a query string or fragment");
+    }
+    if !same_endpoint(client.base(), &next) {
+        return Err(CoreError::Other(format!(
+            "Trino returned a nextUri on {}, which is not the configured endpoint {}. \
+             VibeLens does not follow it, because the credential would be sent there. \
+             Behind a load balancer that terminates TLS, set \
+             http-server.process-forwarded=true on the coordinator so it builds its URLs \
+             from the address the client used",
+            client.redact(&shown(&next)),
+            shown(client.base())
+        )));
+    }
+    // Same origin is not enough when the coordinator sits under a path on a shared gateway:
+    // only the statement protocol's own URLs are followed.
+    let prefix = format!(
+        "{}/v1/statement/",
+        client.base().path().trim_end_matches('/')
+    );
+    let Some(rest) = next.path().strip_prefix(&prefix) else {
+        return refuse(&format!("is outside {prefix}"));
+    };
+    let plain = |seg: &str| {
+        !seg.is_empty()
+            && seg != "."
+            && seg != ".."
+            && seg
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+    };
+    if !rest.split('/').all(plain) {
+        return refuse("has a path segment that is not plain");
+    }
+    Ok(Some(next))
 }
 
 impl Script for TrinoEngine {

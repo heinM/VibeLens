@@ -489,7 +489,7 @@ pub mod vault_keys {
     pub fn engine_secret(profile_id: &str) -> String {
         format!("profile:{profile_id}:engine-secret")
     }
-    /// The endpoint [`engine_secret`] was saved for (`remote::config::engine_origin`). Not
+    /// The endpoint [`engine_secret`] was saved for (`remote::secret::engine_origin`). Not
     /// secret, but kept next to it so a hand-edited profile cannot move the secret elsewhere.
     pub fn engine_secret_origin(profile_id: &str) -> String {
         format!("profile:{profile_id}:engine-secret-origin")
