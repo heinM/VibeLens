@@ -55,6 +55,7 @@ const AGENT_VALKEY_MAX_ITEMS: usize = 200;
 /// Statement timeout for agent-issued SQL.
 const AGENT_SQL_TIMEOUT_MS: u64 = 30_000;
 /// Athena queries are queued and run server-side, so they get a longer budget than a local scan.
+/// The same budget applies to the other remote engines (Trino, Spark).
 const AGENT_ATHENA_TIMEOUT_MS: u64 = 120_000;
 /// Safety valve for `valkey_scan`: stop after this many SCAN pages even if the cursor never ends.
 const MAX_SCAN_PAGES: usize = 2_000;
@@ -397,6 +398,19 @@ impl ConnectionManager {
         profile: &ConnectionProfile,
         password_override: Option<SecretString>,
     ) -> Result<TestResult> {
+        self.test_with_engine_secret(profile, password_override, None)
+            .await
+    }
+
+    /// [`test`](Self::test) with the not-yet-saved password or token of an Iceberg
+    /// connection's remote query engine (Trino, Spark through Livy). Like the catalog secret it
+    /// is served from an overlay on the vault for this test only; `None` uses the stored one.
+    pub async fn test_with_engine_secret(
+        &self,
+        profile: &ConnectionProfile,
+        password_override: Option<SecretString>,
+        engine_secret_override: Option<SecretString>,
+    ) -> Result<TestResult> {
         if profile.engine == EngineKind::Iceberg {
             // `host`/`port` are unused for Iceberg; the catalog options are what matter.
             if profile.iceberg.is_none() {
@@ -417,16 +431,18 @@ impl ConnectionManager {
         // A draft that would send a secret in the clear is invalid input, not a failed test.
         crate::cleartext::check_profile(profile)?;
         let started = Instant::now();
-        let outcome =
-            match tokio::time::timeout(TEST_TIMEOUT, self.test_inner(profile, password_override))
-                .await
-            {
-                Ok(r) => r,
-                Err(_) => Err(CoreError::Timeout(format!(
-                    "connection test took longer than {}s",
-                    TEST_TIMEOUT.as_secs()
-                ))),
-            };
+        let outcome = match tokio::time::timeout(
+            TEST_TIMEOUT,
+            self.test_inner(profile, password_override, engine_secret_override),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(CoreError::Timeout(format!(
+                "connection test took longer than {}s",
+                TEST_TIMEOUT.as_secs()
+            ))),
+        };
         let latency_ms = started.elapsed().as_millis() as u64;
         match outcome {
             Ok(version) => Ok(TestResult {
@@ -457,9 +473,12 @@ impl ConnectionManager {
         &self,
         profile: &ConnectionProfile,
         password_override: Option<SecretString>,
+        engine_secret_override: Option<SecretString>,
     ) -> Result<Option<String>> {
         if profile.engine == EngineKind::Iceberg {
-            return self.test_iceberg(profile, password_override).await;
+            return self
+                .test_iceberg(profile, password_override, engine_secret_override)
+                .await;
         }
         let creds = self.credential_fn(profile, password_override);
         match profile.engine {
@@ -503,6 +522,7 @@ impl ConnectionManager {
         &self,
         profile: &ConnectionProfile,
         secret_override: Option<SecretString>,
+        engine_secret_override: Option<SecretString>,
     ) -> Result<Option<String>> {
         let mut deps = self.iceberg_deps()?;
         if let Some(secret) = secret_override {
@@ -512,9 +532,18 @@ impl ConnectionManager {
                 value: secret,
             });
         }
+        if let Some(secret) = engine_secret_override {
+            deps.vault = Arc::new(OverlayVault {
+                inner: deps.vault.clone(),
+                key: vault_keys::engine_secret(&profile.id),
+                value: secret,
+            });
+        }
         let handle = IcebergHandle::connect(profile.clone(), deps).await?;
         let target = handle.describe_target();
+        let probed = handle.probe_engine().await;
         handle.close().await;
+        probed?;
         Ok(Some(target).filter(|t| !t.is_empty()))
     }
 
@@ -1233,7 +1262,11 @@ impl ToolBackend for AppToolBackend {
             // `database` has no meaning for Iceberg; tables are addressed as `namespace.table`.
             if matches!(
                 profile.iceberg.as_ref().map(|o| &o.query_engine),
-                Some(IcebergQueryEngine::Athena { .. })
+                Some(
+                    IcebergQueryEngine::Athena { .. }
+                        | IcebergQueryEngine::Trino { .. }
+                        | IcebergQueryEngine::Spark { .. }
+                )
             ) {
                 opts.timeout_ms = Some(AGENT_ATHENA_TIMEOUT_MS);
             }

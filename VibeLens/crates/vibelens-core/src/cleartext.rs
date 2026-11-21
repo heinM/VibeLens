@@ -179,6 +179,11 @@ fn check_bearer_auth_has_tls(profile: &ConnectionProfile) -> Result<()> {
 /// Everything above that applies to `profile`. Called when a profile is saved and again before
 /// it is connected to or tested.
 pub fn check_profile(profile: &ConnectionProfile) -> Result<()> {
+    // Remote query engines (Trino, Spark through Livy): URL shape, credentials over cleartext,
+    // session configuration. See `remote::config`.
+    if let (EngineKind::Iceberg, Some(o)) = (profile.engine, profile.iceberg.as_ref()) {
+        crate::remote::config::check_query_engine(&o.query_engine)?;
+    }
     match profile.engine {
         EngineKind::Postgres | EngineKind::Valkey => check_bearer_auth_has_tls(profile),
         EngineKind::Iceberg => match profile.iceberg.as_ref().map(|o| &o.catalog) {

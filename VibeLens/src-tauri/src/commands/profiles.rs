@@ -25,6 +25,7 @@ pub async fn save_profile(
     s3_access_key_id: Option<String>,
     s3_secret_access_key: Option<String>,
     forget_host_key: Option<bool>,
+    engine_secret: Option<String>,
 ) -> CmdResult<ConnectionProfile> {
     let mut profile = profile;
     // A pin can be stored (`trust_host_key`, from the connect dialog) while the form is open, so
@@ -51,8 +52,10 @@ pub async fn save_profile(
     }
     let saved = state.profiles.upsert(profile).map_err(err)?;
     // Iceberg secrets: same semantics as `password` (None = keep, "" = delete).
+    // `engine_secret`: the Trino / Livy password or token.
     for (value, key) in [
         (iceberg_secret, vault_keys::iceberg_secret(&saved.id)),
+        (engine_secret, vault_keys::engine_secret(&saved.id)),
         (s3_access_key_id, vault_keys::s3_access_key_id(&saved.id)),
         (
             s3_secret_access_key,
@@ -120,6 +123,7 @@ pub async fn delete_profile(state: State<'_, AppState>, id: String) -> CmdResult
         vault_keys::iceberg_secret(&id),
         vault_keys::s3_access_key_id(&id),
         vault_keys::s3_secret_access_key(&id),
+        vault_keys::engine_secret(&id),
     ] {
         let _ = state.vault.delete(&key).await;
     }
@@ -131,9 +135,18 @@ pub async fn test_connection(
     state: State<'_, AppState>,
     profile: ConnectionProfile,
     password: Option<String>,
+    engine_secret: Option<String>,
 ) -> CmdResult<TestResult> {
     let pw = password.filter(|p| !p.is_empty()).map(SecretString::from);
-    state.connections.test(&profile, pw).await.map_err(err)
+    // The Trino / Livy password or token typed in the form; absent: the stored one.
+    let engine = engine_secret
+        .filter(|p| !p.is_empty())
+        .map(SecretString::from);
+    state
+        .connections
+        .test_with_engine_secret(&profile, pw, engine)
+        .await
+        .map_err(err)
 }
 
 /// Pins the host key an SSH server presented, after the user has checked it in the trust dialog.
@@ -166,6 +179,8 @@ pub struct SecretStatus {
     pub has_ssh_passphrase: bool,
     pub has_iceberg_secret: bool,
     pub has_s3_keys: bool,
+    /// Trino / Livy password or token.
+    pub has_engine_secret: bool,
 }
 
 /// Which keychain entries exist for a profile. Never returns the secrets themselves.
@@ -186,5 +201,6 @@ pub async fn profile_secret_status(
         has_s3_keys: has(vault_keys::s3_secret_access_key(&id))
             .await
             .map_err(err)?,
+        has_engine_secret: has(vault_keys::engine_secret(&id)).await.map_err(err)?,
     })
 }

@@ -77,4 +77,7 @@ impl IcebergHandle {
         0
     }
     pub async fn close(&self) {}
+    pub async fn probe_engine(&self) -> Result<()> {
+        Ok(())
+    }
 }
