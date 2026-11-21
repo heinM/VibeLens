@@ -5,6 +5,7 @@ import { api, asError } from "../../ipc/commands";
 import type { ErrorPayload, ImportCandidate, ImportReport, ImportSaveResult, ImportSource } from "../../ipc/types";
 import { PROFILES_KEY } from "../../hooks/useProfiles";
 import { cn } from "../../lib/cn";
+import { ENGINE_SHORT } from "../../lib/engines";
 import { useUIStore } from "../../store/useUIStore";
 import { Badge, Button, Dialog, EnvBadge, ErrorBox, Spinner } from "../ui";
 import { Notice, Switch } from "../ui/formKit";
@@ -17,7 +18,7 @@ export const SOURCE_LABEL: Record<ImportSource, string> = {
   pgService: "pg_service.conf",
 };
 
-const ENGINE_LABEL = { postgres: "Postgres", valkey: "Valkey", iceberg: "Iceberg" } as const;
+const ENGINE_LABEL = ENGINE_SHORT;
 
 /** Stable key for a candidate across re-renders (the backend gives each a fresh profile id). */
 const keyOf = (c: ImportCandidate) => c.profile.id;

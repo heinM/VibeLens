@@ -2,6 +2,7 @@
 // keep the form self-consistent, secret bookkeeping and small parsers. No React in here.
 import type { AwsTarget, IcebergCatalog, IcebergOptions, IcebergQueryEngine, IcebergStorage, RestAuth } from "../../ipc/types";
 import { defaultAwsTarget, regionFromArn } from "./awsHelpers";
+import { blankRemoteEngine, cleanRemoteEngine, isRemoteEngine, remoteEngineSummary } from "./remoteEngineForm";
 
 export type CatalogKind = IcebergCatalog["kind"];
 export type StorageKind = IcebergStorage["kind"];
@@ -118,12 +119,14 @@ export function blankStorage(kind: StorageKind, catalog: IcebergCatalog, prev: I
 
 export function blankEngine(kind: IcebergQueryEngine["kind"], prev: IcebergQueryEngine): IcebergQueryEngine {
   if (prev.kind === kind) return prev;
+  if (kind === "trino" || kind === "spark") return blankRemoteEngine(kind, prev);
   return kind === "local" ? { kind } : { kind, workgroup: "primary", outputLocation: null, aws: null };
 }
 
 /**
  * Keep the options internally consistent after any edit:
- *  - Athena only works with Glue / S3 Tables, so it falls back to Local otherwise;
+ *  - Athena only works with Glue / S3 Tables, so it falls back to Local otherwise (Trino and Spark
+ *    work with every catalog kind: the user names the engine's catalog that points at this one);
  *  - an S3 storage block without its own identity needs one when the catalog has none to borrow.
  */
 export function normalizeIceberg(o: IcebergOptions): IcebergOptions {
@@ -178,6 +181,7 @@ export function storageSummary(s: IcebergStorage): string {
   return { auto: "Automatic", s3: "Amazon S3", s3Static: "S3-compatible", local: "Local files" }[s.kind];
 }
 export function engineSummary(e: IcebergQueryEngine): string {
+  if (isRemoteEngine(e)) return remoteEngineSummary(e);
   return e.kind === "local" ? "Local (DataFusion)" : `Athena · ${e.workgroup || "primary"}`;
 }
 
@@ -232,5 +236,6 @@ export function cleanIceberg(o: IcebergOptions): IcebergOptions {
     c.queryEngine.outputLocation = nz(c.queryEngine.outputLocation);
     if (c.queryEngine.aws) trimAws(c.queryEngine.aws);
   }
+  if (isRemoteEngine(c.queryEngine)) c.queryEngine = cleanRemoteEngine(c.queryEngine);
   return c;
 }

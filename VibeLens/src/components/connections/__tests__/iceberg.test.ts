@@ -246,14 +246,14 @@ describe("iceberg secrets", () => {
   it("reports required secrets that are neither typed nor stored", () => {
     const d = initialDraft(null, "iceberg");
     d.profile = rest("bearer", { storage: { kind: "s3Static", endpoint: null, region: null, pathStyle: false } });
-    expect(missingIcebergSecrets(null, d, undefined)).toEqual({ catalog: true, s3Keys: true });
+    expect(missingIcebergSecrets(null, d, undefined)).toEqual({ catalog: true, s3Keys: true, engine: false });
     d.icebergSecret.value = "t";
     d.s3Keys = { mode: "set", accessKeyId: "a", secretAccessKey: "b" };
-    expect(missingIcebergSecrets(null, d, undefined)).toEqual({ catalog: false, s3Keys: false });
+    expect(missingIcebergSecrets(null, d, undefined)).toEqual({ catalog: false, s3Keys: false, engine: false });
     const original = { ...d.profile, id: "p" };
     const e = initialDraft(original);
-    expect(missingIcebergSecrets(original, e, { hasIcebergSecret: true, hasS3Keys: true })).toEqual({ catalog: false, s3Keys: false });
-    expect(missingIcebergSecrets(original, e, { hasIcebergSecret: false, hasS3Keys: true })).toEqual({ catalog: true, s3Keys: false });
+    expect(missingIcebergSecrets(original, e, { hasIcebergSecret: true, hasS3Keys: true })).toEqual({ catalog: false, s3Keys: false, engine: false });
+    expect(missingIcebergSecrets(original, e, { hasIcebergSecret: false, hasS3Keys: true })).toEqual({ catalog: true, s3Keys: false, engine: false });
     // an optional Postgres password is never "missing"
     const sql = initialDraft(null, "iceberg");
     sql.profile = ice({ catalog: { kind: "sql", uri: "postgres://u@h/db", warehouse: "w", catalogName: "c" } });
