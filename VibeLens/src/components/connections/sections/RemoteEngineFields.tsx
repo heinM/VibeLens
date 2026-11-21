@@ -138,7 +138,7 @@ export function RemoteEngineFields({ engine: q, setEngine, draft, setEngineSecre
           <FormField
             label="Session configuration"
             optional
-            hint={`Only the Iceberg catalog settings (spark.sql.catalog.${q.catalog.trim() || "<catalog>"} and its type, warehouse, default-namespace, cache options) and session sizing (shuffle partitions, time zone, adaptive execution, executor and driver memory and cores, dynamic allocation). Anything else is set on the cluster.`}
+            hint={`Only the Iceberg catalog settings (spark.sql.catalog.${q.catalog.trim() || "<catalog>"} and its default-namespace and cache options; its type and warehouse are set on the cluster) and session sizing (shuffle partitions, time zone, adaptive execution, executor and driver memory and cores, dynamic allocation). Anything else is set on the cluster.`}
           >
             <ConfEditor
               key={`${uid}-conf`}
