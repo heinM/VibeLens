@@ -3,7 +3,9 @@
 import { describe, expect, it } from "vitest";
 import type { RedshiftColumn, RedshiftTableRef } from "../../../ipc/types";
 import type { QueryState } from "../pgTreeModel";
-import { buildRsRows, columnType, expandedRsSchemas, isSystemSchema, isViewKind, rsSchemaId, rsSelectAllSql, rsTableId, rsTableKey, type RsModelInput } from "../redshiftTreeModel";
+import { buildRsRows, columnType, expandedRsSchemas, isSystemSchema, isViewKind, rsRefreshKeys, rsSchemaId, rsSelectAllSql, rsTableId, rsTableKey, type RsModelInput } from "../redshiftTreeModel";
+import { QueryClient } from "@tanstack/react-query";
+import { rsQueries } from "../../../hooks/useRedshift";
 
 const ok = <T,>(data: T): QueryState<T> => ({ status: "success", data });
 const c = (name: string, typeName: string, o: Partial<RedshiftColumn> = {}): RedshiftColumn => ({ name, typeName, nullable: true, length: null, precision: null, scale: null, defaultValue: null, ...o });
@@ -89,5 +91,32 @@ describe("helpers", () => {
   it("opens a table as SELECT * FROM \"schema\".\"table\" LIMIT 100", () => {
     expect(rsSelectAllSql("public", "orders")).toBe('SELECT * FROM "public"."orders" LIMIT 100;');
     expect(rsSelectAllSql("Sales", 'we"ird')).toBe('SELECT * FROM "Sales"."we""ird" LIMIT 100;');
+  });
+});
+
+describe("Refresh (rsRefreshKeys)", () => {
+  const stale = (qc: QueryClient, key: readonly unknown[]) => qc.getQueryState(key)?.isInvalidated === true;
+  const seed = () => {
+    const qc = new QueryClient();
+    for (const o of [rsQueries.tables("p1", null, "public"), rsQueries.describe("p1", null, "public", "orders"), rsQueries.describe("p1", null, "public", "items"), rsQueries.describe("p1", null, "sales", "orders"), rsQueries.tables("p1", null, "sales")]) qc.setQueryData(o.queryKey, []);
+    return qc;
+  };
+  const run = (qc: QueryClient, keys: (readonly unknown[])[]) => keys.forEach((queryKey) => void qc.invalidateQueries({ queryKey }));
+
+  it("a schema refresh also refreshes the columns of every table under it, and nothing in other schemas", () => {
+    const qc = seed();
+    run(qc, rsRefreshKeys("p1", null, { kind: "schema", schema: "public" }));
+    expect(stale(qc, rsQueries.tables("p1", null, "public").queryKey)).toBe(true);
+    expect(stale(qc, rsQueries.describe("p1", null, "public", "orders").queryKey)).toBe(true);
+    expect(stale(qc, rsQueries.describe("p1", null, "public", "items").queryKey)).toBe(true);
+    expect(stale(qc, rsQueries.describe("p1", null, "sales", "orders").queryKey)).toBe(false);
+    expect(stale(qc, rsQueries.tables("p1", null, "sales").queryKey)).toBe(false);
+  });
+  it("a table refresh refreshes that table's columns only; anything else the whole connection", () => {
+    const qc = seed();
+    run(qc, rsRefreshKeys("p1", null, { kind: "table", schema: "public", table: { schema: "public", name: "orders", kind: "TABLE" } }));
+    expect(stale(qc, rsQueries.describe("p1", null, "public", "orders").queryKey)).toBe(true);
+    expect(stale(qc, rsQueries.describe("p1", null, "public", "items").queryKey)).toBe(false);
+    expect(rsRefreshKeys("p1", null)).toEqual([["rs", "p1"]]);
   });
 });

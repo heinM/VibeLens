@@ -13,6 +13,8 @@ export type RemoteEngineKind = RemoteEngine["kind"];
 export const isRemoteEngine = (q: IcebergQueryEngine | null | undefined): q is RemoteEngine => q?.kind === "trino" || q?.kind === "spark";
 
 export const DEFAULT_SESSION_START_TIMEOUT_SECS = 300;
+/** Rust's `MAX_SESSION_START_TIMEOUT_SECS`. */
+export const MAX_SESSION_START_TIMEOUT_SECS = 3600;
 export const ENGINE_NAME: Record<RemoteEngineKind, string> = { trino: "Trino", spark: "Spark (Livy)" };
 
 export function blankRemoteEngine(kind: RemoteEngineKind, prev: IcebergQueryEngine): RemoteEngine {
@@ -29,10 +31,18 @@ export function blankHttpAuth(kind: HttpEngineAuth["kind"], prev: HttpEngineAuth
 
 // -- URLs and cleartext (R2) -------------------------------------------------------------------------
 
-/** Same hosts the Rust side treats as this machine (see the LLM provider check in agent/store.rs). */
+/**
+ * Same hosts the Rust side treats as this machine for the engines: `localhost` and literal loopback
+ * addresses (all of 127.0.0.0/8, and ::1). Not `*.localhost` names: those are resolved like any other.
+ * Takes a URL hostname (IPv6 in brackets, as `URL` gives it) or a bare address.
+ */
 export function isLoopbackHost(hostname: string): boolean {
   const h = hostname.toLowerCase();
-  return h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h === "::1" || h.endsWith(".localhost");
+  if (h === "localhost") return true;
+  const v4 = /^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (v4) return v4.slice(1).every((o) => Number(o) <= 255);
+  const v6 = h.startsWith("[") && h.endsWith("]") ? h.slice(1, -1) : h;
+  return v6 === "::1" || /^(0{1,4}:){7}0{0,3}1$/.test(v6);
 }
 
 /** An engine base URL: http(s), a host, and no credentials, query or fragment. Null when fine. */
@@ -77,18 +87,31 @@ export function cleartextProblem(url: string, auth: HttpEngineAuth): CleartextPr
 }
 
 // -- Spark session configuration (R1, design 2.4) ---------------------------------------------------
+//
+// An ALLOW-list, mirrored exactly from Rust: anything not listed (code loading, credentials, any other
+// Spark setting) belongs on the cluster, not in a plain-text profile that can be edited by hand.
 
-/** Settings that load code into the cluster from a profile file that can be edited by hand. */
-export const CODE_LOADING_CONF: ReadonlySet<string> = new Set([
-  "spark.jars",
-  "spark.jars.packages",
-  "spark.files",
-  "spark.submit.pyFiles",
-  "spark.driver.extraJavaOptions",
-  "spark.executor.extraJavaOptions",
-  "spark.driver.extraClassPath",
-  "spark.executor.extraClassPath",
+/** Implementations `spark.sql.catalog.<catalog>` may name. */
+export const SPARK_CATALOG_IMPLS: readonly string[] = ["org.apache.iceberg.spark.SparkCatalog", "org.apache.iceberg.spark.SparkSessionCatalog"];
+/** Options allowed as `spark.sql.catalog.<catalog>.<option>`. */
+export const SPARK_CATALOG_OPTIONS: readonly string[] = ["type", "warehouse", "default-namespace", "cache-enabled", "cache.expiration-interval-ms"];
+/** Session settings allowed whatever the catalog is. */
+export const SPARK_ALLOWED_CONF: ReadonlySet<string> = new Set([
+  "spark.sql.shuffle.partitions",
+  "spark.sql.session.timeZone",
+  "spark.sql.adaptive.enabled",
+  "spark.sql.adaptive.coalescePartitions.enabled",
+  "spark.executor.memory",
+  "spark.executor.cores",
+  "spark.executor.instances",
+  "spark.driver.memory",
+  "spark.driver.cores",
+  "spark.dynamicAllocation.enabled",
+  "spark.dynamicAllocation.minExecutors",
+  "spark.dynamicAllocation.maxExecutors",
+  "spark.dynamicAllocation.initialExecutors",
 ]);
+export const MAX_SESSION_CONF_VALUE = 512;
 
 const CREDENTIAL_KEY_WORDS = ["secret", "password", "token", "credential"];
 
@@ -98,14 +121,31 @@ export function looksLikeCredentialKey(key: string): boolean {
   return CREDENTIAL_KEY_WORDS.some((w) => k.includes(w)) || k.endsWith(".key") || k.endsWith("access.key");
 }
 
-/** Why one session setting is refused, or null when it is fine. Empty rows are ignored by the caller. */
-export function sessionConfError(key: string, value: string): string | null {
+/** A value that is a credential (a bearer token) rather than a setting. */
+export const looksLikeCredentialValue = (value: string): boolean => /^\s*bearer /i.test(value);
+
+// eslint-disable-next-line no-control-regex
+const CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
+
+/**
+ * Why one session setting is refused, or null when it is allowed. `catalog` is the engine's catalog
+ * field (the `<C>` of `spark.sql.catalog.<C>`). A row with neither name nor value is ignored by callers.
+ */
+export function sessionConfError(key: string, value: string, catalog: string): string | null {
   const k = key.trim();
-  if (!k) return value.trim() ? "Give the setting a name, such as spark.sql.catalog.lake." : null;
-  if (/\s/.test(k)) return `"${k}": a setting name can't contain spaces.`;
-  if (CODE_LOADING_CONF.has(k)) return `${k} is refused: it loads code into the cluster from a profile file that can be edited by hand. Configure it on the Livy server or the cluster instead.`;
-  if (looksLikeCredentialKey(k)) return `${k} looks like a credential. Secrets can't be stored in session settings (they are saved in plain text): configure it on the cluster instead.`;
-  if (/^\s*bearer\s/i.test(value)) return `The value of ${k} looks like a bearer token. Secrets can't be stored in session settings: configure it on the cluster instead.`;
+  if (!k) return value.trim() ? "Give the setting a name, or remove the row." : null;
+  const c = catalog.trim();
+  const catKey = `spark.sql.catalog.${c}`;
+  const isCatalogImpl = c !== "" && k === catKey;
+  const isCatalogOption = c !== "" && k.startsWith(`${catKey}.`) && SPARK_CATALOG_OPTIONS.includes(k.slice(catKey.length + 1));
+  if (!isCatalogImpl && !isCatalogOption && !SPARK_ALLOWED_CONF.has(k)) {
+    return `${k} is not a setting VibeLens passes to a Spark session: set this on the cluster instead.`;
+  }
+  if (CONTROL.test(value)) return `The value of ${k} contains a control character.`;
+  if (value.length > MAX_SESSION_CONF_VALUE) return `The value of ${k} is longer than ${MAX_SESSION_CONF_VALUE} characters.`;
+  if (value.includes("${")) return `The value of ${k} can't contain \${ (variable substitution): set this on the cluster instead.`;
+  if (looksLikeCredentialValue(value)) return `The value of ${k} looks like a credential, and the profile is saved as plain text: set this on the cluster instead.`;
+  if (isCatalogImpl && !SPARK_CATALOG_IMPLS.includes(value.trim())) return `${k} must be ${SPARK_CATALOG_IMPLS.join(" or ")}.`;
   return null;
 }
 
@@ -121,18 +161,35 @@ export function confFromRows(rows: ConfRow[]): Record<string, string> {
   return out;
 }
 /** Row-level problem for the editor (adds duplicate detection to `sessionConfError`). */
-export function confRowError(rows: ConfRow[], i: number): string | null {
+export function confRowError(rows: ConfRow[], i: number, catalog: string): string | null {
   const r = rows[i];
-  const e = sessionConfError(r.key, r.value);
+  const e = sessionConfError(r.key, r.value, catalog);
   if (e) return e;
   if (r.key.trim() && rows.findIndex((x) => x.key.trim() === r.key.trim()) !== i) return `${r.key.trim()} is set twice.`;
   return null;
 }
 
+/**
+ * The first problem among the editor's rows, including what the saved map cannot hold (a value with
+ * no name, a name set twice): those rows would otherwise be dropped silently on save.
+ */
+export function confRowsError(rows: readonly ConfRow[], catalog: string): string | null {
+  for (let i = 0; i < rows.length; i++) {
+    const e = confRowError(rows as ConfRow[], i, catalog);
+    if (e) return e;
+  }
+  return null;
+}
+
 // -- validation ------------------------------------------------------------------------------------
 
-/** Deliberately loose (Rust has the final say): one name, no whitespace, quotes, backticks or dots. */
-const CATALOG_RE = /^[^\s"'`.]+$/;
+/** Rust's `plain_name`: not empty, no control characters, at most 256 bytes. Null when fine. */
+export function plainNameError(value: string, what: string): string | null {
+  if (!value.trim()) return `${what} is required.`;
+  if (CONTROL.test(value)) return `${what} contains a control character.`;
+  if (new TextEncoder().encode(value).length > 256) return `${what} is longer than 256 bytes.`;
+  return null;
+}
 
 /**
  * Field errors of a Trino or Spark engine, keyed `ice.engine.*` (the wizard's Query engine section).
@@ -149,23 +206,30 @@ export function validateRemoteEngine(q: RemoteEngine, secretMissing = false): Re
   }
   const cat = q.catalog.trim();
   if (!cat) e["ice.engine.catalogName"] = q.kind === "trino" ? "Catalog is required: the Trino catalog that points at this Iceberg catalog." : "Catalog is required: the Spark catalog configured for this Iceberg catalog.";
-  else if (!CATALOG_RE.test(cat)) e["ice.engine.catalogName"] = "Use the catalog name only: no spaces, quotes or dots.";
-  if (q.kind === "trino" && !q.user.trim()) e["ice.engine.user"] = "User is required (sent as X-Trino-User).";
-  if (q.auth.kind === "basic" && !q.auth.username.trim()) e["ice.engine.username"] = "User name is required for basic authentication.";
+  else {
+    const ce = plainNameError(q.catalog, "Catalog");
+    if (ce) e["ice.engine.catalogName"] = ce;
+  }
+  if (q.kind === "trino") {
+    const ue = q.user.trim() ? plainNameError(q.user, "User") : "User is required (sent as X-Trino-User).";
+    if (ue) e["ice.engine.user"] = ue;
+  }
+  if (q.auth.kind === "basic") {
+    const be = q.auth.username.trim() ? plainNameError(q.auth.username, "User name") : "User name is required for basic authentication.";
+    if (be) e["ice.engine.username"] = be;
+    else if (q.auth.username.includes(":")) e["ice.engine.username"] = "A user name can't contain ':' (HTTP basic authentication cannot carry it).";
+  }
   if (secretMissing && q.auth.kind !== "none") e["ice.engine.secret"] = q.auth.kind === "basic" ? "Enter the password." : "Enter the bearer token.";
   if (q.caCertPath != null && q.caCertPath !== "" && !q.caCertPath.trim()) e["ice.engine.caCertPath"] = "Path is blank.";
   if (q.kind === "spark") {
-    if (q.proxyUser != null && /\s/.test(q.proxyUser.trim())) e["ice.engine.proxyUser"] = "A proxy user can't contain spaces.";
-    const rows = confRows(q.sessionConf);
-    for (let i = 0; i < rows.length; i++) {
-      const ce = confRowError(rows, i);
-      if (ce) {
-        e["ice.engine.sessionConf"] = ce;
-        break;
-      }
+    if (q.proxyUser != null && q.proxyUser.trim()) {
+      const pe = plainNameError(q.proxyUser, "Proxy user");
+      if (pe) e["ice.engine.proxyUser"] = pe;
     }
+    const ce = confRowsError(confRows(q.sessionConf), q.catalog);
+    if (ce) e["ice.engine.sessionConf"] = ce;
     const t = q.sessionStartTimeoutSecs;
-    if (t != null && (!Number.isInteger(t) || t < 1 || t > 86_400)) e["ice.engine.timeout"] = "1-86400 seconds, or leave empty for 300.";
+    if (t != null && (!Number.isInteger(t) || t < 1 || t > MAX_SESSION_START_TIMEOUT_SECS)) e["ice.engine.timeout"] = `1-${MAX_SESSION_START_TIMEOUT_SECS} seconds, or leave empty for 300.`;
   }
   return e;
 }
@@ -183,29 +247,57 @@ export function engineSecretKind(p: Pick<ConnectionProfile, "engine" | "iceberg"
   return `${q.kind}:${q.auth.kind}`;
 }
 
+/**
+ * The endpoint a stored engine secret is bound to, as Rust binds it: engine kind, scheme, host, port
+ * (the scheme's default when absent), path prefix and CA path. Null when the URL does not parse.
+ */
+export function engineSecretBinding(p: Pick<ConnectionProfile, "engine" | "iceberg"> | null | undefined): string | null {
+  if (!p || p.engine !== "iceberg") return null;
+  const q = p.iceberg?.queryEngine;
+  if (!isRemoteEngine(q)) return null;
+  let u: URL;
+  try {
+    u = new URL(q.url.trim());
+  } catch {
+    return null;
+  }
+  const port = u.port || (u.protocol === "https:" ? "443" : u.protocol === "http:" ? "80" : "");
+  const path = u.pathname.replace(/\/+$/, "");
+  return JSON.stringify([q.kind, u.protocol, u.hostname.toLowerCase(), port, path, q.caCertPath?.trim() || null]);
+}
+
+/**
+ * True when the saved profile had a secret-bearing engine and the edit moved its endpoint (engine,
+ * scheme, host, port, path prefix or CA path). Rust then refuses to send the stored secret there and
+ * deletes it unless a new one is typed, so the form asks for it again.
+ */
+export function engineEndpointChanged(original: ConnectionProfile | null, profile: ConnectionProfile): boolean {
+  if (!engineSecretKind(original) || !engineSecretKind(profile)) return false;
+  return engineSecretBinding(original) !== engineSecretBinding(profile);
+}
+
 /** `saveProfile`'s `engineSecret`: undefined keeps, "" deletes, a value stores. Stale secrets are deleted. */
 export function engineSecretArg(original: ConnectionProfile | null, profile: ConnectionProfile, edit: SecretEdit): string | undefined {
   const kind = engineSecretKind(profile);
   const prevKind = engineSecretKind(original);
   if (!kind) return prevKind ? "" : undefined;
   const typed = edit.mode === "keep" ? undefined : edit.mode === "remove" ? "" : edit.value === "" ? undefined : edit.value;
-  // Basic -> bearer, or Trino -> Spark: the stored value was for something else.
-  if (prevKind && prevKind !== kind && typed === undefined) return "";
+  // Basic -> bearer, Trino -> Spark, or a new endpoint: the stored value was for something else.
+  if (prevKind && (prevKind !== kind || engineEndpointChanged(original, profile)) && typed === undefined) return "";
   return typed;
+}
+
+/** Whether a stored secret can be shown as kept: same engine and auth, and the same endpoint, as when it was saved. */
+export function engineSecretStored(original: ConnectionProfile | null, profile: ConnectionProfile, hasStored: boolean | undefined): boolean {
+  const kind = engineSecretKind(profile);
+  return !!kind && !!hasStored && engineSecretKind(original) === kind && !engineEndpointChanged(original, profile);
 }
 
 /** True when the engine needs a secret and none is typed or kept from the vault. */
 export function engineSecretMissing(original: ConnectionProfile | null, profile: ConnectionProfile, edit: SecretEdit, hasStored: boolean | undefined): boolean {
-  const kind = engineSecretKind(profile);
-  if (!kind) return false;
-  const kept = !!hasStored && engineSecretKind(original) === kind && edit.mode === "keep";
+  if (!engineSecretKind(profile)) return false;
+  const kept = engineSecretStored(original, profile, hasStored) && edit.mode === "keep";
   return !kept && !(edit.mode === "set" && edit.value);
-}
-
-/** Whether a stored secret can be shown as kept for this engine (same engine and auth as when it was saved). */
-export function engineSecretStored(original: ConnectionProfile | null, profile: ConnectionProfile, hasStored: boolean | undefined): boolean {
-  const kind = engineSecretKind(profile);
-  return !!kind && !!hasStored && engineSecretKind(original) === kind;
 }
 
 /** Trim and null-out optional text before persisting. */

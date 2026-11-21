@@ -16,7 +16,7 @@ import { copyToClipboard } from "../ui/clipboard";
 import { cn } from "../../lib/cn";
 import { TREE_ROW_H, TreeRow } from "./TreeRow";
 import type { QueryState } from "./pgTreeModel";
-import { buildRsRows, columnType, expandedRsSchemas, isViewKind, rsIsExpanded, rsQualifiedName, rsSchemaId, rsSelectAllSql, rsTableId, rsTableKey, type RsRow } from "./redshiftTreeModel";
+import { buildRsRows, columnType, expandedRsSchemas, isViewKind, rsIsExpanded, rsQualifiedName, rsRefreshKeys, rsSchemaId, rsSelectAllSql, rsTableId, rsTableKey, type RsRow } from "./redshiftTreeModel";
 
 function toState<T>(q: UseQueryResult<T> | undefined): QueryState<T> {
   if (!q) return { status: "pending" };
@@ -108,9 +108,7 @@ export function RedshiftTree({ profile, showSystem }: { profile: ConnectionProfi
     [openQuery, toggle],
   );
   const refresh = (row?: RsRow) => {
-    if (row?.kind === "table" && row.schema && row.table) void qc.invalidateQueries({ queryKey: rsQueries.describe(pid, db, row.schema, row.table.name).queryKey });
-    else if (row?.kind === "schema" && row.schema) void qc.invalidateQueries({ queryKey: rsQueries.tables(pid, db, row.schema).queryKey });
-    else void qc.invalidateQueries({ queryKey: ["rs", pid] });
+    for (const queryKey of rsRefreshKeys(pid, db, row)) void qc.invalidateQueries({ queryKey });
   };
 
   const menuFor = (row: RsRow): MenuEntry[] => {

@@ -16,7 +16,7 @@ import { requestAutoRun } from "../editor/autoRun";
 import { IcebergGlyph } from "../iceberg/IcebergGlyph";
 import { compactNumber } from "../iceberg/iceFormat";
 import { iceQueries } from "../iceberg/iceQueries";
-import { qualifiedName, selectAllSql } from "../iceberg/iceSql";
+import { namespaceSql, qualifiedName, selectAllSql } from "../iceberg/iceSql";
 import { dialectOf } from "../../lib/sqlIntel/dialect";
 import { joinNamespace, openIcebergTableTab } from "../iceberg/openIcebergTab";
 import { catalogSummary } from "../connections/icebergForm";
@@ -208,7 +208,7 @@ export function IcebergTree({ profile }: { profile: ConnectionProfile }) {
     } else if (row.kind === "namespace" && row.namespace) {
       const ns = row.namespace;
       items.push({ label: row.expanded ? "Collapse" : "Expand", onSelect: () => toggle(row) });
-      items.push({ label: "Copy name", icon: <Copy className="size-3.5" />, onSelect: () => void copyToClipboard(ns.map((l) => qualifiedName([], l, dialect)).join(".")) });
+      items.push({ label: "Copy name", icon: <Copy className="size-3.5" />, onSelect: () => void copyToClipboard(namespaceSql(ns, dialect)) });
       items.push("separator");
       items.push({ label: "Refresh", icon: <RefreshCw className="size-3.5" />, onSelect: () => refresh(row) });
     } else if (row.kind === "field" && row.field) {

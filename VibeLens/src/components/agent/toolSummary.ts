@@ -103,6 +103,17 @@ export interface TargetSummary {
   where: string | null;
   /** Set when the statement runs somewhere other than the connection's default database. */
   warning: string | null;
+  /** Rust's one-line description of the engine target (Redshift, Trino, Spark). Present only when sent. */
+  detail?: string;
+}
+
+/** Backend text for the fixed header: one line, no control characters, bounded. */
+export function targetDetailText(detail: string | null | undefined): string | null {
+  if (typeof detail !== "string") return null;
+  // eslint-disable-next-line no-control-regex
+  const t = detail.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ").replace(/\s+/g, " ").trim();
+  if (!t) return null;
+  return t.length > 240 ? `${t.slice(0, 239)}…` : t;
 }
 
 /**
@@ -121,7 +132,8 @@ export function describeTarget(target: ApprovalTarget | null | undefined): Targe
   } else if (target.valkeyDb != null) {
     where = `db ${target.valkeyDb}`;
   }
-  return { connection: target.connection, environment: target.environment, where, warning };
+  const detail = targetDetailText(target.detail);
+  return { connection: target.connection, environment: target.environment, where, warning, ...(detail ? { detail } : {}) };
 }
 
 export type PreviewKind = "sql" | "diff" | "text";

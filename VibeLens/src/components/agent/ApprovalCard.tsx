@@ -107,6 +107,12 @@ export function ApprovalCard({
               {target.where && <span className="selectable font-mono font-semibold">{target.where}</span>}
             </div>
           )}
+          {target?.detail && (
+            // From Rust (the stored profile), not from the model. A text node: React escapes it.
+            <p className="selectable mt-0.5 font-mono text-[12px] text-fg/90" data-testid="approval-target-detail">
+              {target.detail}
+            </p>
+          )}
           {target?.warning && (
             <p className="mt-0.5 flex items-center gap-1 text-[12px] font-medium text-warn">
               <AlertTriangle className="size-3.5 shrink-0" />

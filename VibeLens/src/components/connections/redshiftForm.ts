@@ -80,10 +80,25 @@ export function validateRedshift(o: RedshiftOptions): Record<string, string> {
     }
   }
   if (a.kind === "secret") {
-    if (!a.secretArn.trim()) e["rs.secretArn"] = "Secret ARN is required.";
-    else if (!SECRET_ARN_RE.test(a.secretArn.trim())) e["rs.secretArn"] = "Expected arn:aws:secretsmanager:<region>:<12-digit account>:secret:<name>.";
+    const arn = a.secretArn.trim();
+    const m = REDSHIFT_SECRET_ARN_RE.exec(arn);
+    if (!arn) e["rs.secretArn"] = "Secret ARN is required.";
+    else if (!SECRET_ARN_RE.test(arn) || !m) e["rs.secretArn"] = "Expected arn:aws:secretsmanager:<region>:<12-digit account>:secret:<name>, the name using letters, digits and / _ + = . @ -.";
+    else if (o.aws.region.trim() && m[1] !== o.aws.region.trim()) e["rs.secretArn"] = `The secret is in ${m[1]}, but this connection's AWS region is ${o.aws.region.trim()}. Use a secret in the same region.`;
   }
   return e;
+}
+
+/** A Secrets Manager ARN whose name part is limited to what Rust accepts. Group 1 is the region. */
+export const REDSHIFT_SECRET_ARN_RE = /^arn:aws[a-z-]*:secretsmanager:([a-z0-9-]+):\d{12}:secret:[A-Za-z0-9/_+=.@-]+$/;
+
+/** A database requested for a Redshift run (target picker, history): ASCII letters, digits, `_`, `$`. */
+export const isRedshiftDatabaseName = (v: string): boolean => /^[A-Za-z0-9_$]+$/.test(v);
+
+/** Why a tab's requested Redshift database can't be sent (null = fine; null database = the connection's own). */
+export function requestedDatabaseError(db: string | null | undefined): string | null {
+  if (db == null) return null;
+  return isRedshiftDatabaseName(db) ? null : `"${db}" is not a Redshift database name VibeLens will send (ASCII letters, digits, _ and $ only). Choose another database for this tab.`;
 }
 
 export function cleanRedshift(o: RedshiftOptions): RedshiftOptions {

@@ -6,6 +6,7 @@ import { useConnect, useConnectionStatus } from "../../hooks/useConnectionStatus
 import { useProfiles } from "../../hooks/useProfiles";
 import { usePgDatabases } from "../../hooks/usePg";
 import { useRsDatabases } from "../../hooks/useRedshift";
+import { isRedshiftDatabaseName } from "../connections/redshiftForm";
 import { EnvBadge, Button } from "../ui";
 import { Chip, MiniSelect, StatusDot } from "../ui/wsKit";
 import { engineBadge } from "../grid/statsFormat";
@@ -35,7 +36,8 @@ export function TargetPicker({ tab }: { tab: WorkspaceTab }) {
   const rsDbs = useRsDatabases(isRs ? tab.profileId : null);
 
   const currentDb = tab.database ?? (isRs ? profile?.redshift?.database : profile?.database) ?? "";
-  const dbOptions = isRs ? [...(rsDbs.data ?? [])] : (dbs.data ?? []).filter((d) => d.allowConnections && !d.isTemplate).map((d) => d.name);
+  // A Redshift database name goes into a signed Data API call: only names Rust accepts are offered.
+  const dbOptions = isRs ? (rsDbs.data ?? []).filter(isRedshiftDatabaseName) : (dbs.data ?? []).filter((d) => d.allowConnections && !d.isTemplate).map((d) => d.name);
   if (currentDb && !dbOptions.includes(currentDb)) dbOptions.unshift(currentDb);
 
   const state = status?.state ?? "disconnected";

@@ -576,6 +576,12 @@ export interface ApprovalTarget {
   defaultDatabase: string | null;
   /** Valkey: the logical database number. */
   valkeyDb: number | null;
+  /**
+   * Where the statement really runs, resolved by Rust from the stored profile: Redshift
+   * `Redshift · cluster · database · region · auth`; Trino / Spark engine, host:port, catalog, namespace,
+   * acting user. Plain text: rendered as text, never as markup.
+   */
+  detail?: string | null;
 }
 export type AgentEvent =
   | { type: "turnStarted"; turnId: string; providerId: string; model: string }

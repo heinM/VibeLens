@@ -2,6 +2,7 @@
 import type { ConnectionProfile, ConnectionState, Environment, SchemaMetadata, SchemaObject, WorkspaceFile } from "../../ipc/types";
 import type { HistoryEntry } from "../../store/useHistoryStore";
 import type { Rankable } from "./rank";
+import { quoteIdentFor, type SqlDialect } from "../../lib/sqlIntel/dialect";
 
 export type IconKey =
   | "pg"
@@ -285,10 +286,11 @@ export function groupRanked<T extends { item: { group: string }; score: number }
 const PLAIN_IDENT = /^[a-z_][a-z0-9_$]*$/;
 const RESERVED = new Set(["user", "order", "group", "table", "select", "from", "where", "limit", "offset", "desc", "asc", "end", "all", "analyse", "analyze", "and", "any", "as", "check", "column", "constraint", "default", "distinct", "do", "else", "for", "grant", "having", "in", "into", "not", "null", "on", "or", "primary", "references", "then", "to", "union", "unique", "using", "when", "with"]);
 
-/** Quote an identifier only when it needs it (mixed case, spaces, reserved words). */
-export const identForSql = (s: string): string => (PLAIN_IDENT.test(s) && !RESERVED.has(s) ? s : `"${s.replace(/"/g, '""')}"`);
+/** Quote an identifier only when it needs it (mixed case, spaces, reserved words), in the dialect's quotes (Spark: backticks). */
+export const identForSql = (s: string, dialect?: SqlDialect | null): string =>
+  PLAIN_IDENT.test(s) && !RESERVED.has(s) && !(dialect === "spark" && s.includes("$")) ? s : quoteIdentFor(s, dialect);
 
 /** Text inserted into the editor for an object: `schema.name`, or just `schema` when `name` is empty. */
-export function insertionText(schema: string, name: string): string {
-  return name ? `${identForSql(schema)}.${identForSql(name)}` : identForSql(schema);
+export function insertionText(schema: string, name: string, dialect?: SqlDialect | null): string {
+  return name ? `${identForSql(schema, dialect)}.${identForSql(name, dialect)}` : identForSql(schema, dialect);
 }

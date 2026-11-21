@@ -2,7 +2,7 @@
 // types here, so it is unit-testable and the provider is a thin mapping.
 import type { TableDescription } from "../../ipc/types";
 import { type Catalog, childNamespaces, describeColumnBadges, foreignKeysByColumn, formatRows, ident, isDefaultSchema, kindLabel, lookupTable, quoteIdent, resolveSchemaQualifier, schemaIdent, schemaTables } from "./catalog";
-import { METADATA_TABLES, type SqlDialect, afterRelationExtras, functionsFor, isTrinoFamily, snippetsFor, statementStartFor, tableSuffixTarget, typeNamesFor } from "./dialect";
+import { METADATA_TABLES, type SqlDialect, afterRelationExtras, functionsFor, isTrinoFamily, nestedNamespaceIsOneIdent, snippetsFor, statementStartFor, tableSuffixTarget, typeNamesFor } from "./dialect";
 import { type Analysis, type Context, analyzeAt, tokenizeCached } from "./analysis";
 import { type ColumnEntry, columnsOf, tableOf } from "./columns";
 import { joinConditions } from "./joins";
@@ -129,8 +129,11 @@ function relationSuggestions(cat: Catalog | null, a: Analysis, sql: string, qual
   if (qualifier) {
     // `schema.|` or `db.schema.|`; in an Iceberg catalog `a.b.|` names the namespace `a.b`.
     const schema = resolveSchemaQualifier(cat, qualifier);
-    for (const child of childNamespaces(cat, qualifier)) {
-      out.push({ label: child, kind: "schema", detail: "namespace", insertText: `${ident(child, force)}.`, filterText: child, sortText: `1${child.toLowerCase()}`, retrigger: true });
+    // Trino / Athena name a nested namespace as one quoted schema, so `a.` never leads to a deeper level there.
+    if (!nestedNamespaceIsOneIdent(dialect)) {
+      for (const child of childNamespaces(cat, qualifier)) {
+        out.push({ label: child, kind: "schema", detail: "namespace", insertText: `${ident(child, force, dialect)}.`, filterText: child, sortText: `1${child.toLowerCase()}`, retrigger: true });
+      }
     }
     if (!cat || schema === null) return out;
     for (const t of schemaTables(cat, schema)) {
@@ -140,7 +143,7 @@ function relationSuggestions(cat: Catalog | null, a: Analysis, sql: string, qual
         detail: `${kindLabel(t.kind)}${t.estimatedRows !== null ? " · " + formatRows(t.estimatedRows) : ""}`,
         description: t.schema,
         documentation: tableDocs(t, dialect),
-        insertText: ident(t.name, force),
+        insertText: ident(t.name, force, dialect),
         filterText: t.name,
         sortText: `2${t.name.toLowerCase()}`,
       });
@@ -154,14 +157,14 @@ function relationSuggestions(cat: Catalog | null, a: Analysis, sql: string, qual
     const k = c.name.toLowerCase();
     if (seenCte.has(k)) return;
     seenCte.add(k);
-    out.push({ label: c.name, kind: "cte", detail: "CTE", insertText: ident(c.name, force), sortText: `0${pad(i)}`, filterText: c.name });
+    out.push({ label: c.name, kind: "cte", detail: "CTE", insertText: ident(c.name, force, dialect), sortText: `0${pad(i)}`, filterText: c.name });
   });
   if (!cat) return out;
 
   const mentioned = wordsInBuffer(sql);
   for (const t of cat.tables) {
     const isDefault = isDefaultSchema(cat, t.schema);
-    const qualified = isDefault ? ident(t.name, force) : `${schemaIdent(cat, t.schema)}.${ident(t.name, false)}`;
+    const qualified = isDefault ? ident(t.name, force, dialect) : `${schemaIdent(cat, t.schema, false, dialect)}.${ident(t.name, false, dialect)}`;
     const used = mentioned.has(t.name.toLowerCase());
     out.push({
       label: t.name,
@@ -175,17 +178,19 @@ function relationSuggestions(cat: Catalog | null, a: Analysis, sql: string, qual
     });
   }
   // In a dotted catalog only top-level namespaces are offered here; deeper levels come after the dot.
+  // Trino / Athena: every namespace is offered whole, as the one quoted schema they read it as.
+  const whole = nestedNamespaceIsOneIdent(dialect);
   const shown = new Set<string>();
   for (const s of cat.schemas) {
-    const label = cat.dotted ? s.split(".")[0] : s;
+    const label = cat.dotted && !whole ? s.split(".")[0] : s;
     if (shown.has(label.toLowerCase())) continue;
     shown.add(label.toLowerCase());
-    const n = cat.dotted ? cat.schemas.filter((x) => x === label || x.toLowerCase().startsWith(label.toLowerCase() + ".")).reduce((acc, x) => acc + schemaTables(cat, x).length, 0) : schemaTables(cat, s).length;
+    const n = cat.dotted && !whole ? cat.schemas.filter((x) => x === label || x.toLowerCase().startsWith(label.toLowerCase() + ".")).reduce((acc, x) => acc + schemaTables(cat, x).length, 0) : schemaTables(cat, s).length;
     out.push({
       label,
       kind: "schema",
       detail: `${cat.dotted ? "namespace" : "schema"} · ${n} ${n === 1 ? "relation" : "relations"}`,
-      insertText: `${ident(label, force)}.`,
+      insertText: `${cat.dotted ? schemaIdent(cat, label, force, dialect) : ident(label, force, dialect)}.`,
       filterText: label,
       sortText: `4${label.toLowerCase()}`,
       retrigger: true,
@@ -194,10 +199,10 @@ function relationSuggestions(cat: Catalog | null, a: Analysis, sql: string, qual
   return out;
 }
 
-function columnSuggestions(cols: ColumnEntry[], opts: { group: string; relName?: string; qualifyWith?: string | null; force: boolean; ambiguous?: Set<string>; outer?: boolean }): Suggestion[] {
+function columnSuggestions(cols: ColumnEntry[], opts: { group: string; relName?: string; qualifyWith?: string | null; force: boolean; ambiguous?: Set<string>; outer?: boolean; dialect?: SqlDialect | null }): Suggestion[] {
   return cols.map((c, i) => {
     const ambiguous = opts.ambiguous?.has(c.name.toLowerCase());
-    const bare = ident(c.name, opts.force);
+    const bare = ident(c.name, opts.force, opts.dialect);
     const insertText = ambiguous && opts.qualifyWith ? `${opts.qualifyWith}.${bare}` : bare;
     const fk = c.table && c.info ? (foreignKeysByColumn(c.table).get(c.name)?.length ?? 0) > 0 : false;
     const flag = c.info?.isPrimaryKey ? " · PK" : fk ? " · FK" : "";
@@ -214,7 +219,7 @@ function columnSuggestions(cols: ColumnEntry[], opts: { group: string; relName?:
   });
 }
 
-function scopeColumns(a: Analysis, cat: Catalog | null, force: boolean, includeInto: boolean): Suggestion[] {
+function scopeColumns(a: Analysis, cat: Catalog | null, force: boolean, includeInto: boolean, dialect: SqlDialect | null): Suggestion[] {
   const env = { cat, tree: a.tree, ctes: a.scope.ctes };
   const rels = a.scope.relations.filter((r) => r.role !== "into" || includeInto);
   const colsPerRel = rels.map((r) => ({ r, cols: columnsOf(r, env) }));
@@ -223,17 +228,17 @@ function scopeColumns(a: Analysis, cat: Catalog | null, force: boolean, includeI
   const ambiguous = new Set([...counts].filter(([, n]) => n > 1).map(([k]) => k));
   const out: Suggestion[] = [];
   colsPerRel.forEach(({ r, cols }, idx) => {
-    out.push(...columnSuggestions(cols, { group: `1${pad(idx, 2)}`, relName: exposedName(r), qualifyWith: ident(exposedName(r)), force, ambiguous }));
+    out.push(...columnSuggestions(cols, { group: `1${pad(idx, 2)}`, relName: exposedName(r), qualifyWith: ident(exposedName(r), false, dialect), force, ambiguous, dialect }));
   });
   // Correlated outer-query columns.
   const outerEnv = env;
   a.scope.outer.forEach((r, idx) => {
-    out.push(...columnSuggestions(columnsOf(r, outerEnv), { group: `3${pad(idx, 2)}`, relName: exposedName(r), qualifyWith: ident(exposedName(r)), force, ambiguous, outer: true }));
+    out.push(...columnSuggestions(columnsOf(r, outerEnv), { group: `3${pad(idx, 2)}`, relName: exposedName(r), qualifyWith: ident(exposedName(r), false, dialect), force, ambiguous, outer: true, dialect }));
   });
   return out;
 }
 
-function aliasSuggestions(a: Analysis): Suggestion[] {
+function aliasSuggestions(a: Analysis, dialect: SqlDialect | null): Suggestion[] {
   const seen = new Set<string>();
   const out: Suggestion[] = [];
   for (const r of [...a.scope.relations, ...a.scope.outer]) {
@@ -245,7 +250,7 @@ function aliasSuggestions(a: Analysis): Suggestion[] {
       label: name,
       kind: "alias",
       detail: r.alias ? `alias · ${target}` : r.kind === "table" ? "table in query" : r.kind === "cte" ? "CTE" : "subquery",
-      insertText: `${ident(name)}.`,
+      insertText: `${ident(name, false, dialect)}.`,
       filterText: name,
       sortText: `2${name.toLowerCase()}`,
       retrigger: true,
@@ -296,9 +301,9 @@ function typeSuggestions(dialect: SqlDialect | null): Suggestion[] {
   return typeNamesFor(dialect).map((t, i) => ({ label: t, kind: "type" as const, insertText: t, filterText: t, sortText: `2${pad(i)}` }));
 }
 
-function joinSuggestions(cat: Catalog | null, ctx: Extract<Context, { kind: "on" }>): Suggestion[] {
+function joinSuggestions(cat: Catalog | null, ctx: Extract<Context, { kind: "on" }>, dialect: SqlDialect | null): Suggestion[] {
   if (!ctx.joinEligible || !ctx.right) return [];
-  return joinConditions(cat, ctx.right, ctx.lefts, ctx.onText).map((j, i) => ({
+  return joinConditions(cat, ctx.right, ctx.lefts, ctx.onText, dialect).map((j, i) => ({
     label: j.text,
     kind: "join" as const,
     detail: j.detail,
@@ -323,31 +328,31 @@ function qualifiedSuggestions(cat: Catalog | null, a: Analysis, qualifier: strin
       const seen = new Set<string>();
       const cols: ColumnEntry[] = [];
       for (const r of rels) for (const c of columnsOf(r, env)) if (!seen.has(c.name)) (seen.add(c.name), cols.push(c));
-      out.push(...columnSuggestions(cols, { group: "1", force }));
+      out.push(...columnSuggestions(cols, { group: "1", force, dialect }));
       return out;
     }
     // A table that is not in the query yet (`SELECT orders.| FROM …` written before the FROM).
     const t = lookupTable(cat, qualifier);
     if (t && resolveSchemaQualifier(cat, qualifier) === null) {
-      return columnSuggestions(t.columns.map((c) => ({ name: c.name, info: c, table: t })), { group: "1", force });
+      return columnSuggestions(t.columns.map((c) => ({ name: c.name, info: c, table: t })), { group: "1", force, dialect });
     }
     if (cat && (resolveSchemaQualifier(cat, qualifier) !== null || childNamespaces(cat, qualifier).length > 0)) return relationSuggestions(cat, a, "", qualifier, dialect);
     return out;
   }
   // schema.table.| or db.schema.table.| (an Iceberg namespace path may be any number of levels)
   const t = lookupTable(cat, cat?.dotted ? qualifier : qualifier.slice(-2));
-  if (t) return columnSuggestions(t.columns.map((c) => ({ name: c.name, info: c, table: t })), { group: "1", force });
+  if (t) return columnSuggestions(t.columns.map((c) => ({ name: c.name, info: c, table: t })), { group: "1", force, dialect });
   if (cat?.dotted && (resolveSchemaQualifier(cat, qualifier) !== null || childNamespaces(cat, qualifier).length > 0)) return relationSuggestions(cat, a, "", qualifier, dialect);
   return out;
 }
 
 function expressionSuggestions(cat: Catalog | null, a: Analysis, clause: Context & { kind: "expression" }, force: boolean, dialect: SqlDialect | null): Suggestion[] {
   const includeInto = clause.clause === "returning" || clause.clause === "conflict" || !a.scope.arm.some((it) => "t" in it && it.t.text.toLowerCase() === "select");
-  const out = scopeColumns(a, cat, force, includeInto);
+  const out = scopeColumns(a, cat, force, includeInto, dialect);
   if (clause.clause === "select" && a.scope.relations.length) {
     out.push({ label: "*", kind: "keyword", detail: "all columns", insertText: "*", sortText: "100", filterText: "*" });
   }
-  out.push(...aliasSuggestions(a), ...functionSuggestions(dialect), ...keywordSuggestions(EXPRESSION_KEYWORDS));
+  out.push(...aliasSuggestions(a, dialect), ...functionSuggestions(dialect), ...keywordSuggestions(EXPRESSION_KEYWORDS));
   return out;
 }
 
@@ -382,7 +387,7 @@ export function complete(cat: Catalog | null, sql: string, offset: number, opts:
       break;
     case "columnList": {
       const t = lookupTable(cat, ctx.table);
-      if (t) suggestions = columnSuggestions(t.columns.map((c) => ({ name: c.name, info: c, table: t })), { group: "1", force });
+      if (t) suggestions = columnSuggestions(t.columns.map((c) => ({ name: c.name, info: c, table: t })), { group: "1", force, dialect });
       break;
     }
     case "type":
@@ -396,7 +401,7 @@ export function complete(cat: Catalog | null, sql: string, offset: number, opts:
       break;
     }
     case "on":
-      suggestions = [...joinSuggestions(cat, ctx), ...expressionSuggestions(cat, a, { kind: "expression", clause: "on" }, force, dialect)];
+      suggestions = [...joinSuggestions(cat, ctx, dialect), ...expressionSuggestions(cat, a, { kind: "expression", clause: "on" }, force, dialect)];
       break;
     case "expression":
       suggestions = expressionSuggestions(cat, a, ctx, force, dialect);
