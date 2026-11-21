@@ -51,6 +51,9 @@ const FILE_FORMATS: &[&str] = &[
     "JDBC",
     "XML",
     "ICEBERG",
+    "LIBSVM",
+    "IMAGE",
+    "KAFKA",
 ];
 
 /// Words that start or smuggle in something that is not a read.
@@ -82,7 +85,8 @@ const DENY_WORDS: &[&str] = &[
     "INTO",
     "USE",
     "TRANSFORM",
-    "REDUCE",
+    "RECORDWRITER",
+    "RECORDREADER",
     "EXECUTE",
     "IMMEDIATE",
     "IDENTIFIER",
@@ -111,24 +115,40 @@ const FIRST_WORDS: &[&str] = &["SELECT", "WITH", "SHOW", "DESCRIBE", "DESC", "EX
 /// `escapes` says whether a backslash escapes the next character inside a literal. It does by
 /// default, but not with `spark.sql.parser.escapedStringLiterals=true`, which the cluster can
 /// set without the profile knowing; [`refusal`] therefore reads every statement both ways.
-fn tokenize(sql: &str, escapes: bool) -> std::result::Result<Vec<Tok>, &'static str> {
+fn tokenize(sql: &str, escapes: bool) -> std::result::Result<Lexed, &'static str> {
     let chars: Vec<char> = sql.chars().collect();
     let mut out = Vec::new();
+    let mut has_comment = false;
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
         match c {
             c if c.is_whitespace() => i += 1,
             '-' if chars.get(i + 1) == Some(&'-') => {
+                has_comment = true;
                 while i < chars.len() && chars[i] != '\n' && chars[i] != '\r' {
+                    // Spark continues a `--` comment over a backslash-newline; where it ends
+                    // is not something to guess.
+                    if chars[i] == '\\' {
+                        return Err("a backslash in a -- comment");
+                    }
                     i += 1;
                 }
             }
             '/' if chars.get(i + 1) == Some(&'*') => {
+                has_comment = true;
+                // `/*+ … */` is a hint, which Spark parses.
+                if chars.get(i + 2) == Some(&'+') {
+                    return Err("a query hint");
+                }
                 i += 2;
                 loop {
                     if i + 1 >= chars.len() {
                         return Err("an unterminated comment");
+                    }
+                    // Spark nests block comments; this scan does not.
+                    if chars[i] == '/' && chars[i + 1] == '*' {
+                        return Err("a nested block comment");
                     }
                     if chars[i] == '*' && chars[i + 1] == '/' {
                         i += 2;
@@ -212,7 +232,31 @@ fn tokenize(sql: &str, escapes: bool) -> std::result::Result<Vec<Tok>, &'static 
             _ => return Err("a character that is not part of Spark SQL's syntax"),
         }
     }
-    Ok(out)
+    Ok(Lexed {
+        toks: out,
+        has_comment,
+    })
+}
+
+/// What [`tokenize`] found.
+struct Lexed {
+    toks: Vec<Tok>,
+    has_comment: bool,
+}
+
+/// Why `stmt` must not be sent to Spark in any mode, or `None`.
+///
+/// Spark substitutes `${…}` (`spark.sql.variable.substitute`, on by default) in the raw text
+/// before it parses anything, inside literals and comments too: `'${env:AWS_SECRET_ACCESS_KEY}'`
+/// reads an environment variable of the driver, and a substitution inside a comment can turn
+/// into code. No check on the text can know what it becomes, so it is refused everywhere.
+pub(crate) fn substitution_refusal(stmt: &str) -> Option<String> {
+    stmt.contains("${").then(|| {
+        "it contains '${', which Spark replaces before parsing (variable substitution), so \
+         what would run cannot be checked. Write the value out instead; a cluster admin can \
+         also set spark.sql.variable.substitute=false"
+            .to_string()
+    })
 }
 
 /// Why `stmt` is not provably a read, or `None` when it is. The statement must pass when read
@@ -222,8 +266,16 @@ fn refusal(stmt: &str) -> Option<String> {
 }
 
 fn refusal_as(stmt: &str, escapes: bool) -> Option<String> {
+    if let Some(why) = substitution_refusal(stmt) {
+        return Some(why);
+    }
     let toks = match tokenize(stmt, escapes) {
-        Ok(t) => t,
+        // Comments are where Spark's lexer and this one can disagree (nesting, a backslash
+        // before a newline, hints), so a read-only run has none, as on Athena and Trino.
+        Ok(l) if l.has_comment => {
+            return Some("it contains a comment, which read-only runs do not accept".into());
+        }
+        Ok(l) => l.toks,
         Err(why) => return Some(format!("it contains {why}, which the check cannot read")),
     };
     match toks.first() {
@@ -252,8 +304,14 @@ fn refusal_as(stmt: &str, escapes: bool) -> Option<String> {
                     "it contains {w}, which is not part of a plain query"
                 ));
             }
-            Tok::Word(w) if w == "USING" && matches!(next, Some(Tok::Str)) => {
+            Tok::Word(w) if w == "USING" && matches!(next, Some(Tok::Str | Tok::Quoted(_))) => {
                 return Some("it runs a script (USING '…')".into());
+            }
+            // `MAP …`/`REDUCE … USING 'script'`; `map(…)` and `reduce(…)` are functions.
+            Tok::Word(w)
+                if (w == "MAP" || w == "REDUCE") && !matches!(next, Some(Tok::Punct('('))) =>
+            {
+                return Some(format!("it contains {w}, which can run a script"));
             }
             Tok::Word(w) if w == "LATERAL" && matches!(next, Some(Tok::Word(v)) if v == "VIEW") => {
                 let mut j = i + 2;
@@ -279,7 +337,10 @@ fn refusal_as(stmt: &str, escapes: bool) -> Option<String> {
                     Some(Tok::Quoted(w)) => Some(w.to_ascii_uppercase()),
                     _ => None,
                 };
-                let is_format = source.as_deref().is_some_and(|s| FILE_FORMATS.contains(&s));
+                // A quoted source with a `.` in it is a data source class name.
+                let is_format = source
+                    .as_deref()
+                    .is_some_and(|s| FILE_FORMATS.contains(&s) || s.contains('.'));
                 if is_format || q.contains('/') || q.contains(':') {
                     return Some(
                         "it reads a file path directly (format.`path`), which can reach any file \
@@ -311,15 +372,31 @@ pub fn check_spark_read_only(statements: &[String]) -> Result<()> {
 /// Statements that change the shared Livy session for the statements after them. Refused in
 /// every mode: each statement must run against the catalog and namespace the connection names
 /// (and the approval card shows).
+///
+/// Fails closed: when the statement cannot be tokenised (a backslash in a `--` comment, a nested
+/// block comment, a hint, …) it is refused if it starts with a comment, and otherwise judged by
+/// its first word.
 pub(crate) fn session_statement(stmt: &str) -> Option<&'static str> {
-    let toks = tokenize(stmt, true).ok()?;
-    match toks.first() {
-        Some(Tok::Word(w)) => match w.as_str() {
-            "USE" => Some("USE"),
-            "SET" => Some("SET"),
-            "RESET" => Some("RESET"),
-            _ => None,
+    let first = match tokenize(stmt, true) {
+        Ok(l) => match l.toks.first() {
+            Some(Tok::Word(w)) => w.clone(),
+            _ => return None,
         },
+        Err(_) => {
+            let t = stmt.trim_start();
+            if t.starts_with("--") || t.starts_with("/*") {
+                return Some("a statement that starts with a comment the check cannot read");
+            }
+            t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .next()
+                .unwrap_or("")
+                .to_ascii_uppercase()
+        }
+    };
+    match first.as_str() {
+        "USE" => Some("USE"),
+        "SET" => Some("SET"),
+        "RESET" => Some("RESET"),
         _ => None,
     }
 }
@@ -347,8 +424,8 @@ mod tests {
             "SELECT * FROM lake.shop.orders.snapshots",
             "SELECT c FROM t LATERAL VIEW explode(arr) x AS c",
             "SELECT c FROM t LATERAL VIEW OUTER posexplode(arr) x AS p, c",
-            "SELECT 'its' AS s -- trailing comment",
-            "SELECT /* hint */ 1",
+            "SELECT 'its' AS s",
+            "SELECT map('a', 1), reduce(array(1, 2), 0, (a, x) -> a + x)",
             "SELECT a FROM t JOIN u USING (id)",
             "SELECT \"text\" AS s",
         ] {
@@ -439,6 +516,60 @@ mod tests {
         assert!(!ok("SELECT 'a\\' , reflect('x','y') , '"));
         // An odd backslash before a quote reads differently the two ways: refused.
         assert!(!ok("SELECT 'it\\'s' AS s"));
+    }
+
+    /// Audit 2026-11-21, items 1 to 3: places where Spark's lexer and parser read the text
+    /// differently from this scan. Without these refusals each payload passes as a plain read
+    /// and Spark runs something else.
+    #[test]
+    fn lexer_differences_with_spark_are_refused() {
+        for s in [
+            // `--` comments continue over a backslash-newline in Spark: the INSERT runs.
+            "-- x \\\nSELECT '\nINSERT INTO lake.shop.orders SELECT * FROM lake.shop.orders -- '",
+            // Nested block comments: Spark sees reflect(...) as code.
+            "SELECT 1 /* /* */ ' */ + reflect(\"a\",\"b\") + /* ' */ 2",
+            // Hints and plain comments: refused in read-only runs.
+            "SELECT /*+ REPARTITION(3) */ 1",
+            "SELECT /* c */ 1",
+            "SELECT 1 -- c",
+            // Script transform with a double-quoted script, and MAP/REDUCE without a paren.
+            "SELECT * FROM (MAP a USING \"cat /var/run/secrets/kubernetes.io/serviceaccount/token\" FROM (SELECT 1 a) t) x",
+            "SELECT * FROM (REDUCE a USING 'cat' AS b FROM t) x",
+            "SELECT * FROM t ROW FORMAT SERDE 'x' RECORDWRITER 'y'",
+            "SELECT * FROM t RECORDREADER 'y'",
+            // More file sources, and a data source class name.
+            "SELECT * FROM libsvm.`data`",
+            "SELECT * FROM image.`imgs`",
+            "SELECT * FROM kafka.`topic`",
+            "SELECT * FROM `org.apache.spark.sql.execution.datasources.text.TextFileFormat`.`etc`",
+        ] {
+            assert!(!ok(s), "{s}");
+        }
+    }
+
+    /// Audit item 2: `${…}` is substituted by Spark before parsing, inside literals and
+    /// comments. Without this the first payload returns cluster secrets to the model.
+    #[test]
+    fn variable_substitution_is_refused() {
+        for s in [
+            "SELECT '${env:AWS_SECRET_ACCESS_KEY}', '${spark.hadoop.fs.s3a.secret.key}'",
+            "SELECT 1 -- ${system:line.separator} , reflect('a', 'b')",
+        ] {
+            assert!(!ok(s), "{s}");
+            assert!(substitution_refusal(s).is_some(), "{s}");
+        }
+        assert!(substitution_refusal("SELECT '$' || '{x}'").is_none());
+    }
+
+    /// Audit items 1, 3 and 10: the session check fails closed when it cannot tokenise.
+    #[test]
+    fn the_session_check_fails_closed() {
+        assert!(session_statement("-- x \\\nUSE lake.other").is_some());
+        assert!(session_statement("/* /* */ */ SET a=b").is_some());
+        assert!(session_statement("/*+ x */ SET a=b").is_some());
+        assert_eq!(session_statement("SET $x = 1"), Some("SET"));
+        assert_eq!(session_statement("SELECT $x"), None);
+        assert_eq!(session_statement("INSERT INTO t SELECT 1 -- note"), None);
     }
 
     #[test]

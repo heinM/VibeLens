@@ -359,7 +359,7 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
              is shown to the user as an approval request and only runs if they approve; on production connections the user is warned prominently. A script may contain several statements. \
              The result is JSON: columns, rows (at most about 200, long values shortened), rowCount, truncated, commandTag. Always add LIMIT to exploratory queries. \
              On Apache Iceberg connections: name tables as namespace.table; the dialect is DataFusion SQL on the local engine and Trino/Athena SQL on an Athena engine. Time travel on the local engine reads a table as of a snapshot with a quoted name, ns.\"table@<snapshot_id>\". \
-             Iceberg writes (INSERT, CREATE TABLE AS, and on Athena DML/DDL) need approval and create a new table snapshot. The local engine can only append with INSERT, so UPDATE, DELETE and MERGE need an Athena connection. \
+             Iceberg writes (INSERT, CREATE TABLE AS, and on Athena, Trino or Spark also UPDATE, DELETE, MERGE and DDL) need approval and create a new table snapshot. The local (embedded) engine can only append with INSERT; UPDATE, DELETE and MERGE need a server-side engine (Athena, Trino or Spark). \
              Athena bills per TB scanned: select only the columns you need, filter on partition columns and always add LIMIT. \
              On Amazon Redshift connections the dialect is Redshift SQL; each statement commits on its own (no transactions: BEGIN, COMMIT and ROLLBACK are refused), and read-only statements are checked to be plain queries rather than run in a READ ONLY transaction. \
              On a Trino or Spark engine (remote clusters, not billed per TB) the dialect is Trino SQL or Spark SQL, writes include UPDATE, DELETE and MERGE, and session statements (USE, SET) are refused; on Spark, read-only runs also refuse reflect/java_method and direct file paths. \
@@ -812,6 +812,7 @@ pub(super) async fn run(
     backend: &dyn ToolBackend,
     plan: &Assessment,
     write_baseline: Option<&FileVersion>,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<ToolOutput> {
     match call {
         ToolCall::ListConnections => {
@@ -948,6 +949,7 @@ pub(super) async fn run(
                     sql,
                     !plan.allow_write,
                     MAX_MODEL_ROWS,
+                    cancel.clone(),
                 )
                 .await?;
             Ok(out(
@@ -1045,6 +1047,20 @@ pub(super) async fn run(
 mod tests {
     use super::*;
     use crate::model::{ColumnInfo, ColumnMeta, ObjectKind};
+
+    /// Audit 2026-11-21, item 14: the run_sql description must not send the model to Athena
+    /// for DML that Trino and Spark do too.
+    #[test]
+    fn run_sql_describes_every_iceberg_engine_truthfully() {
+        let specs = tool_specs();
+        let d = &specs
+            .iter()
+            .find(|s| s.name == "run_sql")
+            .unwrap()
+            .description;
+        assert!(!d.contains("need an Athena connection"), "{d}");
+        assert!(d.contains("Athena, Trino or Spark"), "{d}");
+    }
 
     #[test]
     fn specs_are_well_formed() {

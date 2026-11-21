@@ -20,8 +20,9 @@ const SECRET_HEADERS: &[&str] = &[
     "cookie",
 ];
 
-/// Whether `host` names this machine: `localhost`, a `.localhost` name or a loopback address
-/// (`127.0.0.0/8`, `::1`, with or without the brackets a URL puts around IPv6).
+/// Whether `host` names this machine: `localhost` or a loopback address (`127.0.0.0/8`, `::1`,
+/// with or without the brackets a URL puts around IPv6). Other `*.localhost` names are not
+/// accepted: whether they resolve to this machine depends on the resolver.
 pub(crate) fn is_loopback_host(host: &str) -> bool {
     let host = host.trim();
     let host = host
@@ -30,7 +31,6 @@ pub(crate) fn is_loopback_host(host: &str) -> bool {
         .unwrap_or(host)
         .to_ascii_lowercase();
     host == "localhost"
-        || host.ends_with(".localhost")
         || host
             .parse::<std::net::IpAddr>()
             .is_ok_and(|ip| ip.is_loopback())
@@ -227,7 +227,6 @@ mod tests {
         for h in [
             "localhost",
             "LOCALHOST",
-            "db.localhost",
             "127.0.0.1",
             "127.8.9.1",
             "::1",
@@ -238,6 +237,8 @@ mod tests {
         for h in [
             "",
             "example.com",
+            // Audit 2026-11-21, item 12: resolver-dependent.
+            "db.localhost",
             "localhost.example.com",
             "10.0.0.1",
             "192.168.1.5",

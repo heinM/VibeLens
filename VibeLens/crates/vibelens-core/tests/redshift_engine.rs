@@ -239,7 +239,12 @@ async fn writes_report_rows_affected_and_read_no_result() {
     assert_eq!(server.count("GetStatementResult"), 0);
 
     let r = e
-        .execute_collect("CREATE TABLE t (a int)", None, ExecOptions::default())
+        .execute_collect(
+            "CREATE TABLE t (a int)",
+            None,
+            ExecOptions::default(),
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(r.command_tag.as_deref(), Some("CREATE TABLE"));
@@ -285,7 +290,12 @@ async fn failed_and_aborted_statements() {
     assert_eq!(failure(&events).1, "cancelled");
 
     let err = e
-        .execute_collect("SELECT nope", None, ExecOptions::default())
+        .execute_collect(
+            "SELECT nope",
+            None,
+            ExecOptions::default(),
+            CancellationToken::new(),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, CoreError::Database(m) if m.contains("does not exist")));
@@ -391,7 +401,12 @@ async fn throttling_is_retried_with_the_same_client_token() {
     }))
     .await;
     let r = engine(&server)
-        .execute_collect("SELECT 1 AS n", None, ExecOptions::default())
+        .execute_collect(
+            "SELECT 1 AS n",
+            None,
+            ExecOptions::default(),
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(r.rows, vec![vec![json!(1)]]);
@@ -411,7 +426,12 @@ async fn throttling_gives_up_after_three_retries_and_errors_carry_no_credentials
     }))
     .await;
     let err = engine(&server)
-        .execute_collect("SELECT 1", None, ExecOptions::default())
+        .execute_collect(
+            "SELECT 1",
+            None,
+            ExecOptions::default(),
+            CancellationToken::new(),
+        )
         .await
         .unwrap_err();
     match &err {
@@ -479,7 +499,7 @@ async fn max_rows_truncates_and_stops_paging() {
         ..ExecOptions::default()
     };
     let r = e
-        .execute_collect("SELECT n FROM t", None, cap(2))
+        .execute_collect("SELECT n FROM t", None, cap(2), CancellationToken::new())
         .await
         .unwrap();
     assert_eq!(r.rows, vec![vec![json!(1)], vec![json!(2)]]);
@@ -493,7 +513,7 @@ async fn max_rows_truncates_and_stops_paging() {
     // At the end of a page with more pages to come: truncated, and the next page is not read.
     let before = server.count("GetStatementResult");
     let r = e
-        .execute_collect("SELECT n FROM t", None, cap(3))
+        .execute_collect("SELECT n FROM t", None, cap(3), CancellationToken::new())
         .await
         .unwrap();
     assert_eq!((r.row_count, r.truncated), (3, true));
@@ -501,7 +521,7 @@ async fn max_rows_truncates_and_stops_paging() {
 
     // Exactly everything: not truncated.
     let r = e
-        .execute_collect("SELECT n FROM t", None, cap(4))
+        .execute_collect("SELECT n FROM t", None, cap(4), CancellationToken::new())
         .await
         .unwrap();
     assert_eq!((r.row_count, r.truncated), (4, false));
@@ -565,7 +585,10 @@ async fn read_only_refuses_before_any_request() {
         let (idx, code, msg) = failure(&events);
         assert_eq!((idx, code.as_str()), (None, "policy_denied"), "{sql}");
         assert!(msg.contains("read-only run"), "{msg}");
-        let err = e.execute_collect(sql, None, ro()).await.unwrap_err();
+        let err = e
+            .execute_collect(sql, None, ro(), CancellationToken::new())
+            .await
+            .unwrap_err();
         assert!(matches!(err, CoreError::PolicyDenied(_)), "{sql}");
     }
     // Without the check these would have been submitted: the Data API has no read-only session.
@@ -583,7 +606,7 @@ async fn read_only_still_runs_queries_and_show_forms() {
         "SHOW TABLES FROM SCHEMA dev.public",
         "SHOW search_path",
     ] {
-        e.execute_collect(sql, None, ro())
+        e.execute_collect(sql, None, ro(), CancellationToken::new())
             .await
             .unwrap_or_else(|err| panic!("{sql}: {err}"));
     }
@@ -662,9 +685,14 @@ async fn target_and_auth_parameters_per_mode() {
     for (opts, want) in cases {
         let before = server.all().len();
         let e = engine_for(&server, opts.clone());
-        e.execute_collect("CREATE TABLE t (a int)", None, ExecOptions::default())
-            .await
-            .unwrap();
+        e.execute_collect(
+            "CREATE TABLE t (a int)",
+            None,
+            ExecOptions::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
         e.list_databases().await.unwrap();
         let sent: Vec<Value> = server.all()[before..]
             .iter()
@@ -754,7 +782,12 @@ async fn invalid_identifiers_are_refused_before_anything_is_signed() {
 async fn database_override_is_sent() {
     let server = serve(one_result(&[("n", "int4")], vec![vec![long(1)]])).await;
     engine(&server)
-        .execute_collect("SELECT 1", Some(" sales "), ExecOptions::default())
+        .execute_collect(
+            "SELECT 1",
+            Some(" sales "),
+            ExecOptions::default(),
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(server.calls("ExecuteStatement")[0]["Database"], "sales");
@@ -767,7 +800,9 @@ async fn empty_scripts_finish_without_calling_redshift() {
     let events = stream(&e, "  -- nothing\n ;; ", opts()).await;
     assert_eq!(kinds(&events), ["started", "finished"]);
     assert_eq!(
-        e.execute_collect("", None, opts()).await.unwrap(),
+        e.execute_collect("", None, opts(), CancellationToken::new())
+            .await
+            .unwrap(),
         QueryResult::default()
     );
     assert!(server.all().is_empty());
@@ -941,7 +976,12 @@ async fn a_look_alike_database_name_is_refused() {
     let server = serve(refuse_everything()).await;
     let e = engine(&server);
     let err = e
-        .execute_collect("SELECT 1", Some("d\u{0435}v"), ExecOptions::default())
+        .execute_collect(
+            "SELECT 1",
+            Some("d\u{0435}v"),
+            ExecOptions::default(),
+            CancellationToken::new(),
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("ASCII"), "{err}");
@@ -1094,4 +1134,59 @@ async fn describing_a_missing_table_is_not_found() {
         .await
         .unwrap_err();
     assert!(matches!(err, CoreError::NotFound(_)), "{err:?}");
+}
+
+/// Audit 2026-11-21, item 6: an agent Stop or a tool timeout drops the future that runs the
+/// statement. Without the run task and its cancel-on-drop guard the statement would keep
+/// running in the warehouse.
+#[tokio::test]
+async fn dropping_the_collect_future_still_cancels_the_statement() {
+    let server = serve(Arc::new(|req: &Req| match op(req).as_str() {
+        "ExecuteStatement" => executed("stmt-1"),
+        "DescribeStatement" => described("stmt-1", "STARTED", false, -1),
+        "CancelStatement" => Resp::ok(&json!({"Status": true})),
+        _ => Resp::error(400, "ValidationException", "unexpected"),
+    }))
+    .await;
+    let e = engine(&server);
+    let run = e.execute_collect(
+        "SELECT * FROM big",
+        None,
+        ExecOptions::default(),
+        CancellationToken::new(),
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), run)
+            .await
+            .is_err()
+    );
+    for _ in 0..200 {
+        if server.count("CancelStatement") > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(server.calls("CancelStatement")[0]["Id"], "stmt-1");
+
+    // And with the token: the call returns only after CancelStatement was sent.
+    let server = serve(Arc::new(|req: &Req| match op(req).as_str() {
+        "ExecuteStatement" => executed("stmt-2"),
+        "DescribeStatement" => described("stmt-2", "STARTED", false, -1),
+        "CancelStatement" => Resp::ok(&json!({"Status": true})),
+        _ => Resp::error(400, "ValidationException", "unexpected"),
+    }))
+    .await;
+    let e = engine(&server);
+    let cancel = CancellationToken::new();
+    let c = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        c.cancel();
+    });
+    let err = e
+        .execute_collect("SELECT * FROM big", None, ExecOptions::default(), cancel)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CoreError::Cancelled), "{err:?}");
+    assert_eq!(server.count("CancelStatement"), 1);
 }

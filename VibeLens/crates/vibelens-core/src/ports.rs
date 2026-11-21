@@ -99,6 +99,9 @@ pub trait ToolBackend: Send + Sync {
         sql: &str,
         read_only: bool,
         max_rows: usize,
+        // The agent turn's token: when it fires (Stop, tool timeout) the engine stops the
+        // statement on the server before returning.
+        cancel: CancellationToken,
     ) -> Result<QueryResult>;
     async fn schema_metadata(
         &self,

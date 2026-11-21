@@ -23,6 +23,8 @@ pub(super) const MAX_STEPS: usize = 16;
 /// Approximate token budget for a session's history (characters / 4).
 pub(super) const HISTORY_BUDGET_TOKENS: usize = 150_000;
 const TOOL_TIMEOUT: Duration = Duration::from_secs(180);
+/// How long a cancelled tool may take to stop its work on the server before it is dropped.
+const CANCEL_GRACE: Duration = Duration::from_secs(15);
 const ELIDED: &str = "[elided]";
 
 /// One conversation. Lives in the service's map; the running turn works on a copy of `history`
@@ -601,12 +603,35 @@ impl TurnRunner {
         })
         .await;
         let started = Instant::now();
+        // The tool gets its own token, cancelled with the turn or at the tool timeout. On either,
+        // the tool future is awaited a little longer instead of dropped, so the engine can stop
+        // the statement on the server (Trino DELETE, Livy cancel, StopQueryExecution, …).
+        let tool_cancel = self.cancel.child_token();
+        let tool = run_tool(
+            &call,
+            self.backend.as_ref(),
+            &plan,
+            write_baseline.as_ref(),
+            &tool_cancel,
+        );
+        tokio::pin!(tool);
         let result = tokio::select! {
             biased;
-            _ = self.cancel.cancelled() => return CallOutcome::Cancelled,
-            r = tokio::time::timeout(TOOL_TIMEOUT, run_tool(&call, self.backend.as_ref(), &plan, write_baseline.as_ref())) => {
-                r.unwrap_or_else(|_| Err(CoreError::Timeout(format!("{name} did not finish within {} seconds", TOOL_TIMEOUT.as_secs()))))
+            _ = self.cancel.cancelled() => {
+                let _ = tokio::time::timeout(CANCEL_GRACE, &mut tool).await;
+                return CallOutcome::Cancelled;
             }
+            r = tokio::time::timeout(TOOL_TIMEOUT, &mut tool) => match r {
+                Ok(r) => r,
+                Err(_) => {
+                    tool_cancel.cancel();
+                    let _ = tokio::time::timeout(CANCEL_GRACE, &mut tool).await;
+                    Err(CoreError::Timeout(format!(
+                        "{name} did not finish within {} seconds",
+                        TOOL_TIMEOUT.as_secs()
+                    )))
+                }
+            },
         };
         let elapsed_ms = started.elapsed().as_millis() as u64;
         match result {

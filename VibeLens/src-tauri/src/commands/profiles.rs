@@ -51,11 +51,17 @@ pub async fn save_profile(
         *pin = Some(fingerprint);
     }
     let saved = state.profiles.upsert(profile).map_err(err)?;
+    // A new or removed secret must reach the next query: drop the live connection, which
+    // still holds the old one.
+    let rotated = iceberg_secret.is_some() || engine_secret.is_some();
+    // The Trino / Livy password or token is bound to the endpoint it is saved for, and is
+    // deleted when the profile now points elsewhere without a new one (`remote::secret`).
+    vibelens_core::remote::secret::save_engine_secret(state.vault.as_ref(), &saved, engine_secret)
+        .await
+        .map_err(err)?;
     // Iceberg secrets: same semantics as `password` (None = keep, "" = delete).
-    // `engine_secret`: the Trino / Livy password or token.
     for (value, key) in [
         (iceberg_secret, vault_keys::iceberg_secret(&saved.id)),
-        (engine_secret, vault_keys::engine_secret(&saved.id)),
         (s3_access_key_id, vault_keys::s3_access_key_id(&saved.id)),
         (
             s3_secret_access_key,
@@ -110,6 +116,9 @@ pub async fn save_profile(
     for key in saved.unused_vault_keys() {
         state.vault.delete(&key).await.map_err(err)?;
     }
+    if rotated {
+        let _ = state.connections.disconnect(&saved.id).await;
+    }
     Ok(saved)
 }
 
@@ -124,6 +133,7 @@ pub async fn delete_profile(state: State<'_, AppState>, id: String) -> CmdResult
         vault_keys::s3_access_key_id(&id),
         vault_keys::s3_secret_access_key(&id),
         vault_keys::engine_secret(&id),
+        vault_keys::engine_secret_origin(&id),
     ] {
         let _ = state.vault.delete(&key).await;
     }

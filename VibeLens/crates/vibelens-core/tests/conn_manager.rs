@@ -264,7 +264,14 @@ async fn conn_engine_mismatch_is_invalid_and_never_dials() {
     );
     assert!(matches!(
         backend
-            .execute_sql(&vk.id, None, "select 1", true, 10)
+            .execute_sql(
+                &vk.id,
+                None,
+                "select 1",
+                true,
+                10,
+                tokio_util::sync::CancellationToken::new()
+            )
             .await,
         Err(CoreError::Invalid(_))
     ));
@@ -824,9 +831,16 @@ async fn conn_backend_sql_against_unreachable_database_is_a_connection_error_not
     let p = h.profiles.upsert(dead_pg("pg")).unwrap();
     let (_d, be) = backend(&h);
     assert!(
-        be.execute_sql(&p.id, None, "select 1", true, 100)
-            .await
-            .is_err()
+        be.execute_sql(
+            &p.id,
+            None,
+            "select 1",
+            true,
+            100,
+            tokio_util::sync::CancellationToken::new()
+        )
+        .await
+        .is_err()
     );
     assert!(
         be.schema_metadata(&p.id, Some("app"), None, 10)
@@ -834,7 +848,15 @@ async fn conn_backend_sql_against_unreachable_database_is_a_connection_error_not
             .is_err()
     );
     assert!(matches!(
-        be.execute_sql("ghost", None, "select 1", true, 100).await,
+        be.execute_sql(
+            "ghost",
+            None,
+            "select 1",
+            true,
+            100,
+            tokio_util::sync::CancellationToken::new()
+        )
+        .await,
         Err(CoreError::NotFound(_))
     ));
 }

@@ -77,7 +77,23 @@ async fn trino_runs_the_sql_with_the_secret_from_the_vault() {
         json!({"kind": "trino", "url": server.url, "catalog": "lake", "user": "ana",
                "auth": {"kind": "bearer"}, "caCertPath": null}),
     );
-    let deps = deps_with(&vault_keys::engine_secret("p-trino"), "jwt-abc").await;
+    let deps = deps_with("unrelated", "x").await;
+    vibelens_core::remote::secret::save_engine_secret(
+        deps.vault.as_ref(),
+        &p,
+        Some("jwt-abc".into()),
+    )
+    .await
+    .unwrap();
+    // The same token stored without the endpoint it belongs to (or for another one) is not
+    // used: audit 2026-11-21, item 5.
+    let unbound = deps_with(&vault_keys::engine_secret("p-trino"), "jwt-abc").await;
+    let err = IcebergHandle::connect(p.clone(), unbound)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "auth", "{err}");
+    assert_eq!(server.count(), 0);
     let h = IcebergHandle::connect(p, deps).await.unwrap();
     assert!(
         h.describe_target().contains("Trino (127.0.0.1:"),
@@ -128,10 +144,16 @@ async fn a_hand_edited_profile_with_a_cleartext_credential_does_not_connect() {
 
 #[tokio::test]
 async fn closing_a_spark_connection_deletes_its_livy_session() {
-    let server = serve(Arc::new(|req: &Req| {
+    let name = Arc::new(std::sync::Mutex::new(String::new()));
+    let server = serve(Arc::new(move |req: &Req| {
         match (req.method.as_str(), req.path.as_str()) {
-            ("POST", "/sessions") => Resp::json(201, &json!({"id": 9, "state": "starting"})),
-            ("GET", "/sessions/9") => Resp::ok(&json!({"id": 9, "state": "idle"})),
+            ("POST", "/sessions") => {
+                *name.lock().unwrap() = req.json()["name"].as_str().unwrap_or("").to_string();
+                Resp::json(201, &json!({"id": 9, "state": "starting"}))
+            }
+            ("GET", "/sessions/9") => Resp::ok(
+                &json!({"id": 9, "state": "idle", "name": name.lock().unwrap().clone()}),
+            ),
             ("POST", "/sessions/9/statements") => Resp::json(201, &json!({"id": 0})),
             ("GET", "/sessions/9/statements/0") => Resp::ok(&json!({"id": 0, "state": "available",
                 "output": {"status": "ok", "data": {"application/json": {"schema": {"fields": []}, "data": []}}}})),

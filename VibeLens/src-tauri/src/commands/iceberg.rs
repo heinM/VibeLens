@@ -68,7 +68,11 @@ pub async fn ice_execute(
     let opts = options.unwrap_or_default();
     if profile.environment == Environment::Prod
         && !confirmed.unwrap_or(false)
-        && let Some(reason) = super::pg::prod_guard_reason(&sql, opts.read_only)
+        && let Some(reason) = super::pg::prod_guard_reason_on(
+            profile.iceberg.as_ref().map(|o| &o.query_engine),
+            &sql,
+            opts.read_only,
+        )
     {
         return Err(ErrorPayload::new(
             "confirm_required",

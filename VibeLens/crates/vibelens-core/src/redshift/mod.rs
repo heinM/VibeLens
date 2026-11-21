@@ -313,40 +313,66 @@ impl RedshiftEngine {
 
     /// Bounded, materialised execution: the result of the last statement that returns rows
     /// (or of the last statement when none does). Errors are returned as `Err`.
+    ///
+    /// `cancel` stops the run, after `CancelStatement` has been sent for a live statement. The
+    /// run itself is a task of its own, and dropping this future cancels it: the task then
+    /// still sends `CancelStatement` before it ends, so an agent Stop or a timeout higher up
+    /// never leaves a statement running in the warehouse.
     pub async fn execute_collect(
         &self,
         sql: &str,
         database: Option<&str>,
         opts: ExecOptions,
+        cancel: CancellationToken,
     ) -> Result<QueryResult> {
+        /// Cancels the run when the caller's future is dropped.
+        struct CancelOnDrop(CancellationToken);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                self.0.cancel();
+            }
+        }
+
         let statements = crate::sql::split_statements(sql);
         if statements.is_empty() {
             return Ok(QueryResult::default());
         }
         let db = self.database(database)?;
-        let (tx, mut rx) = mpsc::channel::<QueryEvent>(32);
-        let cancel = CancellationToken::new();
-        let session = self.session();
-        let runner = async {
-            let end = session.run(&statements, &db, &opts, &cancel, &tx).await;
-            drop(tx);
-            end
-        };
-        let collector = async {
-            let mut collected = engine::Collector::default();
-            while let Some(ev) = rx.recv().await {
-                collected.push(ev);
+        let run_cancel = cancel.child_token();
+        let _cancel_on_drop = CancelOnDrop(run_cancel.clone());
+        let client = self.client.clone();
+        let ropts = self.opts.clone();
+        let timing = self.timing;
+        let task = tokio::spawn(async move {
+            let session = engine::Session {
+                client: &client,
+                opts: &ropts,
+                timing: &timing,
+            };
+            let (tx, mut rx) = mpsc::channel::<QueryEvent>(32);
+            let runner = async {
+                let end = session.run(&statements, &db, &opts, &run_cancel, &tx).await;
+                drop(tx);
+                end
+            };
+            let collector = async {
+                let mut collected = engine::Collector::default();
+                while let Some(ev) = rx.recv().await {
+                    collected.push(ev);
+                }
+                collected
+            };
+            let (end, collected) = tokio::join!(runner, collector);
+            match end {
+                engine::End::Finished => collected
+                    .into_result()
+                    .ok_or_else(|| CoreError::Other("no statement produced a result".into())),
+                engine::End::Failed { error, .. } => Err(error),
+                engine::End::Gone => Err(CoreError::Other("result collector went away".into())),
             }
-            collected
-        };
-        let (end, collected) = tokio::join!(runner, collector);
-        match end {
-            engine::End::Finished => collected
-                .into_result()
-                .ok_or_else(|| CoreError::Other("no statement produced a result".into())),
-            engine::End::Failed { error, .. } => Err(error),
-            engine::End::Gone => Err(CoreError::Other("result collector went away".into())),
-        }
+        });
+        task.await
+            .unwrap_or_else(|e| Err(CoreError::Other(format!("the Redshift run failed: {e}"))))
     }
 
     /// One `ListDatabases` call of one item: it goes through the whole path (IAM signature,

@@ -380,6 +380,7 @@ impl ToolBackend for FakeBackend {
         sql: &str,
         read_only: bool,
         _max_rows: usize,
+        _cancel: tokio_util::sync::CancellationToken,
     ) -> Result<QueryResult> {
         self.sql_calls.lock().unwrap().push(SqlCall {
             profile: profile_id.into(),

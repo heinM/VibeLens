@@ -34,7 +34,10 @@ use super::common::{
     End, RowBuf, Run, Script, Stop, backoff, cap_cell, collect_script, elapsed_ms, emit,
     sleep_or_cancel, stream_script, which,
 };
-use super::http::{Body, HttpClient, HttpLimits, MAX_ERROR_TEXT, bounded, same_endpoint, shown};
+use super::http::{
+    Body, HttpClient, HttpLimits, MAX_ERROR_TEXT, SMALL_BODY, bounded, same_endpoint, shown,
+};
+use super::livy::MAX_COLUMNS;
 use crate::error::{CoreError, Result};
 use crate::model::*;
 
@@ -111,7 +114,18 @@ impl TrinoEngine {
     /// Bounded, materialised execution: the result of the last statement that returns rows
     /// (or of the last statement when none does). Errors are returned as `Err`.
     pub async fn execute_collect(&self, sql: &str, opts: ExecOptions) -> Result<QueryResult> {
-        collect_script(self, sql, opts).await
+        collect_script(self, sql, opts, CancellationToken::new()).await
+    }
+
+    /// [`execute_collect`](Self::execute_collect) that stops when `cancel` fires, after the
+    /// running query has been deleted on the coordinator.
+    pub async fn execute_collect_cancellable(
+        &self,
+        sql: &str,
+        opts: ExecOptions,
+        cancel: CancellationToken,
+    ) -> Result<QueryResult> {
+        collect_script(self, sql, opts, cancel).await
     }
 
     /// Headers every request carries. Nothing the server sent back is added.
@@ -166,11 +180,10 @@ impl TrinoEngine {
         let res = self
             .drive(first, &mut q, idx, stmt, opts, t0, deadline, cancel, tx)
             .await;
-        // Whatever ended the statement early, do not leave the query running on the cluster.
-        let early = matches!(
-            res,
-            Err(Stop::Gone | Stop::Err(CoreError::Cancelled | CoreError::Timeout(_)))
-        ) || matches!(res, Ok(Done::Truncated));
+        // Whatever ended the statement early (cancel, timeout, truncation, an oversized or
+        // malformed answer, a server error after the retries), do not leave the query running
+        // on the cluster: delete it through the last `nextUri` that passed the checks.
+        let early = !matches!(res, Ok(Done::Complete));
         if early && let Some(next) = q.next_uri.as_ref() {
             self.cancel_best_effort(next).await;
         }
@@ -287,6 +300,13 @@ impl TrinoEngine {
         {
             q.columns_seen = true;
             new = true;
+            if cols.len() > MAX_COLUMNS {
+                return Err(CoreError::Other(format!(
+                    "Trino reported {} columns; VibeLens reads at most {MAX_COLUMNS}",
+                    cols.len()
+                ))
+                .into());
+            }
             // A write (INSERT, CTAS, DELETE, …) reports its count as a one-row result: report
             // it as `rows_affected` instead, as the other engines do.
             q.write = page.get("updateType").is_some_and(Value::is_string);
@@ -326,12 +346,22 @@ impl TrinoEngine {
                 q.dropped_rows = true;
                 break;
             }
-            let values = row.as_array().map(Vec::as_slice).unwrap_or_default();
+            // A row that does not match the columns is refused rather than padded or widened.
+            let values = match row.as_array() {
+                Some(v) if v.len() == q.types.len() => v,
+                _ => {
+                    return Err(CoreError::Other(format!(
+                        "Trino sent a row that does not have {} values",
+                        q.types.len()
+                    ))
+                    .into());
+                }
+            };
             let cells = q
                 .types
                 .iter()
-                .enumerate()
-                .map(|(i, t)| trino_cell(t, values.get(i).cloned().unwrap_or(Value::Null)))
+                .zip(values)
+                .map(|(t, v)| trino_cell(t, v.clone()))
                 .collect();
             buf.push(cells, tx).await?;
             q.row_count += 1;
@@ -378,7 +408,9 @@ impl TrinoEngine {
 
     async fn cancel_best_effort(&self, next: &url::Url) {
         let headers = self.headers();
-        let del = self.client.send(Method::DELETE, next, &headers, None);
+        let del = self
+            .client
+            .send_capped(Method::DELETE, next, &headers, None, SMALL_BODY);
         // Best effort: a failure here must not mask the reason the statement ended.
         match tokio::time::timeout(self.timing.cancel_timeout, del).await {
             Ok(Ok(_)) => {}
@@ -420,6 +452,13 @@ impl TrinoEngine {
         let next = url::Url::parse(raw).map_err(|_| {
             CoreError::Other("Trino returned a nextUri that is not a valid URL".into())
         })?;
+        if !next.username().is_empty() || next.password().is_some() {
+            return Err(CoreError::Other(
+                "Trino returned a nextUri with a user name or password in it; VibeLens does not \
+                 follow it"
+                    .into(),
+            ));
+        }
         if !same_endpoint(self.client.base(), &next) {
             return Err(CoreError::Other(format!(
                 "Trino returned a nextUri on {}, which is not the configured endpoint {}. \
@@ -429,6 +468,19 @@ impl TrinoEngine {
                  from the address the client used",
                 self.client.redact(&shown(&next)),
                 shown(self.client.base())
+            )));
+        }
+        // Same origin is not enough when the coordinator sits under a path on a shared
+        // gateway: only the statement protocol's own URLs are followed.
+        let prefix = format!(
+            "{}/v1/statement/",
+            self.client.base().path().trim_end_matches('/')
+        );
+        if !next.path().starts_with(&prefix) {
+            return Err(CoreError::Other(format!(
+                "Trino returned a nextUri outside {prefix} ({}); VibeLens follows only the \
+                 statement protocol's URLs, because the credential is sent with each request",
+                self.client.redact(&shown(&next))
             )));
         }
         Ok(Some(next))
@@ -451,7 +503,7 @@ impl Script for TrinoEngine {
             };
         }
         if opts.read_only
-            && let Err(error) = crate::athena::check_read_only_as(statements, "Trino")
+            && let Err(error) = check_trino_read_only(statements)
         {
             return End::Failed {
                 statement_index: None,
@@ -527,6 +579,90 @@ impl Query {
     fn more_rows_possible(&self, page: &Value) -> bool {
         self.dropped_rows || page.get("nextUri").is_some_and(Value::is_string)
     }
+}
+
+/// The read-only check for Trino: Athena's (same dialect), plus no table functions. A table
+/// function (`TABLE(pg.system.query(query => '…'))`) runs whatever its connector does, which
+/// for the JDBC connectors includes writes on another database.
+pub fn check_trino_read_only(statements: &[String]) -> Result<()> {
+    crate::athena::check_read_only_as(statements, "Trino")?;
+    for (i, stmt) in statements.iter().enumerate() {
+        if has_table_function(stmt) {
+            return Err(CoreError::PolicyDenied(format!(
+                "read-only run: {}not submitted because it calls a table function (TABLE(…)), \
+                 which can do anything its connector does",
+                which(i, statements.len())
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `stmt` has `TABLE` followed by `(` outside literals, quoted identifiers and
+/// comments. Text that does not scan (an open quote or comment) counts as having one.
+fn has_table_function(stmt: &str) -> bool {
+    let b = stmt.as_bytes();
+    let mut i = 0;
+    let mut last_word = String::new();
+    while i < b.len() {
+        let c = b[i];
+        match c {
+            b'\'' | b'"' => {
+                i += 1;
+                loop {
+                    match b.get(i) {
+                        None => return true,
+                        Some(&q) if q == c && b.get(i + 1) == Some(&c) => i += 2,
+                        Some(&q) if q == c => {
+                            i += 1;
+                            break;
+                        }
+                        Some(_) => i += 1,
+                    }
+                }
+                last_word.clear();
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' && b[i] != b'\r' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                loop {
+                    if i + 1 >= b.len() {
+                        return true;
+                    }
+                    if b[i] == b'*' && b[i + 1] == b'/' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' => {
+                if last_word.eq_ignore_ascii_case("TABLE") {
+                    return true;
+                }
+                last_word.clear();
+                i += 1;
+            }
+            c if c.is_ascii_whitespace() => i += 1,
+            c if c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80 => {
+                let start = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] >= 0x80)
+                {
+                    i += 1;
+                }
+                last_word = String::from_utf8_lossy(&b[start..i]).into_owned();
+            }
+            _ => {
+                last_word.clear();
+                i += 1;
+            }
+        }
+    }
+    false
 }
 
 /// Trino query ids look like `20240131_123456_00001_abcde`. Anything else is not shown.
@@ -674,6 +810,26 @@ mod tests {
         assert_eq!(trino_cell("array(integer)", json!([1, 2])), json!([1, 2]));
         assert_eq!(trino_cell("json", json!("{\"a\":1}")), json!({"a": 1}));
         assert_eq!(trino_cell("varchar", Value::Null), Value::Null);
+    }
+
+    /// Audit 2026-11-21, item 10: a table function runs whatever its connector does.
+    #[test]
+    fn table_functions_are_refused_in_read_only_runs() {
+        for s in [
+            "SELECT * FROM TABLE(pg.system.query(query => 'DELETE FROM accounts RETURNING 1'))",
+            "select * from table ( system.query(query => 'x') )",
+            "SELECT * FROM TABLE /* c */ (x(1))",
+        ] {
+            assert!(check_trino_read_only(&[s.to_string()]).is_err(), "{s}");
+        }
+        for s in [
+            "SELECT * FROM t WHERE note = 'TABLE(x)'",
+            "SELECT \"table\" FROM t",
+            "SHOW TABLES",
+            "SELECT * FROM shop.orders",
+        ] {
+            assert!(check_trino_read_only(&[s.to_string()]).is_ok(), "{s}");
+        }
     }
 
     #[test]

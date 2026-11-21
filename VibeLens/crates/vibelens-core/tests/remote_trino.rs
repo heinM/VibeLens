@@ -594,3 +594,184 @@ async fn a_script_runs_in_order_and_stops_at_the_first_failure() {
         .collect();
     assert_eq!(posts, ["SELECT 1", "SELECT bad"]);
 }
+
+// ---- Audit 2026-11-21 ---------------------------------------------------------------------
+
+/// Item 7: behind a shared gateway the coordinator lives under a path. Without the path check a
+/// hostile coordinator could send the credential to another service on the same host.
+#[tokio::test]
+async fn a_next_uri_outside_the_statement_protocol_is_never_requested() {
+    for (case, next) in [
+        ("other service", "/other-service/admin/x"),
+        ("sibling of the prefix", "/trino-admin/v1/statement/x/1"),
+        ("query API", "/trino/v1/query/q"),
+        ("user info", "USERINFO"),
+    ] {
+        let next = next.to_string();
+        let (server, _) = trino(move |base, req| match req.method.as_str() {
+            "POST" if req.path == "/trino/v1/statement" => {
+                let uri = if next == "USERINFO" {
+                    base.replace("http://", "http://u:p@") + "/trino/v1/statement/x/1"
+                } else {
+                    format!("{base}{next}")
+                };
+                Resp::ok(&page("q", Some(uri), "QUEUED"))
+            }
+            _ => Resp::ok(&page("q", None, "FINISHED")),
+        })
+        .await;
+        let e = engine(&format!("{}/trino/", server.url));
+        let events = stream(&e, "SELECT 1", opts()).await;
+        let (_, _, msg) = failure(&events);
+        assert!(msg.contains("nextUri"), "{case}: {msg}");
+        assert_eq!(server.count(), 1, "{case}: only the POST");
+    }
+    // The protocol's own URLs under the prefix are followed.
+    let (server, _) = trino(|base, req| match req.method.as_str() {
+        "POST" => Resp::ok(&page(
+            "q",
+            Some(format!("{base}/trino/v1/statement/executing/q/s/1")),
+            "QUEUED",
+        )),
+        _ => Resp::ok(&page("q", None, "FINISHED")),
+    })
+    .await;
+    let events = stream(
+        &engine(&format!("{}/trino", server.url)),
+        "SELECT 1",
+        opts(),
+    )
+    .await;
+    assert_eq!(kinds(&events).last(), Some(&"finished"), "{events:#?}");
+}
+
+/// Item 10: every early exit deletes the query, not only cancel, timeout and truncation.
+/// Without it an oversized or malformed answer, or a coordinator that keeps failing, would
+/// leave the query running on the cluster.
+#[tokio::test]
+async fn every_early_exit_deletes_the_query() {
+    for case in ["oversized", "bad json", "503 after retries"] {
+        let (server, _) = trino(move |base, req| match req.method.as_str() {
+            "POST" => Resp::ok(&page(
+                "q",
+                Some(format!("{base}/v1/statement/x/1")),
+                "QUEUED",
+            )),
+            "DELETE" => Resp::text(204, ""),
+            _ => match case {
+                "oversized" => Resp::ok(&json!({"pad": "x".repeat(8000)})),
+                "bad json" => Resp::text(200, "this is not json"),
+                _ => Resp::text(503, "busy"),
+            },
+        })
+        .await;
+        let e = TrinoEngine::with_limits(
+            config(&server.url),
+            Some(SecretString::from(PASSWORD.to_string())),
+            HttpLimits {
+                max_body_bytes: 4096,
+                ..HttpLimits::default()
+            },
+        )
+        .unwrap()
+        .with_timing(timing());
+        let events = stream(&e, "SELECT 1", opts()).await;
+        failure(&events);
+        assert_eq!(
+            server.calls("DELETE", "/v1/statement/x/1").len(),
+            1,
+            "{case}"
+        );
+    }
+}
+
+/// Item 9: a declared column count is bounded and a row must match the columns.
+#[tokio::test]
+async fn columns_are_capped_and_rows_must_match_them() {
+    for case in ["too many columns", "short row", "long row"] {
+        let (server, _) = trino(move |base, req| match req.method.as_str() {
+            "POST" => Resp::ok(&page(
+                "q",
+                Some(format!("{base}/v1/statement/x/1")),
+                "QUEUED",
+            )),
+            "DELETE" => Resp::text(204, ""),
+            _ => {
+                let mut p = page("q", Some(format!("{base}/v1/statement/x/2")), "RUNNING");
+                let n = if case == "too many columns" { 2001 } else { 2 };
+                p["columns"] = Value::Array(
+                    (0..n)
+                        .map(|i| json!({"name": format!("c{i}"), "type": "integer"}))
+                        .collect(),
+                );
+                p["data"] = match case {
+                    "short row" => json!([[1]]),
+                    "long row" => json!([[1, 2, 3]]),
+                    _ => json!([]),
+                };
+                Resp::ok(&p)
+            }
+        })
+        .await;
+        let events = stream(&engine(&server.url), "SELECT * FROM t", opts()).await;
+        let (_, _, msg) = failure(&events);
+        assert!(
+            msg.contains("column") || msg.contains("values"),
+            "{case}: {msg}"
+        );
+        let deletes = server.all().iter().filter(|r| r.method == "DELETE").count();
+        assert_eq!(deletes, 1, "{case}");
+    }
+}
+
+/// Item 6: the bounded run the agent uses deletes the query when its token fires, before it
+/// returns.
+#[tokio::test]
+async fn cancelling_a_collect_run_deletes_the_query() {
+    let (server, _) = trino(|base, req| match req.method.as_str() {
+        "POST" => Resp::ok(&page(
+            "q",
+            Some(format!("{base}/v1/statement/x/1")),
+            "QUEUED",
+        )),
+        "DELETE" => Resp::text(204, ""),
+        _ => Resp::ok(&page(
+            "q",
+            Some(format!("{base}/v1/statement/x/1")),
+            "RUNNING",
+        ))
+        .after(Duration::from_millis(20)),
+    })
+    .await;
+    let e = engine(&server.url);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let c = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        c.cancel();
+    });
+    let err = e
+        .execute_collect_cancellable("SELECT * FROM big", ExecOptions::default(), cancel)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CoreError::Cancelled), "{err:?}");
+    assert_eq!(server.calls("DELETE", "/v1/statement/x/1").len(), 1);
+}
+
+/// Item 10: a table function in a read-only run is refused before any request.
+#[tokio::test]
+async fn table_functions_are_refused_before_any_request() {
+    let (server, _) = trino(|_, _| Resp::ok(&page("q", None, "FINISHED"))).await;
+    let ro = ExecOptions {
+        read_only: true,
+        ..opts()
+    };
+    let events = stream(
+        &engine(&server.url),
+        "SELECT * FROM TABLE(pg.system.query(query => 'DELETE FROM accounts RETURNING 1'))",
+        ro,
+    )
+    .await;
+    assert_eq!(failure(&events).1, "policy_denied");
+    assert_eq!(server.count(), 0);
+}

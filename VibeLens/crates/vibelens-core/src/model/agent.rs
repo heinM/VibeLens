@@ -151,6 +151,11 @@ pub struct ApprovalTarget {
     pub default_database: Option<String>,
     /// Valkey: the logical database number. `None` for other engines.
     pub valkey_db: Option<u8>,
+    /// More about where it runs, resolved from the profile (never from the model), no
+    /// credentials. Trino / Spark: engine, host:port, URL path prefix, catalog, default
+    /// namespace and the acting user. `None` when there is nothing to add.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

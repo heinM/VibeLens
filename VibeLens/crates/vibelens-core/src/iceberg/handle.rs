@@ -20,7 +20,7 @@ use crate::error::{CoreError, Result};
 use crate::model::{
     ConnectionProfile, EngineKind, ExecOptions, ExpireSnapshotsResult, IcebergCatalog,
     IcebergNamespace, IcebergObjectKind, IcebergOptions, IcebergQueryEngine, IcebergTableInfo,
-    IcebergTableRef, QueryEvent, QueryResult, SchemaMetadata, TableDescription, vault_keys,
+    IcebergTableRef, QueryEvent, QueryResult, SchemaMetadata, TableDescription,
 };
 use crate::remote::{SparkConfig, SparkEngine, TrinoConfig, TrinoEngine};
 
@@ -47,11 +47,16 @@ impl RemoteEngine {
         }
     }
 
-    async fn execute_collect(&self, sql: &str, opts: ExecOptions) -> Result<QueryResult> {
+    async fn execute_collect(
+        &self,
+        sql: &str,
+        opts: ExecOptions,
+        cancel: CancellationToken,
+    ) -> Result<QueryResult> {
         match self {
-            RemoteEngine::Athena(e) => e.execute_collect(sql, opts).await,
-            RemoteEngine::Trino(e) => e.execute_collect(sql, opts).await,
-            RemoteEngine::Spark(e) => e.execute_collect(sql, opts).await,
+            RemoteEngine::Athena(e) => e.execute_collect_cancellable(sql, opts, cancel).await,
+            RemoteEngine::Trino(e) => e.execute_collect_cancellable(sql, opts, cancel).await,
+            RemoteEngine::Spark(e) => e.execute_collect_cancellable(sql, opts, cancel).await,
         }
     }
 }
@@ -394,9 +399,22 @@ impl IcebergHandle {
     /// Bounded, materialised execution: the result of the last statement that returns rows
     /// (or of the last statement when none does). Errors are returned as `Err`.
     pub async fn execute_collect(&self, sql: &str, opts: ExecOptions) -> Result<QueryResult> {
+        self.execute_collect_cancellable(sql, opts, CancellationToken::new())
+            .await
+    }
+
+    /// [`execute_collect`](Self::execute_collect) that stops when `cancel` fires; a remote
+    /// engine first stops the work on the server (Athena StopQueryExecution, Trino DELETE, Livy
+    /// statement cancel).
+    pub async fn execute_collect_cancellable(
+        &self,
+        sql: &str,
+        opts: ExecOptions,
+        cancel: CancellationToken,
+    ) -> Result<QueryResult> {
         self.touch();
         if let Some(a) = &self.remote {
-            return a.execute_collect(sql, opts).await;
+            return a.execute_collect(sql, opts, cancel).await;
         }
         let statements = split_statements(sql);
         if statements.is_empty() {
@@ -404,7 +422,6 @@ impl IcebergHandle {
         }
         let engine = self.local_engine().await?;
         let (tx, mut rx) = mpsc::channel::<QueryEvent>(32);
-        let cancel = CancellationToken::new();
         let runner = async {
             let end = engine.run(&statements, &opts, &cancel, &tx).await;
             drop(tx);
@@ -567,13 +584,17 @@ async fn http_engine(
     opts: &IcebergOptions,
     deps: &IcebergDeps,
 ) -> Result<Option<RemoteEngine>> {
+    // Only when it was saved for this very endpoint (see `remote::secret`).
     let secret = match &opts.query_engine {
         IcebergQueryEngine::Trino { auth, .. } | IcebergQueryEngine::Spark { auth, .. }
             if auth.uses_secret() =>
         {
-            deps.vault
-                .get(&vault_keys::engine_secret(profile_id))
-                .await?
+            crate::remote::secret::load_engine_secret(
+                deps.vault.as_ref(),
+                profile_id,
+                &opts.query_engine,
+            )
+            .await?
         }
         _ => None,
     };
