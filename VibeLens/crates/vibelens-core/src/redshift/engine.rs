@@ -130,7 +130,7 @@ impl Session<'_> {
         cancel: &CancellationToken,
         tx: &mpsc::Sender<QueryEvent>,
     ) -> End {
-        let checked = check::check_no_transaction_control(statements).and_then(|()| {
+        let checked = check::check_script(statements).and_then(|()| {
             if opts.read_only {
                 check::check_read_only(statements)
             } else {
@@ -223,10 +223,13 @@ impl Session<'_> {
         cancel: &CancellationToken,
         tx: &mpsc::Sender<QueryEvent>,
     ) -> Run<()> {
-        let deadline = opts.timeout_ms.map(|ms| t0 + Duration::from_millis(ms));
-        let desc = self
-            .wait_done(id, deadline, opts.timeout_ms, cancel)
-            .await?;
+        // No run polls without a deadline: without a timeout of its own a statement gets the
+        // default ceiling, and is cancelled on the server when it passes.
+        let limit = opts
+            .timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(self.timing.default_timeout);
+        let desc = self.wait_done(id, t0 + limit, limit, cancel, tx).await?;
 
         let sum = if desc.has_result_set() == Some(true) {
             self.read_results(id, idx, opts, cancel, tx).await?
@@ -273,9 +276,10 @@ impl Session<'_> {
     async fn wait_done(
         &self,
         id: &str,
-        deadline: Option<Instant>,
-        timeout_ms: Option<u64>,
+        deadline: Instant,
+        limit: Duration,
         cancel: &CancellationToken,
+        tx: &mpsc::Sender<QueryEvent>,
     ) -> Run<DescribeStatementOutput> {
         let mut delay = self.timing.poll_initial;
         loop {
@@ -301,14 +305,21 @@ impl Session<'_> {
                     .into());
                 }
             }
-            if deadline.is_some_and(|d| Instant::now() >= d) {
+            if Instant::now() >= deadline {
                 return Err(CoreError::Timeout(format!(
                     "Redshift statement still running after {} ms; cancelled it",
-                    timeout_ms.unwrap_or_default()
+                    limit.as_millis()
                 ))
                 .into());
             }
-            sleep_or_cancel(delay, cancel).await?;
+            // A closed result channel (the window was closed, the caller went away) ends the
+            // wait at once: `run_statement` then cancels the statement on the server.
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(Stop::Err(CoreError::Cancelled)),
+                _ = tx.closed() => return Err(Stop::Gone),
+                _ = tokio::time::sleep(delay) => {}
+            }
             delay = (delay * 2).min(self.timing.poll_max);
         }
     }

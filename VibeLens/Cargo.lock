@@ -10021,6 +10021,7 @@ dependencies = [
  "typetag",
  "url",
  "uuid",
+ "vibelens-core",
  "windows-native-keyring-store",
  "zeroize",
 ]

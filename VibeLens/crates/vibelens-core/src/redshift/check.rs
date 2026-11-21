@@ -1,123 +1,35 @@
 //! What may be submitted to Redshift, decided before any request is made.
 //!
 //! The Data API runs every statement in its own session and commits it on its own, and it has
-//! no way to make a session read-only. So two checks run over the whole script first:
+//! no way to make a session read-only. So these checks run over the whole script first:
 //!
+//! * **One meaning only** ([`check_script`], every mode). Redshift reads `\'` inside `'…'` as an
+//!   escaped quote; the PostgreSQL-dialect splitter and classifier read `'\'` as a whole string.
+//!   A statement where the two readings differ is refused, and so is a statement that still holds
+//!   a top-level `;` after splitting, so what is classified is what Redshift runs, one statement
+//!   per request.
 //! * **Transaction control is refused in every mode.** `BEGIN … COMMIT` would look atomic and
 //!   not be: each statement has already committed by the time the next one starts.
 //! * **A read-only run submits only statements that are provably reads (R5).** The
 //!   PostgreSQL-dialect classifier must parse a statement and class it read-only; Redshift's
-//!   `SHOW …` forms that the parser does not know are admitted by a narrow text check. Anything
-//!   else, including text that does not parse, is refused.
+//!   `SHOW …` forms that the parser does not know are admitted by a narrow text check. On top of
+//!   that every function call must be a Redshift built-in known to only read
+//!   ([`unknown_function`]): nothing else (no READ ONLY transaction) would stop a Lambda UDF or a
+//!   SageMaker model function from sending row data out. Anything else is refused.
 
+use super::lex::{Lexed, Tok, lex};
 use crate::error::{CoreError, Result};
 use crate::sql::{StatementClass, classify};
 
-/// Words of `stmt`, upper-cased, outside comments, string literals and quoted identifiers, plus
-/// whether the text has anything the narrow check refuses to reason about.
-struct Words {
-    words: Vec<String>,
-    has_comment: bool,
-    has_semicolon: bool,
-    has_dollar_quote: bool,
-    balanced: bool,
-}
-
-fn words(sql: &str) -> Words {
-    let b = sql.as_bytes();
-    let mut out = Words {
-        words: Vec::new(),
-        has_comment: false,
-        has_semicolon: false,
-        has_dollar_quote: false,
-        balanced: true,
-    };
-    let mut i = 0;
-    while i < b.len() {
-        let c = b[i];
-        match c {
-            b'-' if b.get(i + 1) == Some(&b'-') => {
-                out.has_comment = true;
-                while i < b.len() && b[i] != b'\n' && b[i] != b'\r' {
-                    i += 1;
-                }
-            }
-            b'/' if b.get(i + 1) == Some(&b'*') => {
-                out.has_comment = true;
-                // Block comments nest in PostgreSQL and Redshift.
-                let mut depth = 1;
-                i += 2;
-                while depth > 0 {
-                    if i + 1 >= b.len() {
-                        out.balanced = false;
-                        i = b.len();
-                        break;
-                    }
-                    if b[i] == b'/' && b[i + 1] == b'*' {
-                        depth += 1;
-                        i += 2;
-                    } else if b[i] == b'*' && b[i + 1] == b'/' {
-                        depth -= 1;
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            b'\'' | b'"' => {
-                i += 1;
-                loop {
-                    match b.get(i) {
-                        None => {
-                            out.balanced = false;
-                            break;
-                        }
-                        Some(&q) if q == c => {
-                            if b.get(i + 1) == Some(&c) {
-                                i += 2;
-                            } else {
-                                i += 1;
-                                break;
-                            }
-                        }
-                        // `\'` inside a literal: Redshift accepts backslash escapes.
-                        Some(b'\\') if c == b'\'' => i += 2,
-                        Some(_) => i += 1,
-                    }
-                }
-            }
-            b'$' => {
-                out.has_dollar_quote = true;
-                i += 1;
-            }
-            b';' => {
-                out.has_semicolon = true;
-                i += 1;
-            }
-            _ if c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80 => {
-                let start = i;
-                while i < b.len()
-                    && (b[i].is_ascii_alphanumeric()
-                        || b[i] == b'_'
-                        || b[i] == b'$'
-                        || b[i] >= 0x80)
-                {
-                    i += 1;
-                }
-                out.words
-                    .push(String::from_utf8_lossy(&b[start..i]).to_ascii_uppercase());
-            }
-            _ => i += 1,
-        }
-    }
-    out
+fn words(stmt: &str) -> Vec<String> {
+    lex(stmt, true).words_upper()
 }
 
 /// The transaction-control keyword `stmt` starts with, if any: `BEGIN`, `START TRANSACTION`,
 /// `COMMIT`, `END`, `ROLLBACK`, `ABORT`, and the savepoint statements that only make sense
 /// inside a transaction.
 fn transaction_control(stmt: &str) -> Option<String> {
-    let w = words(stmt).words;
+    let w = words(stmt);
     let first = w.first()?.as_str();
     match first {
         "BEGIN" | "COMMIT" | "END" | "ROLLBACK" | "ABORT" | "SAVEPOINT" => Some(first.to_string()),
@@ -155,16 +67,400 @@ pub(crate) fn check_no_transaction_control(statements: &[String]) -> Result<()> 
     Ok(())
 }
 
+/// Refuses a statement that Redshift and the PostgreSQL-dialect splitter and classifier could
+/// read differently: a backslash inside a `'…'` literal under either reading, or a `;` left at the
+/// top level after splitting.
+pub(crate) fn check_unambiguous(statements: &[String]) -> Result<()> {
+    for (i, stmt) in statements.iter().enumerate() {
+        if lex(stmt, false).backslash_in_string() || lex(stmt, true).backslash_in_string() {
+            return Err(CoreError::PolicyDenied(format!(
+                "{}a string literal contains a backslash. Redshift reads \\' inside a string \
+                 as an escaped quote while standard SQL reads '\\' as a complete string, so \
+                 VibeLens cannot tell what this statement would do and does not run it. Write a \
+                 quote inside a string by doubling it ('it''s'), and a backslash as CHR(92)",
+                which(i, statements.len())
+            )));
+        }
+        if lex(stmt, true).toks.contains(&Tok::Punct(';')) {
+            return Err(CoreError::PolicyDenied(format!(
+                "{}the statement still contains a ';' after the script was split, so Redshift \
+                 could run more than one statement in one request. Separate statements at the \
+                 top level only",
+                which(i, statements.len())
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Every check that applies in every mode: one meaning only, no transaction control.
+pub(crate) fn check_script(statements: &[String]) -> Result<()> {
+    check_unambiguous(statements)?;
+    check_no_transaction_control(statements)
+}
+
 /// `SHOW …` with nothing the narrow check cannot reason about. Every Redshift `SHOW` form
 /// (`SHOW TABLES FROM SCHEMA db.s`, `SHOW COLUMNS FROM TABLE db.s.t`, `SHOW DATABASES`,
 /// `SHOW VIEW v`, `SHOW TABLE t`, `SHOW GRANTS …`, `SHOW <parameter>`) only reads.
 fn is_plain_show(stmt: &str) -> bool {
-    let w = words(stmt);
-    !w.has_comment
-        && !w.has_semicolon
-        && !w.has_dollar_quote
-        && w.balanced
-        && w.words.first().is_some_and(|f| f == "SHOW")
+    let l = lex(stmt, true);
+    !l.has_comment
+        && !l.unbalanced
+        && !l.toks.contains(&Tok::Punct(';'))
+        && !l.toks.contains(&Tok::Punct('$'))
+        && matches!(l.toks.first(), Some(Tok::Word(w)) if w == "show")
+}
+
+/// Words that are followed by `(` without being a function call: keywords and type names with
+/// a length or precision.
+const PAREN_KEYWORDS: &[&str] = &[
+    "all",
+    "and",
+    "any",
+    "array",
+    "as",
+    "between",
+    "by",
+    "case",
+    "distinct",
+    "else",
+    "except",
+    "exists",
+    "filter",
+    "from",
+    "group",
+    "having",
+    "ilike",
+    "in",
+    "intersect",
+    "is",
+    "join",
+    "lateral",
+    "like",
+    "limit",
+    "minus",
+    "not",
+    "offset",
+    "on",
+    "or",
+    "order",
+    "over",
+    "partition",
+    "pivot",
+    "qualify",
+    "select",
+    "similar",
+    "some",
+    "then",
+    "top",
+    "union",
+    "unpivot",
+    "using",
+    "values",
+    "when",
+    "where",
+    "with",
+    "within",
+    // Types: `CAST(x AS varchar(20))`, `x::numeric(12, 2)`.
+    "binary",
+    "bpchar",
+    "char",
+    "character",
+    "decimal",
+    "float",
+    "interval",
+    "nchar",
+    "numeric",
+    "nvarchar",
+    "time",
+    "timestamp",
+    "timestamptz",
+    "timetz",
+    "varbinary",
+    "varbyte",
+    "varchar",
+];
+
+/// Redshift built-in SQL functions that only read, by category of the Redshift SQL reference:
+/// aggregate, window, conditional, date and time, math, string, JSON, SUPER, VARBYTE, type
+/// conversion, hash, and the system information functions that only read. Anything that
+/// changes state (`change_*_priority`, `pg_cancel_backend`, `pg_terminate_backend`,
+/// `set_config`, …), spatial functions and every user-defined, Python, Lambda or SageMaker
+/// function are left out on purpose.
+const READ_ONLY_FUNCTIONS: &[&str] = &[
+    // Aggregate.
+    "any_value",
+    "approximate",
+    "avg",
+    "bit_and",
+    "bit_or",
+    "bool_and",
+    "bool_or",
+    "count",
+    "listagg",
+    "max",
+    "median",
+    "min",
+    "percentile_cont",
+    "percentile_disc",
+    "stddev",
+    "stddev_pop",
+    "stddev_samp",
+    "sum",
+    "var_pop",
+    "var_samp",
+    "variance",
+    // Window.
+    "cume_dist",
+    "dense_rank",
+    "first_value",
+    "lag",
+    "last_value",
+    "lead",
+    "nth_value",
+    "ntile",
+    "percent_rank",
+    "rank",
+    "ratio_to_report",
+    "row_number",
+    // Conditional.
+    "coalesce",
+    "decode",
+    "greatest",
+    "least",
+    "nullif",
+    "nvl",
+    "nvl2",
+    // Date and time.
+    "add_months",
+    "convert_timezone",
+    "current_date",
+    "date",
+    "date_add",
+    "date_cmp",
+    "date_cmp_timestamp",
+    "date_cmp_timestamptz",
+    "date_part",
+    "date_part_year",
+    "date_trunc",
+    "dateadd",
+    "datediff",
+    "datepart",
+    "extract",
+    "getdate",
+    "interval_cmp",
+    "last_day",
+    "months_between",
+    "next_day",
+    "timeofday",
+    "timestamp_cmp",
+    "timestamp_cmp_date",
+    "timestamp_cmp_timestamptz",
+    "timestamptz_cmp",
+    "timestamptz_cmp_date",
+    "timestamptz_cmp_timestamp",
+    "timezone",
+    "to_timestamp",
+    "trunc",
+    // Math.
+    "abs",
+    "acos",
+    "asin",
+    "atan",
+    "atan2",
+    "cbrt",
+    "ceil",
+    "ceiling",
+    "cos",
+    "cot",
+    "degrees",
+    "dexp",
+    "dlog1",
+    "dlog10",
+    "exp",
+    "floor",
+    "ln",
+    "log",
+    "mod",
+    "pi",
+    "pow",
+    "power",
+    "radians",
+    "random",
+    "round",
+    "sign",
+    "sin",
+    "sqrt",
+    "tan",
+    // String.
+    "ascii",
+    "bpcharcmp",
+    "btrim",
+    "bttext_pattern_cmp",
+    "char_length",
+    "character_length",
+    "charindex",
+    "chr",
+    "collate",
+    "concat",
+    "difference",
+    "initcap",
+    "left",
+    "len",
+    "length",
+    "lower",
+    "lpad",
+    "ltrim",
+    "octet_length",
+    "oct_length",
+    "position",
+    "quote_ident",
+    "quote_literal",
+    "regexp_count",
+    "regexp_instr",
+    "regexp_replace",
+    "regexp_substr",
+    "repeat",
+    "replace",
+    "replicate",
+    "reverse",
+    "right",
+    "rpad",
+    "rtrim",
+    "soundex",
+    "split_part",
+    "strpos",
+    "strtol",
+    "substr",
+    "substring",
+    "textlen",
+    "translate",
+    "trim",
+    "upper",
+    // JSON.
+    "can_json_parse",
+    "is_valid_json",
+    "is_valid_json_array",
+    "json_array_length",
+    "json_extract_array_element_text",
+    "json_extract_path_text",
+    "json_parse",
+    "json_serialize",
+    "json_serialize_to_varbyte",
+    "json_typeof",
+    // SUPER.
+    "array_concat",
+    "array_flatten",
+    "get_array_length",
+    "is_array",
+    "is_bigint",
+    "is_boolean",
+    "is_char",
+    "is_decimal",
+    "is_float",
+    "is_integer",
+    "is_object",
+    "is_scalar",
+    "is_smallint",
+    "is_varchar",
+    "object",
+    "object_transform",
+    "split_to_array",
+    "subarray",
+    // VARBYTE.
+    "from_hex",
+    "from_varbyte",
+    "getbit",
+    "to_varbyte",
+    // Type conversion and formatting.
+    "cast",
+    "convert",
+    "text_to_int_alt",
+    "text_to_numeric_alt",
+    "to_char",
+    "to_date",
+    "to_hex",
+    "to_number",
+    // Hash.
+    "checksum",
+    "crc32",
+    "farmfingerprint64",
+    "fnv_hash",
+    "func_sha1",
+    "md5",
+    "sha",
+    "sha1",
+    "sha2",
+    // System information that only reads.
+    "current_database",
+    "current_schema",
+    "current_schemas",
+    "current_setting",
+    "current_user_id",
+    "has_assumerole_privilege",
+    "has_column_privilege",
+    "has_database_privilege",
+    "has_function_privilege",
+    "has_language_privilege",
+    "has_schema_privilege",
+    "has_table_privilege",
+    "pg_backend_pid",
+    "pg_get_cols",
+    "pg_get_late_binding_view_cols",
+    "pg_last_copy_count",
+    "pg_last_copy_id",
+    "pg_last_query_id",
+    "pg_last_unload_count",
+    "pg_last_unload_id",
+    "slice_num",
+    "version",
+];
+
+/// The first call in `stmt` (Redshift reading) to a function that is not a Redshift built-in
+/// known to only read, as `name()` or `schema.name()`. A call qualified with any schema but
+/// `pg_catalog` counts, whatever its name: built-ins live in `pg_catalog`, so anything else is a
+/// user-defined (possibly Lambda or SageMaker) function. A quoted name must match a built-in
+/// exactly, because with case-sensitive identifiers `"LOWER"` is not `lower`.
+fn first_unknown_call(l: &Lexed) -> Option<String> {
+    let t = &l.toks;
+    for k in 0..t.len() {
+        if t.get(k + 1) != Some(&Tok::Punct('(')) {
+            continue;
+        }
+        let name = match &t[k] {
+            Tok::Word(w) => w.clone(),
+            Tok::QuotedIdent(q) => q.clone(),
+            _ => continue,
+        };
+        let schema = if k >= 2 && t[k - 1] == Tok::Punct('.') {
+            match &t[k - 2] {
+                Tok::Word(s) => Some(s.clone()),
+                Tok::QuotedIdent(s) => Some(s.clone()),
+                _ => Some(String::new()),
+            }
+        } else {
+            None
+        };
+        match schema.as_deref() {
+            Some("pg_catalog") | None => {}
+            Some(s) => return Some(format!("{s}.{name}()")),
+        }
+        let keyword = schema.is_none()
+            && matches!(t[k], Tok::Word(_))
+            && PAREN_KEYWORDS.contains(&name.as_str());
+        if !keyword && !READ_ONLY_FUNCTIONS.contains(&name.as_str()) {
+            return Some(format!("{name}()"));
+        }
+    }
+    None
+}
+
+/// The first function call in `statements` that a Redshift read-only run refuses (see
+/// [`first_unknown_call`]), with its statement prefix.
+pub(crate) fn unknown_function(statements: &[String]) -> Option<String> {
+    statements.iter().enumerate().find_map(|(i, s)| {
+        first_unknown_call(&lex(s, true)).map(|f| format!("{}{f}", which(i, statements.len())))
+    })
 }
 
 /// Refuses anything that is not provably a read. Fails closed.
@@ -189,12 +485,20 @@ pub(crate) fn check_read_only(statements: &[String]) -> Result<()> {
             )));
         }
     }
+    if let Some(f) = unknown_function(statements) {
+        return Err(CoreError::PolicyDenied(format!(
+            "read-only run: {f} is not a Redshift built-in function known to only read. A \
+             user-defined, Lambda or SageMaker function can change data or send row values out \
+             of the warehouse, and Redshift has no read-only session to stop it, so the \
+             statement is not run read-only. It can be run with approval instead"
+        )));
+    }
     Ok(())
 }
 
 /// A short command tag for `StatementDone`: `SELECT`, `INSERT`, `CREATE TABLE`, …
 pub(crate) fn command_tag(stmt: &str) -> Option<String> {
-    let w = words(stmt).words;
+    let w = words(stmt);
     let first = w.first()?.as_str();
     match first {
         "CREATE" | "DROP" | "ALTER" => {
@@ -227,6 +531,56 @@ mod tests {
 
     fn stmts(sql: &str) -> Vec<String> {
         crate::sql::split_statements(sql)
+    }
+
+    /// The two payloads of the 2026-11 audit (HIGH 1). The classifier reads the first as a
+    /// SELECT of two literals; Redshift runs `SELECT … INTO public.pwned FROM secrets`. The
+    /// second hides `pg_terminate_backend` the same way.
+    const BACKSLASH_PAYLOADS: [&str; 2] = [
+        r"SELECT '\' , ' AS x INTO public.pwned FROM secrets -- '",
+        r"SELECT '\' , ' , pg_terminate_backend(123) -- '",
+    ];
+
+    #[test]
+    fn backslash_payloads_are_refused_in_every_mode() {
+        for sql in BACKSLASH_PAYLOADS {
+            // Without the check the classifier calls it a plain SELECT.
+            assert_eq!(classify(sql).overall, StatementClass::ReadOnly, "{sql}");
+            let m = check_script(&stmts(sql)).unwrap_err().to_string();
+            assert!(m.contains("backslash") && m.contains("CHR(92)"), "{m}");
+        }
+        for sql in [
+            r"SELECT 'a\b'",
+            r"SELECT 'x' || '\'",
+            r"SELECT E'\''",
+            r"UPDATE t SET a = 'C:\temp'",
+        ] {
+            assert!(check_script(&stmts(sql)).is_err(), "{sql}");
+        }
+        // Backslashes outside string literals, and doubled quotes, are fine.
+        for sql in [
+            "SELECT 'it''s', chr(92)",
+            r#"SELECT "a\b" FROM t"#,
+            "SELECT 1 -- a \\ comment",
+            "CREATE FUNCTION f() RETURNS int AS $$ select 1 $$ LANGUAGE sql",
+        ] {
+            check_script(&stmts(sql)).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_split_statement_never_holds_a_top_level_semicolon() {
+        // The splitter would never produce these, but a statement handed over unsplit must not
+        // carry a second one.
+        let m = check_unambiguous(&["SELECT 1; DROP TABLE t".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(m.contains("';'"), "{m}");
+        check_unambiguous(&["SELECT ';'".to_string()]).unwrap();
+        check_unambiguous(&[
+            "CREATE PROCEDURE p() AS $$ BEGIN NULL; END; $$ LANGUAGE plpgsql".to_string(),
+        ])
+        .unwrap();
     }
 
     #[test]
@@ -267,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_admits_queries_and_show_forms() {
+    fn read_only_admits_queries_built_ins_and_show_forms() {
         for sql in [
             "SELECT 1",
             "WITH a AS (SELECT 1) SELECT * FROM a",
@@ -278,8 +632,48 @@ mod tests {
             "SHOW COLUMNS FROM TABLE dev.public.sales",
             "SHOW DATABASES",
             "SHOW VIEW public.v",
+            "SELECT count(*), sum(x), date_trunc('day', at), lower(name) FROM s GROUP BY 3, 4",
+            "SELECT CAST(x AS varchar(20)), x::numeric(12, 2), pg_catalog.lower(n) FROM t",
+            "SELECT row_number() OVER (PARTITION BY a ORDER BY b) FROM t WHERE a IN (1, 2)",
+            "SELECT json_extract_path_text(doc, 'a'), COALESCE(a, b) FROM t \
+             WHERE EXISTS (SELECT 1 FROM u)",
+            "SELECT \"name\" FROM t",
         ] {
             check_read_only(&stmts(sql)).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+    }
+
+    /// HIGH-adjacent finding 2: nothing on Redshift stops a function the classifier does not
+    /// know, so a read-only run refuses every call that is not a read-only built-in.
+    #[test]
+    fn read_only_refuses_unknown_and_schema_qualified_functions() {
+        for (sql, f) in [
+            ("SELECT f_notify(card_number) FROM payments", "f_notify()"),
+            ("SELECT public.f(x) FROM t", "public.f()"),
+            ("SELECT myschema.lower(x) FROM t", "myschema.lower()"),
+            ("SELECT \"LOWER\"(x) FROM t", "LOWER()"),
+            (
+                "SELECT change_query_priority(1, 'high')",
+                "change_query_priority()",
+            ),
+            (
+                "SELECT change_session_priority(1, 'high')",
+                "change_session_priority()",
+            ),
+            (
+                "SELECT change_user_priority('u', 'high')",
+                "change_user_priority()",
+            ),
+            ("SELECT reboot_cluster()", "reboot_cluster()"),
+            ("SELECT x FROM generate_series(1, 3)", "generate_series()"),
+        ] {
+            let m = check_read_only(&stmts(sql)).unwrap_err().to_string();
+            // The admin functions are on the general deny-list too, so the classifier already
+            // names them; everything else gets the built-in allow-list's message.
+            assert!(m.contains(f), "{sql}: {m}");
+            if !f.starts_with("change_") && !f.starts_with("reboot") {
+                assert!(m.contains("with approval"), "{sql}: {m}");
+            }
         }
     }
 

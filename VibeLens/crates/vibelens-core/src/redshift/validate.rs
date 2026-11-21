@@ -41,7 +41,19 @@ pub fn validate_options(o: &RedshiftOptions) -> Result<()> {
             }
             db_user_ok(db_user)?;
         }
-        RedshiftAuth::Secret { secret_arn } => secret_arn_ok(secret_arn)?,
+        RedshiftAuth::Secret { secret_arn } => {
+            secret_arn_ok(secret_arn)?;
+            // The Data API reads the secret in the profile's region; an ARN for another region
+            // would be signed and sent to the wrong place, or fail obscurely.
+            let region = secret_arn.trim().split(':').nth(3).unwrap_or_default();
+            if region != o.aws.region.trim() {
+                return invalid(format!(
+                    "the secret is in region {region}, but this connection is in {}: use a secret \
+                     in the connection's region",
+                    o.aws.region.trim()
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -82,19 +94,6 @@ pub fn workgroup_name_ok(s: &str) -> Result<()> {
     }
 }
 
-/// A standard Redshift identifier: starts with a letter, an underscore or a multi-byte UTF-8
-/// character; then letters, digits, underscores, dollar signs or multi-byte characters; at most
-/// 127 bytes. Quoted identifiers with spaces or punctuation are not accepted here.
-fn standard_identifier(s: &str) -> bool {
-    let s = s.trim();
-    !s.is_empty()
-        && s.len() <= MAX_NAME_BYTES
-        && s.starts_with(|c: char| c.is_alphabetic() || c == '_' || !c.is_ascii())
-        && s.chars()
-            .all(|c| c.is_alphanumeric() || c == '_' || c == '$' || !c.is_ascii())
-        && !s.chars().any(char::is_control)
-}
-
 /// The profile's database: 1 to 64 characters, a lower-case letter or underscore and then
 /// lower-case letters, digits, underscores or dollar signs. This is the connection form's rule
 /// (and the documented one for a cluster's database name), so a profile the form saves is never
@@ -116,17 +115,25 @@ pub fn database_name_ok(s: &str) -> Result<()> {
     }
 }
 
-/// A database named for one call (the browser passes names `ListDatabases` returned): any
-/// standard Redshift identifier, at most 127 bytes. Wider than [`database_name_ok`] because a
-/// database created with SQL may have a longer or mixed-case name, which the server itself
-/// reported.
+/// A database named for one call (the browser passes names `ListDatabases` returned, the agent
+/// passes what the model wrote): an ASCII letter or underscore, then ASCII letters, digits,
+/// underscores or dollar signs, at most 127 bytes. Wider than [`database_name_ok`] because a
+/// database created with SQL may have a longer or mixed-case name. ASCII only, so a look-alike of
+/// the default (`dеv` with a Cyrillic `е`) cannot be named on an approval card.
 pub fn requested_database_ok(s: &str) -> Result<()> {
-    if standard_identifier(s) {
+    let s = s.trim();
+    let ok = (1..=MAX_NAME_BYTES).contains(&s.len())
+        && s.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$');
+    if ok {
         Ok(())
     } else {
         invalid(
-            "the database name is not valid: it starts with a letter or underscore, has only \
-             letters, digits, underscores or dollar signs, and is at most 127 bytes",
+            "the database name is not valid: it starts with an ASCII letter or underscore, has \
+             only ASCII letters, digits, underscores or dollar signs, and is at most 127 bytes. \
+             Other characters are refused so that a look-alike of another database's name \
+             cannot be named",
         )
     }
 }
@@ -294,9 +301,14 @@ mod tests {
             requested_database_ok(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
         }
         // The profile field follows the form; a name the server listed may be wider.
-        for listed in ["Sales", "Ünïcode", &"a".repeat(127)] {
+        for listed in ["Sales", "Big$DB_2", &"a".repeat(127)] {
             assert!(database_name_ok(listed).is_err(), "{listed}");
             requested_database_ok(listed).unwrap_or_else(|e| panic!("{listed}: {e}"));
+        }
+        // LOW 4: a look-alike of `dev` with a Cyrillic `е`, and any other non-ASCII name.
+        for spoof in ["d\u{0435}v", "Ünïcode", "dev\u{200b}"] {
+            let m = requested_database_ok(spoof).unwrap_err().to_string();
+            assert!(m.contains("ASCII"), "{m}");
         }
         for bad in [
             "",
@@ -394,6 +406,19 @@ mod tests {
             validate_options(&opts(prov(), auth.clone())).unwrap();
             validate_options(&opts(sls(), auth)).unwrap();
         }
+    }
+
+    /// LOW 5: the secret must be in the connection's region.
+    #[test]
+    fn a_secret_in_another_region_is_refused() {
+        let o = opts(
+            prov(),
+            RedshiftAuth::Secret {
+                secret_arn: "arn:aws:secretsmanager:us-east-1:123456789012:secret:x".into(),
+            },
+        );
+        let m = validate_options(&o).unwrap_err().to_string();
+        assert!(m.contains("us-east-1") && m.contains("eu-west-1"), "{m}");
     }
 
     #[test]

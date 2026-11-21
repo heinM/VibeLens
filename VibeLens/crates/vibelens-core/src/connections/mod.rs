@@ -148,7 +148,9 @@ pub struct ConnectionManager {
     reaper_started: AtomicBool,
     iceberg_deps: OnceLock<IcebergDeps>,
     /// Test wiring only: where Redshift Data API requests go instead of the regional endpoint.
-    /// Never read from a profile (see `RedshiftEngine::with_endpoint_url`).
+    /// Never read from a profile (see `RedshiftEngine::with_endpoint_url`), and not compiled
+    /// into the app (`test-util` feature).
+    #[cfg(any(test, feature = "test-util"))]
     redshift_endpoint: OnceLock<String>,
 }
 
@@ -165,6 +167,7 @@ impl ConnectionManager {
             state: Mutex::new(State::default()),
             reaper_started: AtomicBool::new(false),
             iceberg_deps: OnceLock::new(),
+            #[cfg(any(test, feature = "test-util"))]
             redshift_endpoint: OnceLock::new(),
         })
     }
@@ -765,7 +768,8 @@ impl ConnectionManager {
 
     /// Where Redshift Data API requests go instead of the regional endpoint. For tests that wire
     /// the manager to a mock; the app never calls it and no profile field reaches it. A second
-    /// call is ignored.
+    /// call is ignored. Only in test builds (`test-util` feature).
+    #[cfg(any(test, feature = "test-util"))]
     #[doc(hidden)]
     pub fn set_redshift_endpoint_url(&self, url: impl Into<String>) {
         if self.redshift_endpoint.set(url.into()).is_err() {
@@ -796,10 +800,12 @@ impl ConnectionManager {
             })?;
         let creds = aws.credentials_provider(&opts.aws).await?;
         let engine = RedshiftEngine::new(opts, creds)?;
-        Ok(match self.redshift_endpoint.get() {
+        #[cfg(any(test, feature = "test-util"))]
+        let engine = match self.redshift_endpoint.get() {
             Some(url) => engine.with_endpoint_url(url.clone()),
             None => engine,
-        })
+        };
+        Ok(engine)
     }
 
     /// Lazily created Redshift engine for the profile. The first creation checks that the

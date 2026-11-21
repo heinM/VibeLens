@@ -77,7 +77,10 @@ pub async fn rs_schema_metadata(
 
 /// Streams results over `on_event` (same contract as `pg_execute` and `ice_execute`). Cancel with
 /// `pg_cancel` (the running-query registry is shared), which also cancels the statement on the
-/// server. Prod write-guard identical to Postgres.
+/// server. The production write guard is Redshift's own (`redshift::prod_guard_reason`): a
+/// script Redshift would read differently from the classifier (a backslash in a string literal)
+/// is refused outright in every environment, and a call to a non-built-in function counts as a
+/// possible write.
 #[tauri::command]
 pub async fn rs_execute(
     state: State<'_, AppState>,
@@ -90,9 +93,10 @@ pub async fn rs_execute(
 ) -> CmdResult<String> {
     let profile = state.profiles.get(&profile_id).map_err(err)?;
     let opts = options.unwrap_or_default();
+    let guard = vibelens_core::redshift::prod_guard_reason(&sql, opts.read_only).map_err(err)?;
     if profile.environment == Environment::Prod
         && !confirmed.unwrap_or(false)
-        && let Some(reason) = super::pg::prod_guard_reason(&sql, opts.read_only)
+        && let Some(reason) = guard
     {
         return Err(ErrorPayload::new(
             "confirm_required",

@@ -207,6 +207,7 @@ pub fn fast() -> RedshiftTiming {
         poll_initial: Duration::from_millis(5),
         poll_max: Duration::from_millis(20),
         retry_base: Duration::from_millis(5),
+        ..RedshiftTiming::default()
     }
 }
 

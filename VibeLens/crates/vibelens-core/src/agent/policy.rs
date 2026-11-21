@@ -402,6 +402,22 @@ pub(super) fn assess(
     }
 }
 
+/// Redshift runs every statement of a script in its own Data API session, so `SET`/`RESET` lasts
+/// only for itself: alone it does nothing, and in a script it does not apply to the statements
+/// after it. Either way the call is denied with advice that works on Redshift.
+fn redshift_session_statements(sql: &str) -> Option<Assessment> {
+    let c = classify(sql);
+    if !c.statements.contains(&StatementClass::Session) {
+        return None;
+    }
+    Some(Assessment::denied(
+        "on Redshift, SET and RESET last only for their own statement: the Data API runs each \
+         statement of a script in its own session, so a setting never applies to the next \
+         statement. Leave them out and qualify names instead (schema.table rather than a \
+         search_path); there is no SET LOCAL or BEGIN … COMMIT to wrap them in.",
+    ))
+}
+
 /// Extra approval-card text for Iceberg statements that change something.
 fn iceberg_write_note(f: &ProfileFacts, c: &SqlClassification) -> String {
     if f.engine != EngineKind::Iceberg {
@@ -429,13 +445,31 @@ fn iceberg_write_note(f: &ProfileFacts, c: &SqlClassification) -> String {
 /// The target always comes before the statement summary and the model's `purpose`, so neither
 /// can push it out of view. The preview is exactly the text that is executed.
 fn assess_sql(f: &ProfileFacts, database: Option<&str>, sql: &str, purpose: &str) -> Assessment {
-    // The engine refuses these too; refusing here tells the model why before the user is asked.
-    if f.engine == EngineKind::Redshift
-        && let Err(e) = crate::redshift::check_transaction_control(sql)
-    {
-        return Assessment::denied(e.to_string());
+    // The engine refuses these too; refusing here tells the model why before the user is asked,
+    // and keeps the classification below honest (a backslash in a literal means Redshift and the
+    // classifier would read the statement differently).
+    if f.engine == EngineKind::Redshift {
+        if let Err(e) = crate::redshift::check_script(sql) {
+            return Assessment::denied(e.to_string());
+        }
+        if let Some(denied) = redshift_session_statements(sql) {
+            return denied;
+        }
     }
-    let c = classify(sql);
+    let mut c = classify(sql);
+    // A Redshift query that calls a function that is not a read-only built-in is not run
+    // read-only (the engine would refuse it): it is shown for approval like any unverified
+    // statement.
+    if f.engine == EngineKind::Redshift
+        && c.overall == StatementClass::ReadOnly
+        && let Some(func) = crate::redshift::unknown_function(sql)
+    {
+        c.overall = StatementClass::Unknown;
+        c.summary = format!(
+            "{} (calls {func}, not a read-only Redshift built-in)",
+            c.summary
+        );
+    }
     let preview = Some(sql.to_string());
     let target = sql_target_text(f, database);
     match c.overall {
@@ -1759,6 +1793,75 @@ mod tests {
     }
 
     #[test]
+    fn redshift_refuses_backslash_literals_before_anyone_is_asked() {
+        // Audit HIGH 1: the classifier reads these as plain SELECTs of two literals; Redshift
+        // runs `SELECT … INTO public.pwned` and `pg_terminate_backend(123)`.
+        for s in [
+            r"SELECT '\' , ' AS x INTO public.pwned FROM secrets -- '",
+            r"SELECT '\' , ' , pg_terminate_backend(123) -- '",
+        ] {
+            for a in [SchemaOnly, ResultsWithApproval, Results] {
+                for env in ENVS {
+                    let r = assess(&sql(s), Some(&rs(a, env)), false);
+                    assert_eq!(r.risk, Denied, "{s}");
+                    assert!(r.reason.unwrap().contains("backslash"), "{s}");
+                }
+            }
+            // On Postgres (standard strings) the same text stays a plain query.
+            assert_eq!(
+                assess(&sql(s), Some(&pg(Results, Environment::Dev)), false).risk,
+                Safe
+            );
+        }
+    }
+
+    #[test]
+    fn redshift_unknown_functions_need_approval_instead_of_running_read_only() {
+        for s in [
+            "SELECT f_notify(card_number) FROM payments",
+            "SELECT public.f(x) FROM t",
+            "SELECT change_query_priority(1, 'high')",
+        ] {
+            let r = assess(&sql(s), Some(&rs(Results, Environment::Dev)), false);
+            assert_eq!(r.risk, NeedsApproval, "{s}");
+            assert!(
+                r.allow_write,
+                "approved, it runs without the read-only check"
+            );
+            // The admin functions are on the general deny-list, so the classifier names them.
+            let m = r.reason.unwrap();
+            assert!(
+                m.contains("not a read-only Redshift built-in")
+                    || m.contains("change_query_priority()"),
+                "{m}"
+            );
+        }
+        let r = assess(
+            &sql("SELECT lower(name), count(*) FROM t GROUP BY 1"),
+            Some(&rs(Results, Environment::Dev)),
+            false,
+        );
+        assert_eq!(r.risk, Safe);
+    }
+
+    #[test]
+    fn redshift_session_statements_get_redshift_advice() {
+        for s in [
+            "SET search_path TO x",
+            "SET search_path TO x; SELECT * FROM t",
+            "SELECT 1; RESET search_path",
+        ] {
+            let r = assess(&sql(s), Some(&rs(Results, Environment::Dev)), false);
+            assert_eq!(r.risk, Denied, "{s}");
+            let m = r.reason.unwrap();
+            assert!(
+                m.contains("qualify names") && !m.contains("SET LOCAL statement_timeout"),
+                "{m}"
+            );
+        }
+    }
+
+    #[test]
     fn redshift_refuses_transaction_control_at_every_access_level() {
         for a in [SchemaOnly, ResultsWithApproval, Results] {
             for s in [
@@ -1788,7 +1891,9 @@ mod tests {
             .reason
             .unwrap();
         assert!(
-            r.contains("'warehouse' (Redshift · analytics-wg · dev · eu-west-1)"),
+            r.contains(
+                "'warehouse' (Redshift · analytics-wg · dev · eu-west-1 · as the IAM identity)"
+            ),
             "{r}"
         );
         let r = assess(&sql_on(Some("sales"), "delete from t"), Some(&f), false)

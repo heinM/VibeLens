@@ -16,6 +16,9 @@ iceberg = [
 ]
 # Hive Metastore catalog (Thrift via volo/pilota). Off by default: heavy, and no Kerberos support.
 iceberg-hms = ["iceberg", "dep:iceberg-catalog-hms"]
+# Test hooks (endpoint overrides that point signed AWS requests at a mock). Never in the app:
+# only the crate's own integration tests turn it on, through the dev-dependency on itself below.
+test-util = []
 
 [dependencies]
 async-trait = "0.1.92"
@@ -83,6 +86,9 @@ apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
 windows-native-keyring-store = "1.1.0"
 
 [dev-dependencies]
+# Turns on `test-util` for this crate's integration tests (`tests/redshift_*`), so a plain
+# `cargo test -p vibelens-core` runs them; release builds of the app never see the hooks.
+vibelens-core = { path = ".", features = ["test-util"] }
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["full", "test-util"] }
 
