@@ -1,7 +1,7 @@
 // Mirror of crates/vibelens-core/src/model/*.rs (serde camelCase). Change both together.
 
 export type ProfileId = string;
-export type EngineKind = "postgres" | "valkey" | "iceberg";
+export type EngineKind = "postgres" | "valkey" | "iceberg" | "redshift";
 export type Environment = "dev" | "test" | "staging" | "prod";
 export type AiDataAccess = "none" | "schemaOnly" | "resultsWithApproval" | "results";
 export type TlsMode = "disable" | "require" | "verifyFull";
@@ -88,6 +88,8 @@ export interface ConnectionProfile {
   updatedAt: string | null;
   /** Required when engine === "iceberg"; host/port are unused then. */
   iceberg?: IcebergOptions | null;
+  /** Required when engine === "redshift"; host/port/auth/tls/tunnel are unused then. */
+  redshift?: RedshiftOptions | null;
 }
 
 // ---------- import ----------
@@ -140,9 +142,23 @@ export type IcebergStorage =
   | { kind: "s3Static"; endpoint: string | null; region: string | null; pathStyle: boolean } // keys in keychain
   | { kind: "local" };
 
+/** Authentication of the Trino / Livy HTTP engines. The password or token is in the vault (`engineSecret`). */
+export type HttpEngineAuth = { kind: "none" } | { kind: "basic"; username: string } | { kind: "bearer" };
+
 export type IcebergQueryEngine =
   | { kind: "local" }
-  | { kind: "athena"; workgroup: string; outputLocation: string | null; aws: AwsTarget | null };
+  | { kind: "athena"; workgroup: string; outputLocation: string | null; aws: AwsTarget | null }
+  | { kind: "trino"; url: string; catalog: string; user: string; auth: HttpEngineAuth; caCertPath: string | null }
+  | {
+      kind: "spark";
+      url: string;
+      catalog: string;
+      auth: HttpEngineAuth;
+      caCertPath: string | null;
+      proxyUser: string | null;
+      sessionConf: Record<string, string>;
+      sessionStartTimeoutSecs: number | null;
+    };
 
 export interface IcebergOptions {
   catalog: IcebergCatalog;
@@ -221,6 +237,31 @@ export interface ExpireSnapshotsResult {
   remaining: number;
 }
 
+// ---------- redshift ----------
+export type RedshiftTarget = { kind: "provisioned"; clusterIdentifier: string } | { kind: "serverless"; workgroupName: string };
+export type RedshiftAuth = { kind: "iamIdentity" } | { kind: "dbUser"; dbUser: string } | { kind: "secret"; secretArn: string };
+export interface RedshiftOptions {
+  target: RedshiftTarget;
+  database: string;
+  aws: AwsTarget;
+  auth: RedshiftAuth;
+}
+export interface RedshiftTableRef {
+  schema: string;
+  name: string;
+  /** TABLE, VIEW, ... as Redshift reports it. */
+  kind: string;
+}
+export interface RedshiftColumn {
+  name: string;
+  typeName: string;
+  nullable: boolean;
+  length: number | null;
+  precision: number | null;
+  scale: number | null;
+  defaultValue: string | null;
+}
+
 export type ConnectionState = "disconnected" | "connecting" | "connected" | "error";
 
 export interface ConnectionStatus {
@@ -239,6 +280,9 @@ export interface SecretStatus {
   hasSshPassphrase: boolean;
   hasIcebergSecret: boolean;
   hasS3Keys: boolean;
+  /** Trino / Spark password or token (`profile:{id}:engine-secret`). Optional: not in the design contract,
+   *  so an older or partial backend may not send it (then the wizard assumes nothing is stored). */
+  hasEngineSecret?: boolean;
 }
 
 export interface TestResult {

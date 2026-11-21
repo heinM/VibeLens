@@ -20,7 +20,8 @@ export const api = {
   listProfiles: () => invoke<T.ConnectionProfile[]>("list_profiles"),
   /** password / sshSecret: undefined = keep, "" = delete, value = store in OS keychain */
   /** icebergSecret: REST bearer token / OAuth2 client secret / SQL-catalog DB password.
-   *  s3Keys: static S3 keys for storage kind "s3Static". Same keep/delete semantics as password. */
+   *  s3Keys: static S3 keys for storage kind "s3Static".
+   *  engineSecret: Trino / Spark (Livy) password or bearer token. Same keep/delete semantics as password. */
   saveProfile: (
     profile: T.ConnectionProfile,
     password?: string,
@@ -28,6 +29,7 @@ export const api = {
     icebergSecret?: string,
     s3Keys?: { accessKeyId: string; secretAccessKey: string },
     forgetHostKey?: boolean,
+    engineSecret?: string,
   ) =>
     invoke<T.ConnectionProfile>("save_profile", {
       forgetHostKey,
@@ -37,6 +39,7 @@ export const api = {
       icebergSecret: icebergSecret ?? null,
       s3AccessKeyId: s3Keys?.accessKeyId ?? null,
       s3SecretAccessKey: s3Keys?.secretAccessKey ?? null,
+      engineSecret: engineSecret ?? null,
     }),
   deleteProfile: (id: string) => invoke<void>("delete_profile", { id }),
   testConnection: (profile: T.ConnectionProfile, password?: string) =>
@@ -127,6 +130,31 @@ export const api = {
       retainLast: opts.retainLast ?? null,
       confirmed: opts.confirmed ?? false,
     }),
+
+  // redshift (Data API). `database` null = the profile's database.
+  rsListDatabases: (profileId: string) => invoke<string[]>("rs_list_databases", { profileId }),
+  rsListSchemas: (profileId: string, database: string | null) => invoke<string[]>("rs_list_schemas", { profileId, database }),
+  rsListTables: (profileId: string, database: string | null, schema: string) =>
+    invoke<T.RedshiftTableRef[]>("rs_list_tables", { profileId, database, schema }),
+  rsDescribeTable: (profileId: string, database: string | null, schema: string, name: string) =>
+    invoke<T.RedshiftColumn[]>("rs_describe_table", { profileId, database, schema, name }),
+  /** Catalog in the Postgres SchemaMetadata shape, for autocomplete. */
+  rsSchemaMetadata: (profileId: string, database: string | null, maxTables?: number) =>
+    invoke<T.SchemaMetadata>("rs_schema_metadata", { profileId, database, maxTables: maxTables ?? null }),
+  /** Same streaming contract as iceExecute; cancel with pgCancel(queryId). */
+  rsExecute: (args: {
+    profileId: string;
+    database: string | null;
+    sql: string;
+    options?: Partial<T.ExecOptions>;
+    confirmed?: boolean;
+    onEvent: (ev: T.QueryEvent) => void;
+  }) => {
+    const ch = new Channel<T.QueryEvent>();
+    ch.onmessage = args.onEvent;
+    const options: T.ExecOptions = { readOnly: false, maxRows: 100_000, pageSize: 500, timeoutMs: null, ...args.options };
+    return invoke<string>("rs_execute", { profileId: args.profileId, sql: args.sql, database: args.database, options, confirmed: args.confirmed ?? false, onEvent: ch });
+  },
 
   // files
   /** Native Save dialog, then writes the file. Resolves to the saved path, or null if cancelled. */
