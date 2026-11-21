@@ -109,11 +109,19 @@ describe("Spark session configuration: Rust's allow-list", () => {
     expect(ok("spark.sql.catalog.lake", "com.evil.Catalog")).toMatch(/must be org\.apache\.iceberg\.spark\.SparkCatalog/);
   });
   it("allows the listed catalog options, for the engine's own catalog only", () => {
-    for (const o of ["type", "warehouse", "default-namespace", "cache-enabled", "cache.expiration-interval-ms"]) expect(ok(`spark.sql.catalog.lake.${o}`, "x"), o).toBeNull();
+    for (const o of ["default-namespace", "cache-enabled", "cache.expiration-interval-ms"]) expect(ok(`spark.sql.catalog.lake.${o}`, "x"), o).toBeNull();
+    // These would let a hand-edited profile point the catalog at another store (type=hadoop, warehouse=file:///).
+    for (const o of ["type", "warehouse"]) expect(ok(`spark.sql.catalog.lake.${o}`, "x"), o).toMatch(/set this on the cluster instead/);
     expect(ok("spark.sql.catalog.lake.uri", "thrift://x")).toMatch(/set this on the cluster instead/);
     expect(ok("spark.sql.catalog.other.type", "glue")).toMatch(/set this on the cluster instead/);
     expect(ok("spark.sql.catalog.other", "org.apache.iceberg.spark.SparkCatalog")).toMatch(/set this on the cluster instead/);
     expect(sessionConfError("spark.sql.catalog.lake.type", "glue", "Lake")).toMatch(/cluster/); // case-sensitive
+  });
+  it("a Spark catalog name is a plain identifier, since it becomes part of a configuration key", () => {
+    expect(validateRemoteEngine(spark({ catalog: "lake_1" }))["ice.engine.catalogName"]).toBeUndefined();
+    for (const bad of ["lake.rest.auth", "1lake", "la ke", "lake-1"]) expect(validateRemoteEngine(spark({ catalog: bad }))["ice.engine.catalogName"], bad).toMatch(/letters, digits and _/);
+    // Trino catalogs keep the looser rule.
+    expect(validateRemoteEngine(trino({ catalog: "lake-1" }))["ice.engine.catalogName"]).toBeUndefined();
   });
   it("allows exactly the listed session settings", () => {
     expect([...SPARK_ALLOWED_CONF].sort()).toEqual(
@@ -146,7 +154,7 @@ describe("Spark session configuration: Rust's allow-list", () => {
     expect(ok("spark.executor.memory", "4g\n")).toMatch(/control character/);
     expect(ok("spark.executor.memory", "x".repeat(512))).toBeNull();
     expect(ok("spark.executor.memory", "x".repeat(513))).toMatch(/512/);
-    expect(ok("spark.sql.catalog.lake.warehouse", "${env:HOME}")).toMatch(/\$\{/);
+    expect(ok("spark.sql.catalog.lake.default-namespace", "${env:HOME}")).toMatch(/\$\{/);
     expect(ok("spark.sql.session.timeZone", "Bearer abc")).toMatch(/credential.*cluster instead/);
     expect(ok("spark.sql.session.timeZone", "bearer abc")).toMatch(/credential/);
   });
@@ -177,7 +185,7 @@ describe("Spark session configuration: Rust's allow-list", () => {
 describe("validateRemoteEngine", () => {
   it("accepts a complete Trino and a complete Spark engine", () => {
     expect(validateRemoteEngine(trino())).toEqual({});
-    expect(validateRemoteEngine(spark({ proxyUser: "etl", sessionConf: { "spark.sql.catalog.lake": "org.apache.iceberg.spark.SparkCatalog", "spark.sql.catalog.lake.type": "glue" }, sessionStartTimeoutSecs: 600 }))).toEqual({});
+    expect(validateRemoteEngine(spark({ proxyUser: "etl", sessionConf: { "spark.sql.catalog.lake": "org.apache.iceberg.spark.SparkCatalog", "spark.sql.catalog.lake.cache-enabled": "false" }, sessionStartTimeoutSecs: 600 }))).toEqual({});
   });
   it("requires the URL, the catalog and (Trino) the user", () => {
     const e = validateRemoteEngine(trino({ url: "", catalog: " ", user: "" }));

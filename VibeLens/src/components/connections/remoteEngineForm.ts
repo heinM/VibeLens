@@ -94,7 +94,11 @@ export function cleartextProblem(url: string, auth: HttpEngineAuth): CleartextPr
 /** Implementations `spark.sql.catalog.<catalog>` may name. */
 export const SPARK_CATALOG_IMPLS: readonly string[] = ["org.apache.iceberg.spark.SparkCatalog", "org.apache.iceberg.spark.SparkSessionCatalog"];
 /** Options allowed as `spark.sql.catalog.<catalog>.<option>`. */
-export const SPARK_CATALOG_OPTIONS: readonly string[] = ["type", "warehouse", "default-namespace", "cache-enabled", "cache.expiration-interval-ms"];
+// `type` and `warehouse` are left out on purpose, as in Rust: a hand-edited profile could point the
+// catalog at another store (`type=hadoop`, `warehouse=file:///`). They are set on the cluster.
+export const SPARK_CATALOG_OPTIONS: readonly string[] = ["default-namespace", "cache-enabled", "cache.expiration-interval-ms"];
+/** A Spark catalog name, as Rust's `is_spark_catalog_name`: it becomes part of `spark.sql.catalog.<name>` keys. */
+export const SPARK_CATALOG_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /** Session settings allowed whatever the catalog is. */
 export const SPARK_ALLOWED_CONF: ReadonlySet<string> = new Set([
   "spark.sql.shuffle.partitions",
@@ -209,6 +213,7 @@ export function validateRemoteEngine(q: RemoteEngine, secretMissing = false): Re
   else {
     const ce = plainNameError(q.catalog, "Catalog");
     if (ce) e["ice.engine.catalogName"] = ce;
+    else if (q.kind === "spark" && !SPARK_CATALOG_NAME_RE.test(cat)) e["ice.engine.catalogName"] = "A Spark catalog name has only letters, digits and _ and does not start with a digit.";
   }
   if (q.kind === "trino") {
     const ue = q.user.trim() ? plainNameError(q.user, "User") : "User is required (sent as X-Trino-User).";
