@@ -1,19 +1,38 @@
-import { Check, FileCode2, Plug, Table2, TextCursorInput, X } from "lucide-react";
+import { Check, FileCode2, Pin, PinOff, Plug, Table2, TextCursorInput, X } from "lucide-react";
 import type { ReactNode } from "react";
 import { cn } from "../../lib/cn";
 import type { AgentContextInfo, ChipExclusions } from "../../hooks/useAgentContext";
 import { EnvBadge } from "../ui";
 import { attachBlockedReason, LAST_RESULT_ROWS } from "./lastResult";
 
-function Chip({ label, excluded, onToggle, children, title }: { label: string; excluded: boolean; onToggle: () => void; children: ReactNode; title?: string }) {
+function Chip({
+  label,
+  excluded,
+  onToggle,
+  children,
+  title,
+  lead,
+  accent,
+}: {
+  label: string;
+  excluded: boolean;
+  onToggle: () => void;
+  children: ReactNode;
+  title?: string;
+  /** A control before the content (the pin toggle). */
+  lead?: ReactNode;
+  accent?: boolean;
+}) {
   return (
     <span
       className={cn(
-        "inline-flex h-6 max-w-64 items-center gap-1.5 rounded-md border pl-1.5 pr-0.5 text-[12px]",
-        excluded ? "border-dashed border-border text-muted/70" : "border-border bg-panel-2 text-fg",
+        "inline-flex h-6 max-w-72 items-center gap-1.5 rounded-md border pr-0.5 text-[12px]",
+        lead ? "pl-0.5" : "pl-1.5",
+        excluded ? "border-dashed border-border text-muted/70" : accent ? "border-accent/60 bg-accent/10 text-fg" : "border-border bg-panel-2 text-fg",
       )}
       title={title}
     >
+      {lead}
       <span className={cn("flex min-w-0 items-center gap-1.5", excluded && "line-through decoration-muted/60")}>{children}</span>
       <button
         type="button"
@@ -77,6 +96,29 @@ function LastResultChip({ info, attached, onToggle }: { info: AgentContextInfo; 
   );
 }
 
+/**
+ * Pins the agent to the connection and database it is on now, or lets it follow focus again.
+ * Pinned, every message (and "Open in new tab") uses that target whatever tab is active.
+ */
+function PinToggle({ pinned, target, onToggle }: { pinned: boolean; target: string; onToggle: () => void }) {
+  const Icon = pinned ? Pin : PinOff;
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-pressed={pinned}
+      aria-label={pinned ? `Agent pinned to ${target}. Click to follow the active tab again.` : `Pin the agent to ${target}`}
+      title={pinned ? "Pinned: every message goes here until you unpin, whatever tab is active" : "Follows the active tab. Pin to keep the agent on this connection and database"}
+      className={cn(
+        "grid size-5 shrink-0 place-items-center rounded outline-none hover:bg-bg focus-visible:ring-2 focus-visible:ring-accent/60",
+        pinned ? "text-accent" : "text-muted hover:text-fg",
+      )}
+    >
+      <Icon className={cn("size-3", pinned && "fill-current")} />
+    </button>
+  );
+}
+
 /** What the next message will carry. Each chip can be left out for one turn. */
 export function ContextChips({
   info,
@@ -84,18 +126,28 @@ export function ContextChips({
   onChange,
   attachResult,
   onToggleResult,
+  onTogglePin,
 }: {
   info: AgentContextInfo;
   exclude: ChipExclusions;
   onChange: (e: ChipExclusions) => void;
   attachResult: boolean;
   onToggleResult: () => void;
+  onTogglePin: () => void;
 }) {
   const hasConn = !!info.profileId;
+  const targetName = `${info.profile?.name ?? "this connection"}${info.database ? ` · ${info.database}` : ""}`;
   return (
     <div className="flex min-w-0 flex-wrap items-center gap-1.5" role="group" aria-label="Context for the next message">
       {hasConn ? (
-        <Chip label="connection" excluded={exclude.connection} onToggle={() => onChange({ ...exclude, connection: !exclude.connection })} title="The connection the agent works against">
+        <Chip
+          label="connection"
+          excluded={exclude.connection}
+          onToggle={() => onChange({ ...exclude, connection: !exclude.connection })}
+          title={info.pinned ? "The connection the agent is pinned to" : "The connection the agent works against (follows the active tab)"}
+          lead={<PinToggle pinned={info.pinned} target={targetName} onToggle={onTogglePin} />}
+          accent={info.pinned}
+        >
           <Plug className="size-3 shrink-0 text-muted" />
           <span className="truncate">{info.profile?.name ?? "Connection"}</span>
           {info.profile && <EnvBadge env={info.profile.environment} />}

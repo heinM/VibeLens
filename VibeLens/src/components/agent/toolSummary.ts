@@ -1,12 +1,13 @@
 // Presentation helpers for agent tool calls. Argument shapes come from the Rust agent, so
 // everything here is defensive: unknown shapes fall back to compact JSON.
-import type { ApprovalTarget, Environment } from "../../ipc/types";
+import type { ApprovalTarget, Environment, SqlRun } from "../../ipc/types";
 
 export type ToolIconName = "list" | "schema" | "table" | "sql" | "key" | "files" | "file" | "write" | "other";
 
 export function toolIconName(tool: string): ToolIconName {
   switch (tool) {
     case "list_connections":
+    case "list_databases":
       return "list";
     case "get_schema":
       return "schema";
@@ -153,4 +154,13 @@ export function formatElapsed(ms: number | null): string {
 
 export function formatTokens(n: number): string {
   return n.toLocaleString("en-US");
+}
+
+/**
+ * What a run_sql card offers once it ran: reopening the SQL (always) and re-running it in a tab
+ * (only when Rust ran it read-only). Both use the connection and database Rust reported.
+ */
+export function sqlRunActions(item: { tool: string; sqlRun: SqlRun | null }): { open: boolean; run: boolean } {
+  const r = item.tool === "run_sql" ? item.sqlRun : null;
+  return { open: !!r, run: !!r && r.readOnly };
 }

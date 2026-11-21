@@ -1,10 +1,10 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { Check, CornerDownRight, SquareArrowOutUpRight } from "lucide-react";
 import { cn } from "../../lib/cn";
-import { useUIStore } from "../../store/useUIStore";
 import { useWorkspaceStore } from "../../store/useWorkspaceStore";
-import { resolveTarget } from "../../hooks/useAgentContext";
+import { currentAgentTarget } from "../../hooks/useAgentContext";
 import { insertIntoActiveEditor } from "./editorInsert";
+import { openAgentTab } from "./openInTab";
 import { Button } from "../ui";
 import { CopyIconButton } from "../ui/formKit";
 import { tokenizeSql, type SqlTokenKind } from "./sqlHighlight";
@@ -98,16 +98,9 @@ export function CodeBlock({ lang, code, open, wrap }: { lang: string; code: stri
     timer.current = window.setTimeout(() => setInserted(null), 1800);
   };
   const openInTab = () => {
-    const ui = useUIStore.getState();
-    const target = resolveTarget(useWorkspaceStore.getState().activeTab(), ui.activeProfileId, ui.activeDatabase);
-    useWorkspaceStore.getState().openTab({
-      kind: isSql ? "sql" : "valkey",
-      contents: code,
-      profileId: target.profileId,
-      database: isSql ? target.database : null,
-      title: isSql ? "agent.sql" : "agent.valkey",
-      dirty: true,
-    });
+    // The pinned target while pinned, else the focused connection.
+    const target = currentAgentTarget();
+    openAgentTab({ kind: isSql ? "sql" : "valkey", contents: code, profileId: target.profileId, database: target.database });
   };
   return (
     <div className="my-2 overflow-hidden rounded-md border border-border bg-bg">

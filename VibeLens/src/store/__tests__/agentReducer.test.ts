@@ -188,3 +188,33 @@ describe("applyAgentEvent: failures and cancel", () => {
     expect(userPrompts(s.transcript)).toEqual(["hello", "again"]);
   });
 });
+
+describe("applyAgentEvent: run_sql target and dismissing errors", () => {
+  const proposed: AgentStoreEvent = { type: "toolCallProposed", callId: "c1", tool: "run_sql", arguments: { sql: "select 1" }, risk: "safe", reason: null };
+  const sqlRun = { profileId: "p1", database: "payments", sql: "select 1", readOnly: true };
+
+  it("keeps where a run_sql call ran", () => {
+    const s = run([prompt, started, proposed, { type: "toolStarted", callId: "c1" }, { type: "toolFinished", callId: "c1", ok: true, summary: "1 row", elapsedMs: 3, sqlRun }]);
+    expect(tool(s)?.sqlRun).toEqual(sqlRun);
+  });
+
+  it("has no target for calls that did not report one", () => {
+    const s = run([prompt, started, proposed, { type: "toolFinished", callId: "c1", ok: false, summary: "denied", elapsedMs: 0 }]);
+    expect(tool(s)?.sqlRun).toBeNull();
+  });
+
+  it("removes only the dismissed error", () => {
+    const err = (message: string): AgentStoreEvent => ({ type: "noticeError", error: { code: "x", message } });
+    const s = run([prompt, err("first"), err("second")]);
+    const [first, second] = s.transcript.filter((i) => i.kind === "error");
+    const after = applyAgentEvent(s, { type: "dismissError", id: first.id });
+    expect(after.transcript.filter((i) => i.kind === "error")).toEqual([second]);
+    expect(kinds(after)).toEqual(["user", "error"]);
+  });
+
+  it("ignores ids that are not errors", () => {
+    const s = run([prompt]);
+    expect(applyAgentEvent(s, { type: "dismissError", id: s.transcript[0].id })).toBe(s);
+    expect(applyAgentEvent(s, { type: "dismissError", id: "nope" })).toBe(s);
+  });
+});
