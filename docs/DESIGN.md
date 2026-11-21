@@ -162,11 +162,17 @@ ConnectionManager ──iceberg(profile)──► IcebergHandle (single-flight, 
                                          ├── FileIO props    Auto (catalog identity / vended) | S3 | S3Static | Local
                                          └── engine          Local: DataFusion SessionContext, lazy providers
                                                              Athena: athena::AthenaEngine (AwsDataCatalog | s3tablescatalog/<bucket>)
+                                                             Trino:  remote::TrinoEngine (client REST protocol; any catalog kind)
+                                                             Spark:  remote::SparkEngine (Apache Livy, kind "sql"; any catalog kind)
 ```
+
+- **Trino and Spark** (`remote/`, design in `REMOTE_ENGINES_AND_REDSHIFT.md` §1–2). Both go through one hardened HTTP client (`remote/http.rs`): no redirects, TLS always verified (OS roots + optional PEM), the credential (vault key `engine_secret`) attached only to requests for the configured scheme/host/port, bodies capped at 64 MiB, the secret redacted from every message. Trino's `nextUri` must be on the configured endpoint; Livy session and statement ids must be non-negative integers. The Livy session is created on first use, switched to `catalog.namespace` with `USE`, replaced once if it died, and deleted when the connection closes. `USE`/`SET SESSION`/transactions (Trino) and `USE`/`SET`/`RESET` (Spark) are refused in every mode, because each statement must run against the catalog the profile (and the approval card) names.
 
 - **Read-only enforcement.**
   - *Local:* every statement is classified (`sql::classify`) before planning, and DataFusion is configured to refuse DDL/DML on read-only runs. That makes two independent layers.
   - *Athena:* there are no read-only transactions, so the pre-submit check is the only one. It's the classifier, plus a narrow text fallback (`athena/scan.rs`) for Trino syntax that sqlparser can't parse. The fallback admits only `SELECT`/`WITH`/`SHOW`/`DESCRIBE` with no comments, semicolons, unbalanced quotes or write keywords.
+  - *Trino:* the Athena check (`athena::check_read_only_as`), same dialect.
+  - *Spark:* a stricter scan (`remote/spark_scan.rs`): only `SELECT`/`WITH`/`SHOW`/`DESCRIBE`/`EXPLAIN`, and no `reflect`/`java_method`/`try_reflect`, no `format.\`path\`` file relations, no `TRANSFORM`/`USING 'script'`, `IDENTIFIER(…)`, `EXECUTE IMMEDIATE`, `LATERAL VIEW` over a non-built-in generator, and no write or session keyword. Literals are read with and without backslash escapes and the statement must pass both ways; text that cannot be tokenised is refused.
   - `EXPLAIN ANALYZE <write>` is a write on both engines.
 - **Cost.** `athena::cost_estimate_usd` gives the list price: billed bytes rounded up to the next MB, 10 MB minimum, US$5/TB. It is shown as an estimate, never as a cap. A workgroup scan limit is the real control.
 - **Agent.**
@@ -214,6 +220,7 @@ provisioned only) or `secret` (a Secrets Manager ARN the Data API reads server-s
   * `uuid` columns are shown as bytes;
   * no scan statistics;
   * Lake Formation is not applied, because the engine reads S3 with the user's own credentials.
+* **Trino and Spark (Livy)** are tested against in-process mocks only (`tests/remote_*`). Livy cuts SQL results at `livy.rsc.sql.num-rows` (1000) without saying so; a result of exactly 1000 rows is reported as truncated. Livy returns decimals as JSON numbers, so a decimal with more digits than a double holds loses precision before VibeLens sees it. A Spark connection is not probed by "Test connection" (that would start a session); its first query reports problems.
 * **Athena** is tested against a mock endpoint only. The header-row and `UpdateCount` handling rest on the documented API shape until test plan ICE-60 to ICE-65 runs on a real account.
 * **Redshift** is tested against a mock Data API only (RS-01 to RS-10 are manual). Results are limited to 100 MB per statement by the Data API, and there are no multi-statement transactions.
 * **Windows** compiles in CI but hasn't had a manual test pass.

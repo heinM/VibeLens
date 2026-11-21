@@ -25,6 +25,7 @@ pub mod pg;
 pub mod ports;
 pub mod profiles;
 pub mod redshift;
+pub mod remote;
 pub mod sql;
 pub mod tls;
 pub mod token;

@@ -362,10 +362,11 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
              Iceberg writes (INSERT, CREATE TABLE AS, and on Athena DML/DDL) need approval and create a new table snapshot. The local engine can only append with INSERT, so UPDATE, DELETE and MERGE need an Athena connection. \
              Athena bills per TB scanned: select only the columns you need, filter on partition columns and always add LIMIT. \
              On Amazon Redshift connections the dialect is Redshift SQL; each statement commits on its own (no transactions: BEGIN, COMMIT and ROLLBACK are refused), and read-only statements are checked to be plain queries rather than run in a READ ONLY transaction. \
+             On a Trino or Spark engine (remote clusters, not billed per TB) the dialect is Trino SQL or Spark SQL, writes include UPDATE, DELETE and MERGE, and session statements (USE, SET) are refused; on Spark, read-only runs also refuse reflect/java_method and direct file paths. \
              For anything beyond a quick query, or any change to data or schema, prefer write_file to save the SQL as a .sql file for the user to review and run themselves. `purpose` is shown to the user next to the SQL, so state plainly why you are running it.",
             json!({
                 "profile_id": profile_id.clone(), "database": database.clone(),
-                "sql": { "type": "string", "description": "The SQL to run. One or more statements in the connection's dialect (PostgreSQL; DataFusion or Athena SQL for Iceberg)." },
+                "sql": { "type": "string", "description": "The SQL to run. One or more statements in the connection's dialect (PostgreSQL; DataFusion, Athena, Trino or Spark SQL for Iceberg, depending on its engine)." },
                 "purpose": { "type": "string", "description": "One sentence for the user: why you are running this." }
             }),
             &["profile_id", "sql", "purpose"],

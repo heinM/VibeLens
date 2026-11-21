@@ -102,6 +102,12 @@ pub(super) fn build_client(
 /// Reject anything that is not provably a read. Fails closed: statements the PostgreSQL-dialect
 /// classifier cannot parse are admitted only by the narrow text check in [`scan`].
 pub(super) fn check_read_only(statements: &[String]) -> Result<()> {
+    check_read_only_as(statements, "Athena")
+}
+
+/// [`check_read_only`] for any Trino-dialect engine (Athena, Trino); `engine` names it in the
+/// refusal.
+pub(crate) fn check_read_only_as(statements: &[String], engine: &str) -> Result<()> {
     for (i, stmt) in statements.iter().enumerate() {
         let c = crate::sql::classify(stmt);
         let ok = match c.overall {
@@ -121,7 +127,7 @@ pub(super) fn check_read_only(statements: &[String]) -> Result<()> {
                 String::new()
             };
             return Err(CoreError::PolicyDenied(format!(
-                "read-only run: {which}{} is not a plain query. Athena has no read-only transactions, \
+                "read-only run: {which}{} is not a plain query. {engine} has no read-only transactions, \
                  so only SELECT, WITH, SHOW and DESCRIBE statements are submitted",
                 c.summary
             )));

@@ -20,8 +20,41 @@ use crate::error::{CoreError, Result};
 use crate::model::{
     ConnectionProfile, EngineKind, ExecOptions, ExpireSnapshotsResult, IcebergCatalog,
     IcebergNamespace, IcebergObjectKind, IcebergOptions, IcebergQueryEngine, IcebergTableInfo,
-    IcebergTableRef, QueryEvent, QueryResult, SchemaMetadata, TableDescription,
+    IcebergTableRef, QueryEvent, QueryResult, SchemaMetadata, TableDescription, vault_keys,
 };
+use crate::remote::{SparkConfig, SparkEngine, TrinoConfig, TrinoEngine};
+
+/// A query engine that runs SQL somewhere else than this process.
+enum RemoteEngine {
+    Athena(AthenaEngine),
+    Trino(TrinoEngine),
+    Spark(SparkEngine),
+}
+
+impl RemoteEngine {
+    async fn execute_stream(
+        &self,
+        query_id: String,
+        sql: &str,
+        opts: ExecOptions,
+        cancel: CancellationToken,
+        tx: mpsc::Sender<QueryEvent>,
+    ) -> Result<()> {
+        match self {
+            RemoteEngine::Athena(e) => e.execute_stream(query_id, sql, opts, cancel, tx).await,
+            RemoteEngine::Trino(e) => e.execute_stream(query_id, sql, opts, cancel, tx).await,
+            RemoteEngine::Spark(e) => e.execute_stream(query_id, sql, opts, cancel, tx).await,
+        }
+    }
+
+    async fn execute_collect(&self, sql: &str, opts: ExecOptions) -> Result<QueryResult> {
+        match self {
+            RemoteEngine::Athena(e) => e.execute_collect(sql, opts).await,
+            RemoteEngine::Trino(e) => e.execute_collect(sql, opts).await,
+            RemoteEngine::Spark(e) => e.execute_collect(sql, opts).await,
+        }
+    }
+}
 use crate::sql::split_statements;
 
 /// Namespaces fetched concurrently for their properties / tables loaded concurrently for `schema_metadata`.
@@ -42,7 +75,8 @@ pub struct IcebergHandle {
     /// Top-level namespaces seen at connect (used to seed `SHOW SCHEMAS`).
     top_level: Vec<String>,
     local: OnceCell<Arc<LocalEngine>>,
-    athena: Option<AthenaEngine>,
+    /// Athena, Trino or Spark; `None` for the local engine.
+    remote: Option<RemoteEngine>,
     started: Instant,
     last_used_ms: AtomicU64,
 }
@@ -74,12 +108,12 @@ impl IcebergHandle {
         let top = catalog.list_namespaces(None).await.map_err(to_core)?;
         let top_level: Vec<String> = top.iter().map(|n| n.as_ref().join(".")).collect();
 
-        let athena = match athena_cfg {
+        let remote = match athena_cfg {
             Some((cfg, target)) => {
                 let creds = deps.aws.credentials_provider(&target).await?;
-                Some(AthenaEngine::new(cfg, creds))
+                Some(RemoteEngine::Athena(AthenaEngine::new(cfg, creds)))
             }
-            None => None,
+            None => http_engine(&profile.id, &opts, &deps).await?,
         };
 
         Ok(Arc::new(IcebergHandle {
@@ -89,7 +123,7 @@ impl IcebergHandle {
             catalog,
             top_level,
             local: OnceCell::new(),
-            athena,
+            remote,
             started: Instant::now(),
             last_used_ms: AtomicU64::new(0),
         }))
@@ -314,7 +348,7 @@ impl IcebergHandle {
     }
 
     /// Same event contract as `PgHandle::execute_stream` (Started … Finished|Failed), plus optional `Stats`.
-    /// With the Athena engine this delegates to [`AthenaEngine`].
+    /// With a remote engine (Athena, Trino, Spark) this delegates to it.
     pub async fn execute_stream(
         &self,
         query_id: String,
@@ -324,7 +358,7 @@ impl IcebergHandle {
         tx: mpsc::Sender<QueryEvent>,
     ) -> Result<()> {
         self.touch();
-        if let Some(a) = &self.athena {
+        if let Some(a) = &self.remote {
             return a.execute_stream(query_id, sql, opts, cancel, tx).await;
         }
         let statements = split_statements(sql);
@@ -361,7 +395,7 @@ impl IcebergHandle {
     /// (or of the last statement when none does). Errors are returned as `Err`.
     pub async fn execute_collect(&self, sql: &str, opts: ExecOptions) -> Result<QueryResult> {
         self.touch();
-        if let Some(a) = &self.athena {
+        if let Some(a) = &self.remote {
             return a.execute_collect(sql, opts).await;
         }
         let statements = split_statements(sql);
@@ -438,7 +472,27 @@ impl IcebergHandle {
     }
 
     pub async fn close(&self) {
-        // Pools (SQL catalog) and HTTP clients close when the last reference drops; nothing to flush.
+        // Pools (SQL catalog) and HTTP clients close when the last reference drops. A Livy
+        // session lives on the server, so it is deleted here.
+        if let Some(RemoteEngine::Spark(s)) = &self.remote {
+            s.close().await;
+        }
+    }
+
+    /// Checks that the query engine answers and accepts the credential, for a connection test.
+    /// Trino runs `SELECT 1`. Spark is not probed: that would start a Livy session (minutes on
+    /// a cold cluster) only to delete it again; its first query reports any problem.
+    pub async fn probe_engine(&self) -> Result<()> {
+        if let Some(RemoteEngine::Trino(t)) = &self.remote {
+            let opts = ExecOptions {
+                read_only: true,
+                max_rows: 1,
+                page_size: 1,
+                timeout_ms: Some(30_000),
+            };
+            t.execute_collect("SELECT 1", opts).await?;
+        }
+        Ok(())
     }
 }
 
@@ -506,6 +560,79 @@ fn athena_target(opts: &IcebergOptions) -> Result<Option<(AthenaConfig, crate::m
     Ok(Some((cfg, target)))
 }
 
+/// The Trino or Spark engine for `opts`, with its secret read from the vault. `Ok(None)` for
+/// the other engines. Both work with every catalog kind.
+async fn http_engine(
+    profile_id: &str,
+    opts: &IcebergOptions,
+    deps: &IcebergDeps,
+) -> Result<Option<RemoteEngine>> {
+    let secret = match &opts.query_engine {
+        IcebergQueryEngine::Trino { auth, .. } | IcebergQueryEngine::Spark { auth, .. }
+            if auth.uses_secret() =>
+        {
+            deps.vault
+                .get(&vault_keys::engine_secret(profile_id))
+                .await?
+        }
+        _ => None,
+    };
+    let namespace = opts
+        .default_namespace
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let blank = |s: &Option<String>| {
+        s.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    Ok(match &opts.query_engine {
+        IcebergQueryEngine::Trino {
+            url,
+            catalog,
+            user,
+            auth,
+            ca_cert_path,
+        } => Some(RemoteEngine::Trino(TrinoEngine::new(
+            TrinoConfig {
+                url: url.trim().to_string(),
+                catalog: catalog.trim().to_string(),
+                schema: namespace,
+                user: user.trim().to_string(),
+                auth: auth.clone(),
+                ca_cert_path: blank(ca_cert_path),
+            },
+            secret,
+        )?)),
+        IcebergQueryEngine::Spark {
+            url,
+            catalog,
+            auth,
+            ca_cert_path,
+            proxy_user,
+            session_conf,
+            session_start_timeout_secs,
+        } => Some(RemoteEngine::Spark(SparkEngine::new(
+            SparkConfig {
+                url: url.trim().to_string(),
+                catalog: catalog.trim().to_string(),
+                namespace,
+                auth: auth.clone(),
+                ca_cert_path: blank(ca_cert_path),
+                proxy_user: blank(proxy_user),
+                session_conf: session_conf.clone(),
+                session_start_timeout: session_start_timeout_secs
+                    .map(std::time::Duration::from_secs),
+            },
+            secret,
+        )?)),
+        IcebergQueryEngine::Local | IcebergQueryEngine::Athena { .. } => None,
+    })
+}
+
 /// "REST · localhost:8181 · Local engine".
 pub(crate) fn describe(opts: &IcebergOptions) -> String {
     let (kind, place) = match &opts.catalog {
@@ -518,6 +645,12 @@ pub(crate) fn describe(opts: &IcebergOptions) -> String {
     let engine = match &opts.query_engine {
         IcebergQueryEngine::Local => "Local engine".to_string(),
         IcebergQueryEngine::Athena { workgroup, .. } => format!("Athena ({workgroup})"),
+        IcebergQueryEngine::Trino { url, catalog, .. } => {
+            format!("Trino ({} · {catalog})", host_port(url))
+        }
+        IcebergQueryEngine::Spark { url, catalog, .. } => {
+            format!("Spark via Livy ({} · {catalog})", host_port(url))
+        }
     };
     format!("{kind} · {place} · {engine}")
 }

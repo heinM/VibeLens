@@ -367,6 +367,12 @@ impl ConnectionProfile {
         });
         let uses_s3_keys =
             iceberg.is_some_and(|o| matches!(o.storage, IcebergStorage::S3Static { .. }));
+        let uses_engine_secret = self.engine == EngineKind::Iceberg
+            && iceberg.is_some_and(|o| match &o.query_engine {
+                super::iceberg::IcebergQueryEngine::Trino { auth, .. }
+                | super::iceberg::IcebergQueryEngine::Spark { auth, .. } => auth.uses_secret(),
+                _ => false,
+            });
 
         let mut unused = Vec::new();
         if !self.auth.uses_stored_password() {
@@ -384,6 +390,9 @@ impl ConnectionProfile {
         if !uses_s3_keys {
             unused.push(vault_keys::s3_access_key_id(id));
             unused.push(vault_keys::s3_secret_access_key(id));
+        }
+        if !uses_engine_secret {
+            unused.push(vault_keys::engine_secret(id));
         }
         unused
     }
@@ -474,5 +483,9 @@ pub mod vault_keys {
     }
     pub fn s3_secret_access_key(profile_id: &str) -> String {
         format!("profile:{profile_id}:s3-secret-access-key")
+    }
+    /// Password or bearer token of a remote query engine (Trino, Spark through Livy).
+    pub fn engine_secret(profile_id: &str) -> String {
+        format!("profile:{profile_id}:engine-secret")
     }
 }

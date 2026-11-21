@@ -31,6 +31,12 @@ mod cells;
 mod engine;
 mod scan;
 
+// Trino speaks the same dialect: the remote Trino engine shares the read-only check, the
+// command tags and the cell typing.
+pub(crate) use cells::{base_type, convert_cell};
+pub(crate) use engine::check_read_only_as;
+pub(crate) use scan::{command_tag, scan as scan_words};
+
 use std::time::{Duration, Instant};
 
 use aws_credential_types::provider::SharedCredentialsProvider;
