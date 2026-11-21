@@ -30,6 +30,7 @@
 mod cells;
 mod check;
 mod engine;
+mod lex;
 mod validate;
 
 use std::collections::HashMap;
@@ -83,6 +84,12 @@ pub struct RedshiftTiming {
     pub poll_max: Duration,
     /// Base of the throttling retry backoff (`base * 2^attempt`, plus up to 50% jitter).
     pub retry_base: Duration,
+    /// Ceiling for a statement run without `ExecOptions.timeout_ms`, so no run polls forever
+    /// (R8). On expiry the statement is cancelled on the server.
+    pub default_timeout: Duration,
+    /// Deadline for a whole [`RedshiftEngine::schema_metadata`] call, which fans out into many
+    /// listing requests.
+    pub metadata_timeout: Duration,
 }
 
 impl Default for RedshiftTiming {
@@ -91,28 +98,97 @@ impl Default for RedshiftTiming {
             poll_initial: Duration::from_millis(100),
             poll_max: Duration::from_secs(1),
             retry_base: Duration::from_millis(250),
+            default_timeout: Duration::from_secs(60 * 60),
+            metadata_timeout: Duration::from_secs(60),
         }
     }
 }
 
-/// `Redshift · {cluster or workgroup} · {database} · {region}`: the status line and the agent's
-/// approval card. Built from the profile, never from anything a server or the model said.
+/// `Redshift · {cluster or workgroup} · {database} · {region} · {who}`: the status line and the
+/// agent's approval card. Built from the profile, never from anything a server or the model
+/// said. `{who}` is `as the IAM identity`, `as {db user}` or `via secret {name}`.
 pub fn describe_target(o: &RedshiftOptions, database: &str) -> String {
     let place = match &o.target {
         RedshiftTarget::Provisioned { cluster_identifier } => cluster_identifier.trim(),
         RedshiftTarget::Serverless { workgroup_name } => workgroup_name.trim(),
     };
     format!(
-        "Redshift · {place} · {} · {}",
+        "Redshift · {place} · {} · {} · {}",
         database.trim(),
-        o.aws.region.trim()
+        o.aws.region.trim(),
+        auth_text(&o.auth)
     )
 }
 
-/// `Err(PolicyDenied)` with the reason when `sql` contains transaction control, which no
-/// Redshift run accepts. For the agent policy, so the model learns why before anyone is asked.
-pub fn check_transaction_control(sql: &str) -> Result<()> {
-    check::check_no_transaction_control(&crate::sql::split_statements(sql))
+/// [`describe_target`] for the database a call resolves to ([`effective_database`]): the text
+/// for the approval card's `detail`.
+pub fn approval_detail(o: &RedshiftOptions, requested_database: Option<&str>) -> String {
+    describe_target(o, &effective_database(o, requested_database))
+}
+
+/// Who statements run as, for people: never the account id or the secret's random suffix.
+fn auth_text(a: &RedshiftAuth) -> String {
+    match a {
+        RedshiftAuth::IamIdentity => "as the IAM identity".to_string(),
+        RedshiftAuth::DbUser { db_user } => format!("as {}", db_user.trim()),
+        RedshiftAuth::Secret { secret_arn } => {
+            format!("via secret {}", secret_display_name(secret_arn))
+        }
+    }
+}
+
+/// `arn:…:secret:prod/redshift-AbC123` → `prod/redshift`: the name part, without the six
+/// characters Secrets Manager appends.
+fn secret_display_name(arn: &str) -> String {
+    let name = arn
+        .trim()
+        .split_once(":secret:")
+        .map(|(_, n)| n)
+        .unwrap_or("");
+    match name.rsplit_once('-') {
+        Some((base, suffix))
+            if !base.is_empty()
+                && suffix.len() == 6
+                && suffix.bytes().all(|b| b.is_ascii_alphanumeric()) =>
+        {
+            base.to_string()
+        }
+        _ => name.to_string(),
+    }
+}
+
+/// `Err(PolicyDenied)` with the reason when `sql` is refused on Redshift in every mode: a string
+/// literal with a backslash (Redshift and the classifier would read it differently), a split
+/// statement that still holds a `;`, or transaction control. For the agent policy and the
+/// production guard, so the same rules apply before anyone is asked.
+pub fn check_script(sql: &str) -> Result<()> {
+    check::check_script(&crate::sql::split_statements(sql))
+}
+
+/// The first function call in `sql` that a Redshift read-only run refuses (not a built-in known
+/// to only read, or qualified with a schema other than `pg_catalog`), as `name()`.
+pub fn unknown_function(sql: &str) -> Option<String> {
+    check::unknown_function(&crate::sql::split_statements(sql))
+}
+
+/// The production write guard for Redshift (`rs_execute`). `Err` when [`check_script`] refuses
+/// the script outright; otherwise `Some(reason)` when the run needs the user's confirmation: a
+/// write (class Write or above, judged only after the script was found unambiguous) or a call to
+/// a function that is not a read-only built-in, in a run that may write; in a read-only run, a
+/// statement that is not provably a read (the engine refuses the rest of what it would not run).
+pub fn prod_guard_reason(sql: &str, read_only: bool) -> Result<Option<String>> {
+    check_script(sql)?;
+    let c = crate::sql::classify(sql);
+    let unknown = unknown_function(sql);
+    let needs = if read_only {
+        c.overall == crate::sql::StatementClass::Unknown
+    } else {
+        c.overall >= crate::sql::StatementClass::Write || unknown.is_some()
+    };
+    Ok(needs.then(|| match unknown {
+        Some(f) => format!("{} (calls {f})", c.summary),
+        None => c.summary,
+    }))
 }
 
 /// The database a call runs in: the requested one, else the profile's.
@@ -126,6 +202,8 @@ pub fn effective_database(o: &RedshiftOptions, requested: Option<&str>) -> Strin
 
 pub struct RedshiftEngine {
     opts: RedshiftOptions,
+    /// Kept only to rebuild the client for an endpoint override (test builds).
+    #[cfg(any(test, feature = "test-util"))]
     creds: SharedCredentialsProvider,
     timing: RedshiftTiming,
     client: aws_sdk_redshiftdata::Client,
@@ -139,6 +217,7 @@ impl RedshiftEngine {
         let client = engine::build_client(&opts.aws.region, &creds, None);
         Ok(Self {
             opts,
+            #[cfg(any(test, feature = "test-util"))]
             creds,
             timing: RedshiftTiming::default(),
             client,
@@ -148,6 +227,7 @@ impl RedshiftEngine {
     /// Sends every request to `url` instead of the regional endpoint. A hook for tests and for
     /// the connection manager's test wiring: it is deliberately not a profile setting (R3, R4),
     /// so nothing a user or a hand-edited file says can point signed requests elsewhere.
+    #[cfg(any(test, feature = "test-util"))]
     #[doc(hidden)]
     #[must_use]
     pub fn with_endpoint_url(mut self, url: impl Into<String>) -> Self {
@@ -488,7 +568,33 @@ impl RedshiftEngine {
     /// Compact catalog for the editor and the agent: tables and views with their columns, of
     /// one schema or of every non-system schema, at most `max_tables`. `truncated` says when
     /// the cap (or a page cap) cut it. Redshift has no indexes or enforced keys to report.
+    ///
+    /// `max_tables` is clamped to [`DEFAULT_MAX_TABLES`], and the whole call has a deadline
+    /// (`RedshiftTiming::metadata_timeout`, 60 s): it fans out into a request per schema and
+    /// page, and the UI can ask for it directly.
     pub async fn schema_metadata(
+        &self,
+        database: Option<&str>,
+        schema_filter: Option<&str>,
+        max_tables: usize,
+    ) -> Result<SchemaMetadata> {
+        let limit = self.timing.metadata_timeout;
+        let max_tables = max_tables.min(DEFAULT_MAX_TABLES);
+        match tokio::time::timeout(
+            limit,
+            self.schema_metadata_unbounded(database, schema_filter, max_tables),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(CoreError::Timeout(format!(
+                "reading the Redshift catalog took longer than {} s; name a schema to read less",
+                limit.as_secs()
+            ))),
+        }
+    }
+
+    async fn schema_metadata_unbounded(
         &self,
         database: Option<&str>,
         schema_filter: Option<&str>,
@@ -612,15 +718,57 @@ mod tests {
         });
         assert_eq!(
             describe_target(&p, "dev"),
-            "Redshift · analytics · dev · eu-west-1"
+            "Redshift · analytics · dev · eu-west-1 · as the IAM identity"
         );
-        let s = opts(RedshiftTarget::Serverless {
+        let mut s = opts(RedshiftTarget::Serverless {
             workgroup_name: "wg".into(),
         });
         assert_eq!(
             describe_target(&s, "sales"),
-            "Redshift · wg · sales · eu-west-1"
+            "Redshift · wg · sales · eu-west-1 · as the IAM identity"
         );
+        s.auth = RedshiftAuth::Secret {
+            secret_arn: "arn:aws:secretsmanager:eu-west-1:123456789012:secret:prod/rs-app-AbC123"
+                .into(),
+        };
+        let d = approval_detail(&s, None);
+        assert_eq!(
+            d,
+            "Redshift · wg · dev · eu-west-1 · via secret prod/rs-app"
+        );
+        assert!(!d.contains("123456789012") && !d.contains("AbC123"));
+        let mut p = p;
+        p.auth = RedshiftAuth::DbUser {
+            db_user: "reader".into(),
+        };
+        assert_eq!(
+            approval_detail(&p, Some(" sales ")),
+            "Redshift · analytics · sales · eu-west-1 · as reader"
+        );
+        // A name without the random suffix is shown whole.
+        assert_eq!(
+            secret_display_name("arn:aws:secretsmanager:r:1:secret:plain"),
+            "plain"
+        );
+    }
+
+    /// HIGH 1 (c): the guard `rs_execute` uses refuses the backslash payloads outright, and asks
+    /// for confirmation where the Postgres guard would see no write.
+    #[test]
+    fn production_guard_is_redshift_aware() {
+        for sql in [
+            r"SELECT '\' , ' AS x INTO public.pwned FROM secrets -- '",
+            r"SELECT '\' , ' , pg_terminate_backend(123) -- '",
+        ] {
+            for ro in [false, true] {
+                assert!(prod_guard_reason(sql, ro).is_err(), "{sql}");
+            }
+        }
+        assert_eq!(prod_guard_reason("SELECT 1", false).unwrap(), None);
+        assert!(prod_guard_reason("DELETE FROM t", false).unwrap().is_some());
+        let r = prod_guard_reason("SELECT f_notify(x) FROM t", false).unwrap();
+        assert!(r.is_some_and(|r| r.contains("f_notify()")));
+        assert!(prod_guard_reason("BEGIN", false).is_err());
     }
 
     #[test]

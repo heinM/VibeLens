@@ -198,7 +198,7 @@ async fn connect_reports_the_target_and_never_tunnels() {
     assert_eq!(st.state, ConnectionState::Connected);
     assert_eq!(
         st.server_version.as_deref(),
-        Some("Redshift · analytics-1 · dev · eu-west-1")
+        Some("Redshift · analytics-1 · dev · eu-west-1 · as the IAM identity")
     );
     assert!(!st.tunneled);
     assert_eq!(h.tunnels.opened.load(Ordering::SeqCst), 0);
@@ -226,7 +226,7 @@ async fn connect_reports_the_target_and_never_tunnels() {
     assert!(!Arc::ptr_eq(&a, &c));
     assert_eq!(
         h.mgr.status()[0].server_version.as_deref(),
-        Some("Redshift · analytics-1 · sales · eu-west-1")
+        Some("Redshift · analytics-1 · sales · eu-west-1 · as the IAM identity")
     );
 
     h.mgr.disconnect("r1").await.unwrap();
@@ -265,7 +265,7 @@ async fn test_connection_checks_the_whole_path_and_refuses_invalid_drafts_offlin
     assert!(ok.ok, "{}", ok.message);
     assert_eq!(
         ok.server_version.as_deref(),
-        Some("Redshift · default-wg · dev · eu-west-1")
+        Some("Redshift · default-wg · dev · eu-west-1 · as the IAM identity")
     );
     assert_eq!(
         h.server.calls("ListDatabases")[0]["WorkgroupName"],

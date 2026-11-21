@@ -1058,6 +1058,11 @@ const SIDE_EFFECT_NAMES: &[&str] = &[
     "pg_stat_file",
     "lowrite",
     "loread",
+    // Amazon Redshift workload and cluster administration.
+    "change_query_priority",
+    "change_session_priority",
+    "change_user_priority",
+    "reboot_cluster",
 ];
 
 /// Schemas whose every function is treated as side-effecting (extensions that reach outside the
@@ -1982,6 +1987,19 @@ mod tests {
             ("select database_to_xml(true, false, '')", "database_to_xml"),
         ] {
             assert_flagged(sql, f);
+        }
+    }
+
+    /// Redshift's workload and cluster administration functions are not reads.
+    #[test]
+    fn redshift_admin_functions_are_side_effects() {
+        for sql in [
+            "select change_query_priority(123, 'high')",
+            "select change_session_priority(123, 'high')",
+            "select change_user_priority('bob', 'high')",
+            "select reboot_cluster()",
+        ] {
+            assert_eq!(classify(sql).overall, Unknown, "{sql}");
         }
     }
 

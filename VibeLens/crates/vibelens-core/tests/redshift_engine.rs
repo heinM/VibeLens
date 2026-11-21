@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use vibelens_core::CoreError;
 use vibelens_core::model::*;
-use vibelens_core::redshift::RedshiftEngine;
+use vibelens_core::redshift::{RedshiftEngine, RedshiftTiming};
 
 fn opts() -> ExecOptions {
     ExecOptions {
@@ -770,6 +770,182 @@ async fn empty_scripts_finish_without_calling_redshift() {
         e.execute_collect("", None, opts()).await.unwrap(),
         QueryResult::default()
     );
+    assert!(server.all().is_empty());
+}
+
+// ---- audit fixes (2026-11) -------------------------------------------------------------------
+
+/// HIGH 1: Redshift reads `\'` inside a literal as an escaped quote, the classifier does not.
+/// Without the check the first payload is classified as a SELECT of two literals while Redshift
+/// runs `SELECT … INTO public.pwned FROM secrets`, and the second hides `pg_terminate_backend`.
+#[tokio::test]
+async fn backslash_literals_are_refused_before_any_request_in_every_mode() {
+    let server = serve(refuse_everything()).await;
+    let e = engine(&server);
+    for sql in [
+        r"SELECT '\' , ' AS x INTO public.pwned FROM secrets -- '",
+        r"SELECT '\' , ' , pg_terminate_backend(123) -- '",
+    ] {
+        for read_only in [false, true] {
+            let events = stream(
+                &e,
+                sql,
+                ExecOptions {
+                    read_only,
+                    ..ExecOptions::default()
+                },
+            )
+            .await;
+            let (idx, code, msg) = failure(&events);
+            assert_eq!((idx, code.as_str()), (None, "policy_denied"), "{sql}");
+            assert!(
+                msg.contains("backslash") && msg.contains("CHR(92)"),
+                "{msg}"
+            );
+        }
+    }
+    assert!(server.all().is_empty(), "{:?}", server.all());
+}
+
+/// MEDIUM 2: on Redshift nothing but this check stops a Lambda UDF or a SageMaker function in a
+/// read-only run from sending row data out.
+#[tokio::test]
+async fn read_only_refuses_unknown_functions_before_any_request() {
+    let server = serve(refuse_everything()).await;
+    let e = engine(&server);
+    for sql in [
+        "SELECT f_notify(card_number) FROM payments",
+        "SELECT myschema.f(x) FROM t",
+        "SELECT change_user_priority('bob', 'highest')",
+    ] {
+        let events = stream(&e, sql, ro()).await;
+        let (_, code, msg) = failure(&events);
+        assert_eq!(code, "policy_denied", "{sql}");
+        let name = sql.split('(').next().unwrap().rsplit(' ').next().unwrap();
+        assert!(msg.contains(name), "{msg}");
+    }
+    assert!(server.all().is_empty());
+}
+
+/// MEDIUM 3: a statement run without a timeout still has one (the default ceiling), and passing
+/// it cancels the statement on the server.
+#[tokio::test]
+async fn a_run_without_a_timeout_gets_the_default_ceiling() {
+    let server = serve(Arc::new(|req: &Req| match op(req).as_str() {
+        "ExecuteStatement" => executed("stmt-1"),
+        "DescribeStatement" => described("stmt-1", "STARTED", false, -1),
+        "CancelStatement" => Resp::ok(&json!({"Status": true})),
+        _ => Resp::error(400, "ValidationException", "unexpected"),
+    }))
+    .await;
+    let e = RedshiftEngine::new(provisioned(RedshiftAuth::IamIdentity), creds())
+        .unwrap()
+        .with_endpoint_url(&server.url)
+        .with_timing(RedshiftTiming {
+            default_timeout: Duration::from_millis(80),
+            ..fast()
+        });
+    let events = stream(&e, "SELECT 1", ExecOptions::default()).await;
+    assert_eq!(failure(&events).1, "timeout");
+    assert_eq!(server.calls("CancelStatement")[0]["Id"], "stmt-1");
+}
+
+/// MEDIUM 3: when the result receiver goes away (the window closed) while the statement runs,
+/// polling stops and the statement is cancelled on the server.
+#[tokio::test]
+async fn a_closed_result_channel_stops_polling_and_cancels() {
+    let server = serve(Arc::new(|req: &Req| match op(req).as_str() {
+        "ExecuteStatement" => executed("stmt-1"),
+        "DescribeStatement" => described("stmt-1", "STARTED", false, -1),
+        "CancelStatement" => Resp::ok(&json!({"Status": true})),
+        _ => Resp::error(400, "ValidationException", "unexpected"),
+    }))
+    .await;
+    let e = Arc::new(engine(&server));
+    let (tx, mut rx) = mpsc::channel(4);
+    let task = {
+        let e = e.clone();
+        tokio::spawn(async move {
+            e.execute_stream(
+                "q".into(),
+                "SELECT * FROM big",
+                None,
+                ExecOptions::default(),
+                CancellationToken::new(),
+                tx,
+            )
+            .await
+        })
+    };
+    assert!(matches!(rx.recv().await, Some(QueryEvent::Started { .. })));
+    for _ in 0..200 {
+        if server.count("DescribeStatement") >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    drop(rx);
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the run noticed the closed channel")
+        .unwrap()
+        .unwrap();
+    assert_eq!(server.calls("CancelStatement")[0]["Id"], "stmt-1");
+}
+
+/// MEDIUM 3: the catalog call is clamped to the default table cap whatever IPC asks for.
+#[tokio::test]
+async fn schema_metadata_clamps_the_table_cap() {
+    let tables: Vec<serde_json::Value> = (0..2500)
+        .map(|i| json!({"schema": "public", "name": format!("t{i}"), "type": "TABLE"}))
+        .collect();
+    let server = serve(Arc::new(move |req: &Req| match op(req).as_str() {
+        "ListTables" => Resp::ok(&json!({"Tables": tables})),
+        "DescribeTable" => Resp::ok(&json!({"ColumnList": []})),
+        other => Resp::error(400, "ValidationException", &format!("unexpected {other}")),
+    }))
+    .await;
+    let meta = engine(&server)
+        .schema_metadata(None, Some("public"), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        meta.tables.len(),
+        vibelens_core::redshift::DEFAULT_MAX_TABLES
+    );
+    assert!(meta.truncated);
+}
+
+/// MEDIUM 3: the whole catalog call has a deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn schema_metadata_has_an_overall_deadline() {
+    let server = serve(Arc::new(|_req: &Req| {
+        std::thread::sleep(Duration::from_millis(300));
+        Resp::ok(&json!({"Schemas": ["public"]}))
+    }))
+    .await;
+    let e = RedshiftEngine::new(provisioned(RedshiftAuth::IamIdentity), creds())
+        .unwrap()
+        .with_endpoint_url(&server.url)
+        .with_timing(RedshiftTiming {
+            metadata_timeout: Duration::from_millis(100),
+            ..fast()
+        });
+    let err = e.schema_metadata(None, None, 10).await.unwrap_err();
+    assert!(matches!(err, CoreError::Timeout(_)), "{err:?}");
+}
+
+/// LOW 4: a requested database must be ASCII, so a look-alike of the default cannot be named.
+#[tokio::test]
+async fn a_look_alike_database_name_is_refused() {
+    let server = serve(refuse_everything()).await;
+    let e = engine(&server);
+    let err = e
+        .execute_collect("SELECT 1", Some("d\u{0435}v"), ExecOptions::default())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("ASCII"), "{err}");
+    assert!(e.list_schemas(Some("d\u{0435}v")).await.is_err());
     assert!(server.all().is_empty());
 }
 

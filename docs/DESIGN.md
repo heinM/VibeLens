@@ -198,7 +198,17 @@ provisioned only) or `secret` (a Secrets Manager ARN the Data API reads server-s
   nothing unexpected is signed and sent. No endpoint override in the profile.
 - **Read-only.** No read-only session exists, so the pre-submit check is the enforcement: the
   classifier must parse and class every statement read-only; Redshift `SHOW …` forms are admitted by a
-  narrow text check. Fails closed.
+  narrow text check. Fails closed. Every function call in a read-only run must be on an allow-list
+  of Redshift built-ins that only read (schema-qualified calls other than `pg_catalog.` are
+  refused): a Lambda UDF or SageMaker function could send rows out, and no read-only session
+  would stop it. Such a statement can still run with approval.
+- **One meaning only, every mode.** Redshift reads `\'` in a literal as an escaped quote, the
+  classifier does not; a statement with a backslash in a string literal (under either reading), or
+  a split statement still holding a top-level `;`, is refused before anything is sent. The agent
+  policy and `rs_execute`'s production guard apply the same check.
+- **Deadlines.** A statement without a timeout gets a 1-hour ceiling; a closed result channel
+  stops polling and cancels the statement; `rs_schema_metadata` is capped at 2000 tables and 60 s.
+  Endpoint overrides exist only in test builds (`test-util` feature).
 - **No transactions.** Each statement commits on its own, so `BEGIN`/`COMMIT`/`ROLLBACK`/`START
   TRANSACTION`/`END`/`ABORT` (and savepoints) are refused in every mode with that reason.
 - **Bounds.** `max_rows` with `truncated`, `MAX_CELL_BYTES` markers, `PAGE_BYTE_BUDGET` page cuts,
