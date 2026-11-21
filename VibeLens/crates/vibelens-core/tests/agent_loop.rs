@@ -329,6 +329,10 @@ struct FakeBackend {
     unreadable: Mutex<std::collections::BTreeSet<String>>,
     /// The `expected` version of every `write_file` call, in call order.
     write_expectations: Mutex<Vec<FileVersion>>,
+    /// `execute_sql` runs until its token fires, then takes a moment to "stop the statement
+    /// on the server" and records that it did.
+    hang_until_cancelled: std::sync::atomic::AtomicBool,
+    stopped_on_server: std::sync::atomic::AtomicBool,
 }
 
 fn fake_error(kind: &str, msg: &str) -> CoreError {
@@ -403,6 +407,7 @@ impl ToolBackend for FakeBackend {
         sql: &str,
         read_only: bool,
         _max_rows: usize,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<QueryResult> {
         self.sql_calls.lock().unwrap().push(SqlCall {
             profile: profile_id.into(),
@@ -412,6 +417,16 @@ impl ToolBackend for FakeBackend {
         });
         if let Some((kind, msg)) = self.fail.lock().unwrap().clone() {
             return Err(fake_error(kind, &msg));
+        }
+        if self
+            .hang_until_cancelled
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            cancel.cancelled().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            self.stopped_on_server
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return Err(CoreError::Cancelled);
         }
         let rows = self.sql_rows.lock().unwrap().clone();
         Ok(QueryResult {
@@ -1068,6 +1083,63 @@ async fn cancel_while_awaiting_approval_ends_cleanly_and_session_stays_usable() 
             .last()
             .unwrap()["text"],
         "never mind, say hi"
+    );
+}
+
+/// Audit 2026-11-21, item 6: Stop used to drop the running tool, so the engine never stopped
+/// the statement on the server. Now the tool gets the turn's token and is awaited while it
+/// cancels.
+#[tokio::test]
+async fn stop_lets_a_running_query_be_cancelled_on_the_server() {
+    let h = Harness::anthropic(
+        vec![Reply::Sse(anthropic_sse(
+            "",
+            &[(
+                "t1",
+                "run_sql",
+                json!({"profile_id": "p1", "sql": "select * from big", "purpose": "look"}),
+            )],
+            "tool_use",
+            (1, 1),
+        ))],
+        vec![profile(
+            "p1",
+            EngineKind::Postgres,
+            Environment::Dev,
+            AiDataAccess::Results,
+        )],
+    )
+    .await;
+    h.backend
+        .hang_until_cancelled
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (_, mut rx) = h
+        .start("s1", "anthropic", "hello", AgentContext::default())
+        .await;
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(ev, AgentEvent::ToolStarted { .. }) {
+            break;
+        }
+    }
+    h.svc.cancel("s1").await.unwrap();
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if is_terminal(&ev) {
+            break;
+        }
+    }
+    assert!(
+        h.backend
+            .stopped_on_server
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the tool saw the cancel and finished stopping before the turn ended"
     );
 }
 
@@ -2020,6 +2092,7 @@ async fn approval_target_names_a_model_chosen_database_and_execution_uses_it() {
             database: Some("payments_prod".into()),
             default_database: Some("shop".into()),
             valkey_db: None,
+            detail: None,
         }
     );
     assert!(
@@ -2094,6 +2167,7 @@ async fn approval_target_names_the_valkey_db_the_command_runs_on() {
             database: None,
             default_database: None,
             valkey_db: Some(3),
+            detail: None,
         }
     );
     assert!(reason.contains("(db 3)"), "{reason}");

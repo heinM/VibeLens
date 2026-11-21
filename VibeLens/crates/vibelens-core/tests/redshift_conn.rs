@@ -326,7 +326,14 @@ async fn agent_backend_runs_redshift_sql_and_reads_its_catalog() {
     );
 
     let r = backend
-        .execute_sql("r1", Some("sales"), "SELECT 1 AS n", true, 10)
+        .execute_sql(
+            "r1",
+            Some("sales"),
+            "SELECT 1 AS n",
+            true,
+            10,
+            tokio_util::sync::CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(r.rows, vec![vec![json!(1)]]);
@@ -335,7 +342,14 @@ async fn agent_backend_runs_redshift_sql_and_reads_its_catalog() {
     // A read-only agent call never submits a write.
     let before = h.server.count("ExecuteStatement");
     let err = backend
-        .execute_sql("r1", None, "DELETE FROM sales", true, 10)
+        .execute_sql(
+            "r1",
+            None,
+            "DELETE FROM sales",
+            true,
+            10,
+            tokio_util::sync::CancellationToken::new(),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, CoreError::PolicyDenied(_)), "{err:?}");

@@ -879,3 +879,29 @@ async fn omitted_settings_are_left_out_of_the_request() {
     assert!(s["QueryExecutionContext"].get("Database").is_none());
     assert_eq!(s["WorkGroup"], "primary");
 }
+
+/// Audit 2026-11-21, item 6: the bounded run the agent uses stops the query on Athena when its
+/// token fires, before it returns.
+#[tokio::test]
+async fn cancelling_a_collect_run_stops_the_athena_query() {
+    let server = serve(Arc::new(|req: &Req| match op(req).as_str() {
+        "StartQueryExecution" => started("qid-1"),
+        "GetQueryExecution" => execution("RUNNING", "DML", 0),
+        "StopQueryExecution" => Resp::ok("{}"),
+        _ => Resp::error(400, "InvalidRequestException", "unexpected"),
+    }))
+    .await;
+    let e = engine(&server);
+    let cancel = CancellationToken::new();
+    let c = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        c.cancel();
+    });
+    let err = e
+        .execute_collect_cancellable("SELECT * FROM big", ExecOptions::default(), cancel)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CoreError::Cancelled), "{err:?}");
+    assert_eq!(calls(&server, "StopQueryExecution").len(), 1);
+}

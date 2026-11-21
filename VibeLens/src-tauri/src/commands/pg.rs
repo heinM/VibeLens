@@ -2,7 +2,7 @@ use tauri::State;
 use tauri::ipc::Channel;
 use tokio::sync::mpsc;
 use vibelens_core::model::*;
-use vibelens_core::sql::{StatementClass, classify};
+use vibelens_core::sql::StatementClass;
 use vibelens_core::{CoreError, ErrorPayload};
 
 use super::{CmdResult, err};
@@ -129,7 +129,18 @@ pub async fn pg_execute(
 /// (`dblink_exec`, `lo_export`, `pg_terminate_backend`, advisory locks, …), which the classifier
 /// reports as `Unknown`. So read-only runs are still classified on prod.
 pub(crate) fn prod_guard_reason(sql: &str, read_only: bool) -> Option<String> {
-    let c = classify(sql);
+    prod_guard_reason_on(None, sql, read_only)
+}
+
+/// [`prod_guard_reason`] for an Iceberg connection on `engine`: Trino and Spark SQL the
+/// PostgreSQL parser cannot read is judged by the engine's own read-only check
+/// (`remote::classify_on`), so ordinary reads do not hit the write guard.
+pub(crate) fn prod_guard_reason_on(
+    engine: Option<&vibelens_core::model::IcebergQueryEngine>,
+    sql: &str,
+    read_only: bool,
+) -> Option<String> {
+    let c = vibelens_core::remote::classify_on(engine, sql);
     let needs = if read_only {
         c.overall == StatementClass::Unknown
     } else {

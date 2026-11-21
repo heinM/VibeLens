@@ -240,7 +240,14 @@ async fn ice_missing_deps_is_invalid_and_is_not_a_connection_failure() {
     ));
     let (b, _ws) = backend(&h);
     let err = b
-        .execute_sql(&p.id, None, "select 1", true, 10)
+        .execute_sql(
+            &p.id,
+            None,
+            "select 1",
+            true,
+            10,
+            tokio_util::sync::CancellationToken::new(),
+        )
         .await
         .unwrap_err();
     assert!(
@@ -737,6 +744,7 @@ async fn ice_tool_backend_runs_sql_and_reads_the_schema() {
             "select count(*) as n from shop.customers",
             true,
             100,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("select");
@@ -748,6 +756,7 @@ async fn ice_tool_backend_runs_sql_and_reads_the_schema() {
             "select id from customers order by id limit 3",
             true,
             100,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("default namespace resolves unqualified names");
@@ -755,7 +764,14 @@ async fn ice_tool_backend_runs_sql_and_reads_the_schema() {
 
     // max_rows is honoured.
     let res = b
-        .execute_sql(&p.id, None, "select id from shop.customers", true, 7)
+        .execute_sql(
+            &p.id,
+            None,
+            "select id from shop.customers",
+            true,
+            7,
+            tokio_util::sync::CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(res.rows.len(), 7);
@@ -769,6 +785,7 @@ async fn ice_tool_backend_runs_sql_and_reads_the_schema() {
             "insert into shop.customers select * from shop.customers",
             true,
             10,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .unwrap_err();
@@ -777,7 +794,14 @@ async fn ice_tool_backend_runs_sql_and_reads_the_schema() {
         "{err:?}"
     );
     let still = b
-        .execute_sql(&p.id, None, "select count(*) from shop.customers", true, 10)
+        .execute_sql(
+            &p.id,
+            None,
+            "select count(*) from shop.customers",
+            true,
+            10,
+            tokio_util::sync::CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(still.rows, vec![vec![serde_json::json!("500")]]);
@@ -789,6 +813,7 @@ async fn ice_tool_backend_runs_sql_and_reads_the_schema() {
             "delete from shop.customers where id = 1",
             false,
             10,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .unwrap_err();

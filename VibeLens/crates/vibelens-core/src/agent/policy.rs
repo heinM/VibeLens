@@ -34,7 +34,7 @@ use crate::model::{
     AiDataAccess, ApprovalTarget, ConnectionProfile, EngineKind, Environment, IcebergQueryEngine,
     RedshiftOptions, ToolRisk, effective_database,
 };
-use crate::sql::{SqlClassification, StatementClass, classify};
+use crate::sql::{SqlClassification, StatementClass};
 
 /// The facts about a connection that policy needs. Never includes host or credentials.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,12 +50,23 @@ pub(super) struct ProfileFacts {
     /// `remote::config::engine_target` names it (engine, endpoint host and port, catalog; no
     /// credentials). Shown in approval text. `None` for every other engine.
     pub remote_engine: Option<String>,
+    /// Iceberg connection on Trino or Spark: its engine (whose own read-only check corrects
+    /// the PostgreSQL classifier, see `remote::classify_on`) and the approval card's detail
+    /// line. `None` for every other engine.
+    pub remote: Option<RemoteFacts>,
     /// The profile's configured database (Postgres and Redshift; `None` when unset or another
     /// engine). Always resolved through [`effective_database`], the rule execution uses.
     pub database: Option<String>,
     /// Redshift connection options (cluster or workgroup, region; identifiers, no secret), for
     /// the approval card's target line. `None` for every other engine.
     pub redshift: Option<RedshiftOptions>,
+}
+
+/// See [`ProfileFacts::remote`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RemoteFacts {
+    pub engine: IcebergQueryEngine,
+    pub detail: Option<String>,
 }
 
 impl From<&ConnectionProfile> for ProfileFacts {
@@ -74,6 +85,20 @@ impl From<&ConnectionProfile> for ProfileFacts {
                 .as_ref()
                 .filter(|_| p.engine == EngineKind::Iceberg)
                 .and_then(|o| crate::remote::config::engine_target(&o.query_engine)),
+            remote: p
+                .iceberg
+                .as_ref()
+                .filter(|o| {
+                    p.engine == EngineKind::Iceberg
+                        && matches!(
+                            o.query_engine,
+                            IcebergQueryEngine::Trino { .. } | IcebergQueryEngine::Spark { .. }
+                        )
+                })
+                .map(|o| RemoteFacts {
+                    engine: o.query_engine.clone(),
+                    detail: crate::remote::config::engine_detail(o),
+                }),
             database: match p.engine {
                 EngineKind::Redshift => p.redshift.as_ref().map(|o| o.database.clone()),
                 _ => p
@@ -117,6 +142,7 @@ pub(super) fn approval_target(call: &ToolCall, f: &ProfileFacts) -> Option<Appro
         database: postgres.then(|| effective_database(f.database.as_deref(), requested)),
         default_database: postgres.then(|| effective_database(f.database.as_deref(), None)),
         valkey_db: valkey_db.filter(|_| f.engine == EngineKind::Valkey),
+        detail: f.remote.as_ref().and_then(|r| r.detail.clone()),
     })
 }
 
@@ -435,7 +461,7 @@ fn assess_sql(f: &ProfileFacts, database: Option<&str>, sql: &str, purpose: &str
     {
         return Assessment::denied(e.to_string());
     }
-    let c = classify(sql);
+    let c = crate::remote::classify_on(f.remote.as_ref().map(|r| &r.engine), sql);
     let preview = Some(sql.to_string());
     let target = sql_target_text(f, database);
     match c.overall {
@@ -561,6 +587,7 @@ mod tests {
             access,
             athena: false,
             remote_engine: None,
+            remote: None,
             database: Some("shop".into()),
             redshift: None,
         }
@@ -573,6 +600,7 @@ mod tests {
             access,
             athena,
             remote_engine: None,
+            remote: None,
             database: None,
             redshift: None,
         }
@@ -585,6 +613,7 @@ mod tests {
             access,
             athena: false,
             remote_engine: None,
+            remote: None,
             database: None,
             redshift: None,
         }
@@ -598,6 +627,7 @@ mod tests {
             access,
             athena: false,
             remote_engine: None,
+            remote: None,
             database: Some("dev".into()),
             redshift: Some(RedshiftOptions {
                 target: RedshiftTarget::Serverless {
@@ -1479,6 +1509,65 @@ mod tests {
             ProfileFacts::from(&p).remote_engine.as_deref(),
             Some("Spark (Livy) at livy.example, catalog 'glue'")
         );
+
+        // Audit 2026-11-21, item 14: the approval card's detail line names engine, endpoint,
+        // catalog and namespace, never a credential.
+        p.iceberg.as_mut().unwrap().default_namespace = Some("shop".into());
+        let mut f = ProfileFacts::from(&p);
+        let t = approval_target(&sql("select 1"), &f).unwrap();
+        assert_eq!(
+            t.detail.as_deref(),
+            Some("Spark (Livy) · livy.example:443 · catalog glue · namespace shop")
+        );
+
+        // Item 13: Spark SQL the PostgreSQL parser cannot read is judged by the engine's own
+        // check. Without it an ordinary read showed a "may do anything" card and, once
+        // approved, ran with read_only = false, skipping the Spark scan.
+        f.access = Results;
+        for s in [
+            "SELECT `id` FROM lake.shop.orders VERSION AS OF 1 LIMIT 10",
+            "SHOW TABLES IN lake.shop",
+        ] {
+            let r = assess(&sql(s), Some(&f), false);
+            assert_eq!(r.risk, Safe, "{s}: {r:?}");
+        }
+        for s in [
+            // The PostgreSQL classifier calls this a read: it runs read-only, where the
+            // Spark check refuses it before submission (remote_spark tests).
+            "SELECT reflect('java.lang.Runtime', 'getRuntime')",
+            // Unknown to both: approval, as before.
+            "SELECT * FROM text.`/etc/passwd`",
+        ] {
+            let r = assess(&sql(s), Some(&f), false);
+            assert!(r.risk != Safe || !r.allow_write, "{s}: {r:?}");
+        }
+        for s in [
+            "DELETE FROM lake.shop.orders",
+            "INSERT INTO t SELECT * FROM `x`",
+        ] {
+            let r = assess(&sql(s), Some(&f), false);
+            assert_eq!(r.risk, NeedsApproval, "{s}");
+        }
+        // Never the other way round: a write the PostgreSQL classifier sees stays a write.
+        let r = assess(&sql("DELETE FROM t"), Some(&f), false);
+        assert!(r.allow_write && r.risk == NeedsApproval);
+
+        // Trino: same, with Athena's check.
+        p.iceberg.as_mut().unwrap().query_engine = IcebergQueryEngine::Trino {
+            url: "https://trino.example/".into(),
+            catalog: "lake".into(),
+            user: "ana".into(),
+            auth: crate::model::HttpEngineAuth::None,
+            ca_cert_path: None,
+        };
+        let mut f = ProfileFacts::from(&p);
+        f.access = Results;
+        let r = assess(
+            &sql("SELECT * FROM shop.orders FOR VERSION AS OF 1 LIMIT 5"),
+            Some(&f),
+            false,
+        );
+        assert_eq!(r.risk, Safe, "{r:?}");
     }
 
     // ---- The target the user approves (review finding M3) --------------------------------
@@ -1572,6 +1661,7 @@ mod tests {
                 database: Some("payments_prod".into()),
                 default_database: Some("shop".into()),
                 valkey_db: None,
+                detail: None,
             }
         );
         let t = approval_target(&sql_on(None, "select 1"), &facts).unwrap();

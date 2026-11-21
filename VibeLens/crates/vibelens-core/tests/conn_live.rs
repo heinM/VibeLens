@@ -420,7 +420,14 @@ async fn conn_postgres_connect_reuse_databases_and_tool_backend() {
 
     let r = l
         .backend
-        .execute_sql(&p.id, None, "select 1 as one, 'x'::text as t", true, 100)
+        .execute_sql(
+            &p.id,
+            None,
+            "select 1 as one, 'x'::text as t",
+            true,
+            100,
+            tokio_util::sync::CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(r.row_count, 1);
@@ -435,6 +442,7 @@ async fn conn_postgres_connect_reuse_databases_and_tool_backend() {
             "select * from generate_series(1, 50)",
             true,
             10,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -449,6 +457,7 @@ async fn conn_postgres_connect_reuse_databases_and_tool_backend() {
             "create table vg_conn_must_not_exist(i int)",
             true,
             10,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
     assert!(

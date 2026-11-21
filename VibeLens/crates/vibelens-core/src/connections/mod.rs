@@ -46,6 +46,7 @@ use crate::ports::{
 use crate::redshift::RedshiftEngine;
 use crate::valkey::{ValkeyConnectParams, ValkeyHandle};
 use crate::workspace::WorkspaceFs;
+use tokio_util::sync::CancellationToken;
 
 /// How often the idle reaper wakes up.
 const REAP_INTERVAL: Duration = Duration::from_secs(30);
@@ -61,6 +62,9 @@ const AGENT_SQL_TIMEOUT_MS: u64 = 30_000;
 /// Athena queries are queued and run server-side, so they get a longer budget than a local scan.
 /// The same budget applies to the other remote engines (Trino, Spark).
 const AGENT_ATHENA_TIMEOUT_MS: u64 = 120_000;
+/// Whole-script budget for agent SQL, below the agent's 180 s tool timeout so the engine is
+/// cancelled (and stops the work on the server) before the agent gives up on the tool.
+const AGENT_SCRIPT_DEADLINE: Duration = Duration::from_secs(150);
 /// Redshift statements are queued and run server-side too (and a Serverless workgroup may have
 /// to resume first), so they get the same budget as Athena.
 const AGENT_REDSHIFT_TIMEOUT_MS: u64 = 120_000;
@@ -574,11 +578,22 @@ impl ConnectionManager {
                 value: secret,
             });
         }
-        if let Some(secret) = engine_secret_override {
+        // A secret typed for the test is bound to the endpoint being tested, and only there.
+        if let Some(secret) = engine_secret_override
+            && let Some(origin) = profile
+                .iceberg
+                .as_ref()
+                .and_then(|o| crate::remote::config::engine_origin(&o.query_engine))
+        {
             deps.vault = Arc::new(OverlayVault {
                 inner: deps.vault.clone(),
                 key: vault_keys::engine_secret(&profile.id),
                 value: secret,
+            });
+            deps.vault = Arc::new(OverlayVault {
+                inner: deps.vault.clone(),
+                key: vault_keys::engine_secret_origin(&profile.id),
+                value: SecretString::from(origin),
             });
         }
         let handle = IcebergHandle::connect(profile.clone(), deps).await?;
@@ -1398,25 +1413,16 @@ impl AppToolBackend {
             workspace,
         })
     }
-}
 
-#[async_trait]
-impl ToolBackend for AppToolBackend {
-    fn profile(&self, profile_id: &str) -> Result<ConnectionProfile> {
-        self.connections.profiles().get(profile_id)
-    }
-
-    fn list_profiles(&self) -> Result<Vec<ConnectionProfile>> {
-        self.connections.profiles().list()
-    }
-
-    async fn execute_sql(
+    /// `execute_sql` for one engine, stopped by `cancel`.
+    async fn execute_sql_inner(
         &self,
         profile_id: &str,
         database: Option<&str>,
         sql: &str,
         read_only: bool,
         max_rows: usize,
+        cancel: &CancellationToken,
     ) -> Result<QueryResult> {
         let profile = self.connections.profiles().get(profile_id)?;
         let mut opts = ExecOptions {
@@ -1438,17 +1444,67 @@ impl ToolBackend for AppToolBackend {
                 opts.timeout_ms = Some(AGENT_ATHENA_TIMEOUT_MS);
             }
             let handle = self.connections.iceberg(profile_id).await?;
-            return handle.execute_collect(sql, opts).await;
+            return handle
+                .execute_collect_cancellable(sql, opts, cancel.clone())
+                .await;
         }
         if profile.engine == EngineKind::Redshift {
             opts.timeout_ms = Some(AGENT_REDSHIFT_TIMEOUT_MS);
             let engine = self.connections.redshift(profile_id).await?;
-            return engine.execute_collect(sql, database, opts).await;
+            return engine
+                .execute_collect(sql, database, opts, cancel.clone())
+                .await;
         }
         // Everything else goes through the Postgres path, which rejects other engines with
         // a clear `Invalid`.
         let pg = self.connections.pg(profile_id, database).await?;
-        pg.execute_collect(sql, opts).await
+        pg.execute_collect_cancellable(sql, opts, cancel.clone())
+            .await
+    }
+}
+
+#[async_trait]
+impl ToolBackend for AppToolBackend {
+    fn profile(&self, profile_id: &str) -> Result<ConnectionProfile> {
+        self.connections.profiles().get(profile_id)
+    }
+
+    fn list_profiles(&self) -> Result<Vec<ConnectionProfile>> {
+        self.connections.profiles().list()
+    }
+
+    async fn execute_sql(
+        &self,
+        profile_id: &str,
+        database: Option<&str>,
+        sql: &str,
+        read_only: bool,
+        max_rows: usize,
+        cancel: CancellationToken,
+    ) -> Result<QueryResult> {
+        // One deadline for the whole script, below the agent's tool timeout: when it passes,
+        // the engine is cancelled and stops the statement on the server before returning.
+        let script = cancel.child_token();
+        let timer = {
+            let script = script.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(AGENT_SCRIPT_DEADLINE).await;
+                script.cancel();
+            })
+        };
+        let res = self
+            .execute_sql_inner(profile_id, database, sql, read_only, max_rows, &script)
+            .await;
+        timer.abort();
+        match res {
+            Err(CoreError::Cancelled) if !cancel.is_cancelled() && script.is_cancelled() => {
+                Err(CoreError::Timeout(format!(
+                    "the script did not finish within {} seconds; it was cancelled",
+                    AGENT_SCRIPT_DEADLINE.as_secs()
+                )))
+            }
+            other => other,
+        }
     }
 
     async fn schema_metadata(

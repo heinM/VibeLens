@@ -1175,12 +1175,23 @@ impl PgHandle {
     /// Bounded, materialised execution: the result of the last statement that returns rows
     /// (or of the last statement when none does). Errors are returned as `Err`.
     pub async fn execute_collect(&self, sql: &str, opts: ExecOptions) -> Result<QueryResult> {
+        self.execute_collect_cancellable(sql, opts, CancellationToken::new())
+            .await
+    }
+
+    /// [`execute_collect`](Self::execute_collect) that stops when `cancel` fires (the same
+    /// server-side cancel `execute_stream` uses).
+    pub async fn execute_collect_cancellable(
+        &self,
+        sql: &str,
+        opts: ExecOptions,
+        cancel: CancellationToken,
+    ) -> Result<QueryResult> {
         let statements = split_script(sql);
         if statements.is_empty() {
             return Ok(QueryResult::default());
         }
         let (tx, mut rx) = mpsc::channel::<QueryEvent>(32);
-        let cancel = CancellationToken::new();
         let runner = async {
             let end = self.run(&statements, &opts, &cancel, &tx).await;
             drop(tx);
