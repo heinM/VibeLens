@@ -8,13 +8,14 @@ import { copyToClipboard } from "../ui/clipboard";
 import { formatDateTime, groupDigits, relativeTime, signed } from "./iceFormat";
 import { opTone, refsBySnapshot, snapshotDelta, type OpTone } from "./iceTableModel";
 import { selectAsOfSnapshotSql } from "./iceSql";
+import type { SqlDialect } from "../../lib/sqlIntel/dialect";
 import { InlineEmpty, PaneHeader } from "./icePrimitives";
 
 const PAGE = 40;
 const DOT: Record<OpTone, string> = { ok: "bg-ok border-ok", warn: "bg-warn border-warn", danger: "bg-danger border-danger", muted: "bg-muted border-muted" };
 
 /** Newest-first timeline of table history. Each entry can open a time-travel query or hand over its id. */
-export function SnapshotsPane({ info, onQueryAsOf }: { info: IcebergTableInfo; onQueryAsOf: (snapshotId: string, sql: string) => void }) {
+export function SnapshotsPane({ info, dialect, onQueryAsOf }: { info: IcebergTableInfo; dialect?: SqlDialect | null; onQueryAsOf: (snapshotId: string, sql: string) => void }) {
   const [shown, setShown] = useState(PAGE);
   const byRef = useMemo(() => refsBySnapshot(info.refs), [info.refs]);
   const list = info.snapshots;
@@ -36,7 +37,7 @@ export function SnapshotsPane({ info, onQueryAsOf }: { info: IcebergTableInfo; o
               current={s.snapshotId === info.currentSnapshotId}
               last={i === Math.min(shown, list.length) - 1 && shown >= list.length}
               refs={byRef.get(s.snapshotId) ?? []}
-              onQueryAsOf={() => onQueryAsOf(s.snapshotId, selectAsOfSnapshotSql(info.namespace, info.name, s.snapshotId))}
+              onQueryAsOf={() => onQueryAsOf(s.snapshotId, selectAsOfSnapshotSql(info.namespace, info.name, s.snapshotId, 100, dialect))}
             />
           ))}
         </ol>

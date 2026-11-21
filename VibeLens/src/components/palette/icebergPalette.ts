@@ -8,6 +8,7 @@ import { useWorkspaceStore } from "../../store/useWorkspaceStore";
 import { requestAutoRun } from "../editor/autoRun";
 import { iceQueries } from "../iceberg/iceQueries";
 import { selectAllSql } from "../iceberg/iceSql";
+import { dialectOf } from "../../lib/sqlIntel/dialect";
 import { joinNamespace } from "../iceberg/openIcebergTab";
 import type { PaletteItem } from "./items";
 
@@ -112,6 +113,6 @@ export function defaultIcebergTableActions(openTab: (profileId: string, namespac
       useUIStore.getState().setActiveTarget(p.id, null);
       openTab(p.id, namespace, name);
     },
-    queryTable: (p, namespace, name) => void openIcebergQueryTab(p, { title: `${name}.sql`, contents: selectAllSql(namespace, name), autoRun: true }),
+    queryTable: (p, namespace, name) => void openIcebergQueryTab(p, { title: `${name}.sql`, contents: selectAllSql(namespace, name, 100, dialectOf(p)), autoRun: true }),
   };
 }

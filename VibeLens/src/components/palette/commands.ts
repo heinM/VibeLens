@@ -1,9 +1,12 @@
 // The "Commands" list (⌘⇧P). Pure builder: everything it needs arrives in `env`.
-import type { ConnectionProfile, ConnectionState } from "../../ipc/types";
+import type { ConnectionProfile, ConnectionState, EngineKind } from "../../ipc/types";
 import type { AiMode } from "../../store/useUIStore";
 import { AI_MODES } from "../layout/aiModes";
 import type { ErdTarget } from "./erdTarget";
 import type { PaletteItem } from "./items";
+
+/** Engine named on the Connect / Disconnect rows. */
+const ENGINE_PALETTE_META: Record<EngineKind, string> = { postgres: "PostgreSQL", iceberg: "Iceberg", redshift: "Redshift", valkey: "Valkey" };
 
 export interface CommandActions {
   newSqlTab: () => void;
@@ -94,8 +97,8 @@ export function buildCommands(env: CommandEnv): PaletteItem[] {
         icon: live ? "unplug" : "plug",
         tone: live ? "muted" : "emerald",
         env: p.environment,
-        meta: p.engine === "postgres" ? "PostgreSQL" : p.engine === "iceberg" ? "Iceberg" : "Valkey",
-        search: `${p.engine === "iceberg" ? "iceberg lakehouse" : p.host} ${live ? "close" : "open"}`,
+        meta: ENGINE_PALETTE_META[p.engine],
+        search: `${p.engine === "iceberg" ? "iceberg lakehouse" : p.engine === "redshift" ? "redshift warehouse" : p.host} ${live ? "close" : "open"}`,
         run: () => (live ? a.disconnect(p.id) : a.connect(p.id)),
       }),
     );

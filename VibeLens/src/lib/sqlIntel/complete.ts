@@ -2,7 +2,7 @@
 // types here, so it is unit-testable and the provider is a thin mapping.
 import type { TableDescription } from "../../ipc/types";
 import { type Catalog, childNamespaces, describeColumnBadges, foreignKeysByColumn, formatRows, ident, isDefaultSchema, kindLabel, lookupTable, quoteIdent, resolveSchemaQualifier, schemaIdent, schemaTables } from "./catalog";
-import { METADATA_TABLES, type SqlDialect, afterRelationExtras, functionsFor, snippetsFor, statementStartFor, tableSuffixTarget, typeNamesFor } from "./dialect";
+import { METADATA_TABLES, type SqlDialect, afterRelationExtras, functionsFor, isTrinoFamily, snippetsFor, statementStartFor, tableSuffixTarget, typeNamesFor } from "./dialect";
 import { type Analysis, type Context, analyzeAt, tokenizeCached } from "./analysis";
 import { type ColumnEntry, columnsOf, tableOf } from "./columns";
 import { joinConditions } from "./joins";
@@ -63,9 +63,11 @@ function tableDocs(t: TableDescription, dialect?: SqlDialect | null): string {
   const travel =
     dialect === "datafusion"
       ? `\n\nTime travel: \`"${t.name}@<snapshot_id>"\``
-      : dialect === "athena"
+      : isTrinoFamily(dialect)
         ? `\n\nTime travel: \`${t.name} FOR VERSION AS OF <snapshot_id>\``
-        : "";
+        : dialect === "spark"
+          ? `\n\nTime travel: \`${t.name} VERSION AS OF <snapshot_id>\``
+          : "";
   return `${head}${t.comment ? `\n\n${t.comment}` : ""}\n\n\`\`\`plaintext\n${cols}${more}\n\`\`\`${travel}`;
 }
 
@@ -84,7 +86,8 @@ const snippetEscape = (text: string): string => text.replace(/[\\$}]/g, "\\$&");
 
 /** `"orders@<snapshot_id>"` and `"orders$snapshots"` offers, once the user has typed the marker after a table name. */
 function suffixSuggestions(cat: Catalog | null, a: Analysis, qualifier: string[] | null, dialect: SqlDialect): Suggestion[] {
-  if (dialect !== "datafusion" && dialect !== "athena") return [];
+  // Spark reaches metadata tables as `table.snapshots` (plain qualified names), so only these two quote a suffix.
+  if (dialect !== "datafusion" && !isTrinoFamily(dialect)) return [];
   const target = tableSuffixTarget(a.prefix);
   if (!target) return [];
   const t = lookupTable(cat, [...(qualifier ?? []), target.table]);
@@ -107,7 +110,7 @@ function suffixSuggestions(cat: Catalog | null, a: Analysis, qualifier: string[]
       },
     ];
   }
-  return METADATA_TABLES[dialect].map((m, i) => ({
+  return METADATA_TABLES[dialect === "datafusion" ? "datafusion" : "athena"].map((m, i) => ({
     label: `${t.name}$${m.name}`,
     kind: "view" as const,
     detail: "metadata table",

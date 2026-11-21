@@ -19,7 +19,7 @@ import { layoutStorage, panelStyle } from "../layout/storage";
 import { consumeAutoRun } from "./autoRun";
 import { redactDbError } from "../../lib/sqlIntel/redact";
 import { dialectOf, isIcebergDialect } from "../../lib/sqlIntel/dialect";
-import { ICEBERG_NO_ANALYZE, planExplain, startsWithExplain } from "./explainGuard";
+import { ICEBERG_NO_ANALYZE, REDSHIFT_NO_EXPLAIN, planExplain, startsWithExplain } from "./explainGuard";
 import { AI_OFF_HINT } from "../../lib/aiInline";
 import { SaveAsDialog } from "./SaveAsDialog";
 import { SqlEditor, runnableAtCursor, type CodeEditor, type SqlEditorControls, type SqlEditorHandlers, type TrackedRange } from "./SqlEditor";
@@ -72,8 +72,14 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
   // by the default namespace, and no database is ever sent with a run.
   const dialect = dialectOf(profile);
   const isIce = isIcebergDialect(dialect);
+  const isRedshift = dialect === "redshift";
+  // Iceberg engines and Redshift (Data API) have no READ ONLY transaction: read-only means the statement
+  // is checked and refused before it is sent.
+  const refusesWrites = isIce || isRedshift;
+  // EXPLAIN view and Explain Analyze are Postgres (JSON plan) and Iceberg (text plan) features. Not offered on Redshift.
+  const canExplain = !isRedshift;
   const defaultNamespace = isIce ? (profile?.iceberg?.defaultNamespace ?? null) : null;
-  const database = isIce ? null : (tab.database ?? profile?.database ?? null);
+  const database = isIce ? null : isRedshift ? (tab.database ?? profile?.redshift?.database ?? null) : (tab.database ?? profile?.database ?? null);
 
   const executeNow = useCallback(
     async (sql: string, opts: ExecOpts = {}) => {
@@ -145,6 +151,7 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
       let ro = readOnlyOnce;
       let textPlan = false;
       if (mode !== "run") {
+        if (!canExplain) return void setNotice({ tone: "info", text: REDSHIFT_NO_EXPLAIN });
         // Explain and Explain Analyze never get write access: EXPLAIN ANALYZE really executes the
         // statement, and a statement that already starts with EXPLAIN is refused rather than run as is.
         // On Iceberg connections the engine answers a plain `EXPLAIN <sql>` with a text plan.
@@ -157,7 +164,7 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
       track(r.sql, r.start, r.end);
       void execute(sql, { readOnly: ro || undefined, textPlan: textPlan || undefined });
     },
-    [execute, track, dialect],
+    [execute, track, dialect, canExplain],
   );
 
   const runScript = useCallback(
@@ -237,14 +244,14 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
           { id: "run", label: "Run selection or statement", hint: `${MOD}↵`, icon: <Play className="size-3.5" />, onSelect: () => runCurrent("run") },
           {
             id: "ro",
-            label: isIce ? "Run read-only" : "Run in read-only transaction",
+            label: refusesWrites ? "Run read-only" : "Run in read-only transaction",
             hint: `${MOD}⌥↵`,
             icon: <Lock className="size-3.5" />,
-            detail: isIce ? "Refuses statements that would change data or tables." : "Wraps this run in BEGIN READ ONLY. Writes fail instead of changing data.",
+            detail: refusesWrites ? "Refuses statements that would change data or tables." : "Wraps this run in BEGIN READ ONLY. Writes fail instead of changing data.",
             onSelect: () => runCurrent("run", true),
           },
           { id: "script", label: "Run whole script", hint: `${MOD}⇧↵`, icon: <ListVideo className="size-3.5" />, onSelect: () => runScript() },
-          { id: "script-ro", label: isIce ? "Run script read-only" : "Run script in read-only transaction", icon: <Lock className="size-3.5" />, onSelect: () => runScript(true) },
+          { id: "script-ro", label: refusesWrites ? "Run script read-only" : "Run script in read-only transaction", icon: <Lock className="size-3.5" />, onSelect: () => runScript(true) },
         ]
       : menu?.kind === "explain"
         ? [
@@ -329,6 +336,7 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
             </button>
           </div>
         )}
+        {canExplain && (
         <div className="inline-flex shrink-0">
           <button
             type="button"
@@ -353,6 +361,7 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
             <ChevronDown className="size-3.5" />
           </button>
         </div>
+        )}
         <Button size="sm" variant="ghost" disabled={running} onClick={() => runScript()} title={`Run the whole script (${MOD}+Shift+Enter)`} aria-label="Run script">
           <ListVideo className="size-3.5" /> <span className="hidden @[1040px]:inline">Run script</span>
         </Button>
@@ -363,7 +372,7 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
           aria-label="Read-only mode"
           onClick={() => setReadOnly((v) => !v)}
           title={
-            isIce
+            refusesWrites
               ? readOnly
                 ? "Read-only: statements that change data or tables are refused"
                 : "Writes allowed. Click to refuse statements that change data or tables"

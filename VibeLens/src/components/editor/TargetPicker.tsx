@@ -5,33 +5,37 @@ import { useWorkspaceStore, type WorkspaceTab } from "../../store/useWorkspaceSt
 import { useConnect, useConnectionStatus } from "../../hooks/useConnectionStatus";
 import { useProfiles } from "../../hooks/useProfiles";
 import { usePgDatabases } from "../../hooks/usePg";
+import { useRsDatabases } from "../../hooks/useRedshift";
 import { EnvBadge, Button } from "../ui";
 import { Chip, MiniSelect, StatusDot } from "../ui/wsKit";
 import { engineBadge } from "../grid/statsFormat";
-import { dialectOf } from "../../lib/sqlIntel/dialect";
+import { DIALECT_ENGINE, dialectOf } from "../../lib/sqlIntel/dialect";
+import { isSqlEngine } from "../../lib/engines";
 import { envBg } from "../ui/env";
 import { cn } from "../../lib/cn";
 
 /**
- * Per-tab connection + database picker. Postgres and Iceberg profiles are offered for SQL tabs (Valkey
- * has its own console). An Iceberg connection has no databases: the picker shows its default namespace
- * and the query engine instead.
+ * Per-tab connection + database picker. Postgres, Iceberg and Redshift profiles are offered for SQL tabs
+ * (Valkey has its own console). An Iceberg connection has no databases: the picker shows its default
+ * namespace and the query engine instead. Redshift lists its databases through the Data API.
  */
 export function TargetPicker({ tab }: { tab: WorkspaceTab }) {
   const updateTab = useWorkspaceStore((s) => s.updateTab);
   const setActiveTarget = useUIStore((s) => s.setActiveTarget);
   const openWizard = useUIStore((s) => s.openWizard);
   const { data: profiles = [] } = useProfiles();
-  const sqlProfiles = profiles.filter((p) => p.engine === "postgres" || p.engine === "iceberg");
+  const sqlProfiles = profiles.filter((p) => isSqlEngine(p.engine));
   const profile = sqlProfiles.find((p) => p.id === tab.profileId);
   const isIce = profile?.engine === "iceberg";
+  const isRs = profile?.engine === "redshift";
   const status = useConnectionStatus(tab.profileId);
   const connect = useConnect();
-  // Databases are a Postgres concept: do not ask an Iceberg connection for them.
-  const dbs = usePgDatabases(profile && !isIce ? tab.profileId : null);
+  // Each engine is asked for its own databases; an Iceberg connection has none.
+  const dbs = usePgDatabases(profile?.engine === "postgres" ? tab.profileId : null);
+  const rsDbs = useRsDatabases(isRs ? tab.profileId : null);
 
-  const currentDb = tab.database ?? profile?.database ?? "";
-  const dbOptions = (dbs.data ?? []).filter((d) => d.allowConnections && !d.isTemplate).map((d) => d.name);
+  const currentDb = tab.database ?? (isRs ? profile?.redshift?.database : profile?.database) ?? "";
+  const dbOptions = isRs ? [...(rsDbs.data ?? [])] : (dbs.data ?? []).filter((d) => d.allowConnections && !d.isTemplate).map((d) => d.name);
   if (currentDb && !dbOptions.includes(currentDb)) dbOptions.unshift(currentDb);
 
   const state = status?.state ?? "disconnected";
@@ -98,7 +102,7 @@ export function TargetPicker({ tab }: { tab: WorkspaceTab }) {
 function IcebergTarget({ profile }: { profile: ConnectionProfile }) {
   const ns = profile.iceberg?.defaultNamespace ?? null;
   const dialect = dialectOf(profile);
-  const engine = engineBadge(dialect === "athena" ? "athena" : "datafusion");
+  const engine = engineBadge(dialect ? DIALECT_ENGINE[dialect] : "datafusion");
   return (
     <div className="flex shrink-0 items-center gap-1.5">
       <span

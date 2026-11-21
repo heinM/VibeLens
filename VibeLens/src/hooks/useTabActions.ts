@@ -38,7 +38,8 @@ export function useTabActions() {
       let profileId = opts.profileId !== undefined ? opts.profileId : ui.activeProfileId;
       let database = opts.database !== undefined ? opts.database : ui.activeDatabase;
       const p = profileOf(profileId);
-      // SQL tabs run on Postgres and Iceberg; a Valkey connection gets a console instead.
+      // SQL tabs run on Postgres, Iceberg and Redshift; a Valkey connection gets a console instead.
+      // A Redshift tab keeps its database (null = the connection's own).
       if (p && p.engine === "valkey") {
         profileId = null;
         database = null;
