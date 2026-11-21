@@ -340,6 +340,7 @@ export const METADATA_TABLES: Record<"datafusion" | "athena", readonly { name: s
   datafusion: [
     { name: "snapshots", doc: "One row per snapshot: id, parent, operation, commit time, summary." },
     { name: "manifests", doc: "The manifest files of the current snapshot." },
+    { name: "history", doc: "Table history: when each snapshot became current." },
   ],
   athena: [
     { name: "snapshots", doc: "One row per snapshot: id, parent, operation, commit time, manifest list." },

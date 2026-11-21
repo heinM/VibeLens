@@ -32,6 +32,7 @@ pub(crate) fn type_string(ty: &Type) -> String {
             type_string(&m.key_field.field_type),
             type_string(&m.value_field.field_type)
         ),
+        Type::Variant(_) => "variant".to_string(),
     }
 }
 
@@ -44,7 +45,7 @@ pub(crate) fn map_field(f: &NestedField) -> IcebergField {
             named(map_field(&m.key_field), "key"),
             named(map_field(&m.value_field), "value"),
         ],
-        Type::Primitive(_) => Vec::new(),
+        Type::Primitive(_) | Type::Variant(_) => Vec::new(),
     };
     IcebergField {
         id: f.id,

@@ -19,7 +19,6 @@
 //!   write path through `iceberg-datafusion` against a [`ScopedCatalog`] that exposes exactly one
 //!   table (so only that table is loaded).
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -75,7 +74,7 @@ enum Selector {
     Current,
     /// `table@<x>`: x is a snapshot id, a branch/tag name or an RFC 3339 timestamp.
     AsOf(String),
-    /// `table$snapshots` / `table$manifests`.
+    /// `table$snapshots` / `table$manifests` / `table$history`.
     Meta(String),
 }
 
@@ -232,10 +231,6 @@ struct LazyCatalog {
 }
 
 impl CatalogProvider for LazyCatalog {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         self.names.read().map(|g| g.clone()).unwrap_or_default()
     }
@@ -265,10 +260,6 @@ fn block_on_sync<F: std::future::Future>(f: F) -> Option<F::Output> {
 
 #[async_trait]
 impl SchemaProvider for LazySchema {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         block_on_sync(self.catalog.list_tables(&self.ns))
             .and_then(|r| r.ok())
@@ -330,7 +321,7 @@ impl SchemaProvider for LazySchema {
     ) -> DFResult<Option<Arc<dyn TableProvider>>> {
         // DataFusion also lands here for `CREATE VIEW` and `CREATE EXTERNAL TABLE`, which must not
         // silently become a physical table holding a copy of the data.
-        if table.as_any().downcast_ref::<MemTable>().is_none() {
+        if !table.is::<MemTable>() {
             return Err(DataFusionError::NotImplemented(
                 "the local Iceberg engine only creates tables (CREATE TABLE, CREATE TABLE AS SELECT)"
                     .into(),
@@ -385,7 +376,7 @@ impl SchemaProvider for LazySchema {
     }
 }
 
-/// `table$snapshots` / `table$manifests` as an in-memory table.
+/// `table$snapshots` / `table$manifests` / `table$history` as an in-memory table.
 async fn metadata_table(table: &Table, kind: &str) -> DFResult<Arc<dyn TableProvider>> {
     let kind = MetadataTableType::try_from(kind).map_err(DataFusionError::Plan)?;
     let inspect = table.inspect();
@@ -396,6 +387,10 @@ async fn metadata_table(table: &Table, kind: &str) -> DFResult<Arc<dyn TableProv
         }
         MetadataTableType::Manifests => {
             let t = inspect.manifests();
+            (t.schema(), t.scan().await.map_err(to_df)?)
+        }
+        MetadataTableType::History => {
+            let t = inspect.history();
             (t.schema(), t.scan().await.map_err(to_df)?)
         }
     };
@@ -418,10 +413,6 @@ struct LiveTable {
 
 #[async_trait]
 impl TableProvider for LiveTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> ArrowSchemaRef {
         self.read.schema()
     }
