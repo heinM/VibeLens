@@ -8,7 +8,7 @@ import { useUIStore } from "../../store/useUIStore";
 import { Button, ConfirmDialog, Dialog, EmptyState, EnvBadge, ErrorBox, Spinner } from "../ui";
 import { FocusScope } from "../ui/formKit";
 import { aiAccessMeta } from "./aiAccess";
-import { cleanProfile, icebergSecretArgs, initialDraft, missingIcebergSecrets, secretArgs, testPasswordArg, type Draft, type S3KeysEdit, type SecretEdit } from "./draft";
+import { cleanProfile, icebergSecretArgs, initialDraft, missingIcebergSecrets, secretArgs, testEngineSecretArg, testPasswordArg, type Draft, type S3KeysEdit, type SecretEdit } from "./draft";
 import { HostKeyTrustDialog } from "./HostKeyDialog";
 import { isHostKeyFingerprint, withTrustedHostKey } from "./hostKey";
 import { catalogSummary, engineSummary, normalizeIceberg, storageSummary } from "./icebergForm";
@@ -199,7 +199,7 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
     const seq = ++testSeq.current;
     setTest({ status: "running" });
     try {
-      const result = await api.testConnection(cleanProfile(tested), testPasswordArg(draft));
+      const result = await api.testConnection(cleanProfile(tested), testPasswordArg(draft), testEngineSecretArg(draft));
       if (seq !== testSeq.current) return;
       setTest({ status: "done", result });
       // An unpinned SSH host: nothing was sent to it. Show its key instead of just failing.

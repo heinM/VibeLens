@@ -43,8 +43,9 @@ export const api = {
     }),
   deleteProfile: (id: string) => invoke<void>("delete_profile", { id }),
   /** Never stores anything. An unpinned SSH host comes back as `ok: false` with `hostKey` set. */
-  testConnection: (profile: T.ConnectionProfile, password?: string) =>
-    invoke<T.TestResult>("test_connection", { profile, password: password ?? null }),
+  /** `engineSecret`: a Trino / Spark password or token typed in the form; without it the stored one is used. */
+  testConnection: (profile: T.ConnectionProfile, password?: string, engineSecret?: string) =>
+    invoke<T.TestResult>("test_connection", { profile, password: password ?? null, engineSecret: engineSecret ?? null }),
   /**
    * Pins the host key an SSH server presented, on the saved profile. Call it only from the user's
    * "trust" action. Rust refuses when the profile's tunnel no longer points at that host and port,

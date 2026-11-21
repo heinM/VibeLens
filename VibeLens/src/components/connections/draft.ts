@@ -100,6 +100,12 @@ export function testPasswordArg(draft: Draft): string | undefined {
   return usesPassword(draft.profile.auth) ? secretArg(draft.password) : undefined;
 }
 
+/** The Trino / Spark secret typed in the form, for `testConnection`. Undefined tests with the stored one. */
+export function testEngineSecretArg(draft: Draft): string | undefined {
+  if (draft.profile.engine !== "iceberg" || draft.engineSecret.mode !== "set") return undefined;
+  return draft.engineSecret.value || undefined;
+}
+
 export interface IcebergSecretArgs {
   icebergSecret: string | undefined;
   /** Trino / Spark password or token: undefined keeps, "" deletes. */
