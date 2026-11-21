@@ -46,11 +46,13 @@ export function AgentEmpty({
   const items = suggestionsFor({
     engine: profile?.engine ?? null,
     connectionName: profile?.name ?? null,
-    database: profile?.engine === "postgres" ? (database ?? profile.database ?? null) : null,
+    database: profile?.engine === "postgres" ? (database ?? profile.database ?? null) : profile?.engine === "redshift" ? (database ?? profile.redshift?.database ?? null) : null,
     access: profile?.aiDataAccess ?? null,
     hasEditorText,
   });
-  const where = profile ? [profile.name, profile.engine === "postgres" ? (database ?? profile.database) : null].filter(Boolean).join(" / ") : null;
+  const where = profile
+    ? [profile.name, profile.engine === "postgres" ? (database ?? profile.database) : profile.engine === "redshift" ? (database ?? profile.redshift?.database) : null].filter(Boolean).join(" / ")
+    : null;
 
   return (
     <div className={cn("mx-auto flex w-full flex-col", primary ? "max-w-2xl gap-6 px-2 pb-6 pt-[6vh]" : "max-w-3xl gap-2.5 py-2")}>
