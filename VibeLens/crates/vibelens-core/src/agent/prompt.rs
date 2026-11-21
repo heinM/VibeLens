@@ -48,7 +48,9 @@ fn iceberg_notes(p: &ConnectionProfile) -> String {
             "- Default namespace: {ns} (unqualified table names resolve there).\n"
         ));
     }
-    if athena {
+    if let Some(note) = opts.and_then(|o| remote_engine_note(&o.query_engine)) {
+        s.push_str(note);
+    } else if athena {
         s.push_str(
             "- Query engine: Amazon Athena (Trino SQL, server-side, full DML). Athena is billed per TB scanned (US$5/TB list price, 10 MB minimum per query), so be frugal: select only the columns you need, filter on partition columns, use aggregates and always add LIMIT to exploratory queries; avoid SELECT * on large tables. \
              Time travel uses FOR VERSION AS OF <snapshot_id> or FOR TIMESTAMP AS OF <timestamp>.\n",
@@ -63,6 +65,25 @@ fn iceberg_notes(p: &ConnectionProfile) -> String {
         "- Every write (INSERT, CREATE TABLE AS, DML) adds a new table snapshot; earlier snapshots stay readable until they are expired. Writes need the user's approval: prefer a reviewed script.\n",
     );
     s
+}
+
+/// The query-engine line for Trino and Spark. Says the engine is remote and its dialect; never
+/// its address.
+fn remote_engine_note(engine: &IcebergQueryEngine) -> Option<&'static str> {
+    Some(match engine {
+        IcebergQueryEngine::Trino { .. } => {
+            "- Query engine: a Trino cluster (remote, Trino SQL, full DML on Iceberg: INSERT, UPDATE, DELETE, MERGE). Queries run on the user's cluster and use its capacity, so select only the columns you need, filter on partition columns and always add LIMIT to exploratory queries. \
+             Name tables as namespace.table (the connection's catalog is the default; catalog.namespace.table also works). USE, SET SESSION and transactions are refused: every statement starts from the connection's catalog and namespace. \
+             Time travel uses FOR VERSION AS OF <snapshot_id> or FOR TIMESTAMP AS OF <timestamp>; metadata tables are \"table$snapshots\", \"table$history\", \"table$files\".\n"
+        }
+        IcebergQueryEngine::Spark { .. } => {
+            "- Query engine: Apache Spark through Apache Livy (remote, Spark SQL, full DML on Iceberg: INSERT, UPDATE, DELETE, MERGE INTO). Queries run on the user's cluster, so select only the columns you need, filter on partition columns and always add LIMIT to exploratory queries. \
+             Name tables as namespace.table or catalog.namespace.table. USE, SET and RESET are refused: they would change the shared session. \
+             Read-only checks are strict on Spark: reflect/java_method, file paths such as parquet.`/path`, TRANSFORM and IDENTIFIER() are refused, as is a string literal with an odd backslash before a quote. \
+             Time travel uses VERSION AS OF <snapshot_id> or TIMESTAMP AS OF '<timestamp>'; metadata tables are namespace.table.snapshots, .history and .files.\n"
+        }
+        IcebergQueryEngine::Local | IcebergQueryEngine::Athena { .. } => return None,
+    })
 }
 
 fn access_blurb(a: AiDataAccess) -> &'static str {
@@ -243,6 +264,37 @@ mod tests {
         for p in [&local, &athena] {
             assert!(!p.contains("catalog.internal.example"));
             assert!(!p.contains("secret-warehouse") && !p.contains("wg-private"));
+        }
+    }
+
+    #[test]
+    fn trino_and_spark_are_described_as_remote_without_their_address() {
+        let mut p = iceberg(false);
+        p.iceberg.as_mut().unwrap().query_engine = IcebergQueryEngine::Trino {
+            url: "https://trino.private.example:8443".into(),
+            catalog: "lake".into(),
+            user: "svc-user".into(),
+            auth: crate::model::HttpEngineAuth::Bearer,
+            ca_cert_path: None,
+        };
+        let trino = build_system_prompt(Some(&p), &AgentContext::default());
+        assert!(trino.contains("Trino cluster (remote, Trino SQL"));
+        assert!(trino.contains("FOR VERSION AS OF"));
+        p.iceberg.as_mut().unwrap().query_engine = IcebergQueryEngine::Spark {
+            url: "https://livy.private.example".into(),
+            catalog: "lake".into(),
+            auth: crate::model::HttpEngineAuth::None,
+            ca_cert_path: None,
+            proxy_user: Some("svc-user".into()),
+            session_conf: Default::default(),
+            session_start_timeout_secs: None,
+        };
+        let spark = build_system_prompt(Some(&p), &AgentContext::default());
+        assert!(spark.contains("Apache Spark through Apache Livy (remote, Spark SQL"));
+        assert!(spark.contains("reflect"));
+        for s in [&trino, &spark] {
+            assert!(!s.contains("billed per TB") && !s.contains("cannot UPDATE"));
+            assert!(!s.contains("private.example") && !s.contains("svc-user"));
         }
     }
 

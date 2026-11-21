@@ -42,6 +42,10 @@ pub(super) struct ProfileFacts {
     /// Iceberg connection whose SQL runs on Amazon Athena (billed per TB scanned, full DML)
     /// rather than the embedded engine (append-only). `false` for every other engine.
     pub athena: bool,
+    /// Iceberg connection whose SQL runs on Trino or Spark: where, as
+    /// `remote::config::engine_target` names it (engine, endpoint host and port, catalog; no
+    /// credentials). Shown in approval text. `None` for every other engine.
+    pub remote_engine: Option<String>,
     /// The profile's configured database (Postgres only; `None` when unset or another engine).
     /// Always resolved through [`effective_database`], the rule execution uses.
     pub database: Option<String>,
@@ -58,6 +62,11 @@ impl From<&ConnectionProfile> for ProfileFacts {
                 && p.iceberg
                     .as_ref()
                     .is_some_and(|o| matches!(o.query_engine, IcebergQueryEngine::Athena { .. })),
+            remote_engine: p
+                .iceberg
+                .as_ref()
+                .filter(|_| p.engine == EngineKind::Iceberg)
+                .and_then(|o| crate::remote::config::engine_target(&o.query_engine)),
             database: p
                 .database
                 .clone()
@@ -99,6 +108,9 @@ pub(super) fn approval_target(call: &ToolCall, f: &ProfileFacts) -> Option<Appro
 /// `'orders-db', database 'payments' (not this connection's default database 'shop')` for
 /// Postgres, just the quoted connection name for Iceberg (which has no database to choose).
 fn sql_target_text(f: &ProfileFacts, requested: Option<&str>) -> String {
+    if let Some(remote) = &f.remote_engine {
+        return format!("'{}' ({remote})", f.name);
+    }
     if f.engine != EngineKind::Postgres {
         return format!("'{}'", f.name);
     }
@@ -367,7 +379,8 @@ fn iceberg_write_note(f: &ProfileFacts, c: &SqlClassification) -> String {
     let mut note = String::from(" Iceberg writes create a new table snapshot.");
     if f.athena {
         note.push_str(" Athena is billed per TB scanned.");
-    } else {
+    } else if f.remote_engine.is_none() {
+        // The embedded engine; Trino and Spark run full DML on Iceberg.
         let summary = c.summary.to_ascii_uppercase();
         if ["UPDATE", "DELETE", "MERGE"]
             .iter()
@@ -508,6 +521,7 @@ mod tests {
             environment: env,
             access,
             athena: false,
+            remote_engine: None,
             database: Some("shop".into()),
         }
     }
@@ -518,6 +532,7 @@ mod tests {
             environment: env,
             access,
             athena,
+            remote_engine: None,
             database: None,
         }
     }
@@ -528,6 +543,7 @@ mod tests {
             environment: env,
             access,
             athena: false,
+            remote_engine: None,
             database: None,
         }
     }
@@ -1353,6 +1369,50 @@ mod tests {
         assert!(f.athena && f.engine == EngineKind::Iceberg);
         // The facts never carry catalog details.
         assert!(!format!("{f:?}").contains("sqlite"));
+        assert_eq!(f.remote_engine, None);
+
+        // Trino and Spark: the approval text names engine, endpoint host and catalog (never a
+        // credential), has no per-TB note, and does not send the user to Athena for DML.
+        p.iceberg.as_mut().unwrap().query_engine = IcebergQueryEngine::Trino {
+            url: "https://trino.example:8443/".into(),
+            catalog: "lake".into(),
+            user: "ana".into(),
+            auth: crate::model::HttpEngineAuth::Basic {
+                username: "ana".into(),
+            },
+            ca_cert_path: None,
+        };
+        let f = ProfileFacts::from(&p);
+        assert!(!f.athena);
+        assert_eq!(
+            f.remote_engine.as_deref(),
+            Some("Trino at trino.example:8443, catalog 'lake'")
+        );
+        for s in ["delete from shop.t where id = 1", "select 1"] {
+            let mut g = f.clone();
+            g.access = ResultsWithApproval;
+            let r = assess(&sql(s), Some(&g), false).reason.unwrap();
+            assert!(
+                r.contains("'lake' (Trino at trino.example:8443, catalog 'lake')")
+                    && !r.contains("billed")
+                    && !r.contains("need an Athena")
+                    && !r.contains("ana"),
+                "{r}"
+            );
+        }
+        p.iceberg.as_mut().unwrap().query_engine = IcebergQueryEngine::Spark {
+            url: "https://livy.example".into(),
+            catalog: "glue".into(),
+            auth: crate::model::HttpEngineAuth::None,
+            ca_cert_path: None,
+            proxy_user: None,
+            session_conf: Default::default(),
+            session_start_timeout_secs: None,
+        };
+        assert_eq!(
+            ProfileFacts::from(&p).remote_engine.as_deref(),
+            Some("Spark (Livy) at livy.example, catalog 'glue'")
+        );
     }
 
     // ---- The target the user approves (review finding M3) --------------------------------
