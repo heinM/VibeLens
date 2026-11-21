@@ -30,6 +30,10 @@ pub(super) const MAX_PURPOSE_CHARS: usize = 200;
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum ToolCall {
     ListConnections,
+    /// The databases of a Postgres server or a Redshift cluster/workgroup (names only).
+    ListDatabases {
+        profile_id: String,
+    },
     GetSchema {
         profile_id: String,
         database: Option<String>,
@@ -156,6 +160,7 @@ impl ToolCall {
     pub fn name(&self) -> &'static str {
         match self {
             ToolCall::ListConnections => "list_connections",
+            ToolCall::ListDatabases { .. } => "list_databases",
             ToolCall::GetSchema { .. } => "get_schema",
             ToolCall::DescribeTable { .. } => "describe_table",
             ToolCall::RunSql { .. } => "run_sql",
@@ -171,7 +176,8 @@ impl ToolCall {
     /// The connection this call touches, if any.
     pub fn profile_id(&self) -> Option<&str> {
         match self {
-            ToolCall::GetSchema { profile_id, .. }
+            ToolCall::ListDatabases { profile_id }
+            | ToolCall::GetSchema { profile_id, .. }
             | ToolCall::DescribeTable { profile_id, .. }
             | ToolCall::RunSql { profile_id, .. }
             | ToolCall::ValkeyScan { profile_id, .. }
@@ -181,6 +187,41 @@ impl ToolCall {
             | ToolCall::ListFiles
             | ToolCall::ReadFile { .. }
             | ToolCall::WriteFile { .. } => None,
+        }
+    }
+
+    /// Gives a SQL call on the user's active connection that names no database the active
+    /// database, so a follow-up question works where the user is (or where they pinned the
+    /// agent), not in the connection's default database. Calls on other connections, and calls
+    /// that name a database, are left alone. Only meaningful for Postgres and Redshift: the
+    /// caller applies it to those engines only.
+    pub fn default_database(
+        &mut self,
+        active_profile: Option<&str>,
+        active_database: Option<&str>,
+    ) {
+        let Some(active) = active_database.map(str::trim).filter(|d| !d.is_empty()) else {
+            return;
+        };
+        if let ToolCall::GetSchema {
+            profile_id,
+            database,
+            ..
+        }
+        | ToolCall::DescribeTable {
+            profile_id,
+            database,
+            ..
+        }
+        | ToolCall::RunSql {
+            profile_id,
+            database,
+            ..
+        } = self
+            && database.is_none()
+            && active_profile == Some(profile_id.as_str())
+        {
+            *database = Some(active.to_string());
         }
     }
 
@@ -221,6 +262,9 @@ impl ToolCall {
         };
         Ok(match name {
             "list_connections" => ToolCall::ListConnections,
+            "list_databases" => ToolCall::ListDatabases {
+                profile_id: profile()?,
+            },
             "get_schema" => ToolCall::GetSchema {
                 profile_id: profile()?,
                 database: opt_str(input, "database"),
@@ -321,7 +365,7 @@ fn spec(name: &str, description: &str, properties: Value, required: &[&str]) -> 
 /// when to use each tool, what comes back, and what the user will be asked to approve.
 pub(super) fn tool_specs() -> Vec<ToolSpec> {
     let profile_id = json!({ "type": "string", "description": "Connection id from list_connections. Defaults to the user's active connection when omitted." });
-    let database = json!({ "type": "string", "description": "Postgres or Amazon Redshift database name. Defaults to the connection's default database. Ignored for Apache Iceberg connections." });
+    let database = json!({ "type": "string", "description": "Postgres or Amazon Redshift database name (list_databases lists them). Defaults to the connection's default database. Ignored for Apache Iceberg connections." });
     let db = json!({ "type": "integer", "minimum": 0, "maximum": 255, "description": "Valkey logical database number. Default 0. Cluster-mode connections only have 0." });
     vec![
         spec(
@@ -330,6 +374,14 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
              Call this first when you do not know which connection to use. It never returns hosts or credentials. ai_data_access tells you what you may see: 'none' means do not touch the connection; \
              'schemaOnly' means table/column structure only, no row data; the 'results' levels allow query results (the second one asks the user before each query).",
             json!({}),
+            &[],
+        ),
+        spec(
+            "list_databases",
+            "List the names of the databases on a Postgres server or an Amazon Redshift cluster or workgroup (Postgres: templates and databases that refuse connections are left out). \
+             Use it when the user mentions another database, or when the table you need is not in the active one; then pass that name as `database` to get_schema, describe_table and run_sql. \
+             Names only: no sizes, owners or contents. Works at every ai_data_access level except 'none'. Not for Apache Iceberg (use get_schema for its namespaces) or Valkey connections.",
+            json!({ "profile_id": profile_id.clone() }),
             &[],
         ),
         spec(
@@ -826,6 +878,14 @@ pub(super) async fn run(
                 ),
             ))
         }
+        ToolCall::ListDatabases { profile_id } => {
+            let names = backend.list_databases(profile_id).await?;
+            let n = names.len();
+            Ok(out(
+                json!({ "databases": names, "count": n }).to_string(),
+                format!("{n} database{}", if n == 1 { "" } else { "s" }),
+            ))
+        }
         ToolCall::GetSchema {
             profile_id,
             database,
@@ -1070,6 +1130,7 @@ mod tests {
             names,
             [
                 "list_connections",
+                "list_databases",
                 "get_schema",
                 "describe_table",
                 "run_sql",
@@ -1184,6 +1245,24 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(c, ToolCall::DescribeTable { schema: None, .. }));
+        // list_databases takes only the connection, defaulting to the active one.
+        assert_eq!(
+            ToolCall::parse("list_databases", &json!({}), Some("active")).unwrap(),
+            ToolCall::ListDatabases {
+                profile_id: "active".into()
+            }
+        );
+        assert_eq!(
+            ToolCall::parse("list_databases", &json!({"profile_id":"p"}), Some("active"))
+                .unwrap()
+                .profile_id(),
+            Some("p")
+        );
+        assert!(
+            ToolCall::parse("list_databases", &json!({}), None)
+                .unwrap_err()
+                .contains("profile_id")
+        );
         // write_file keeps empty contents (truncating a file is legitimate) but needs the key.
         assert!(
             ToolCall::parse("write_file", &json!({"path":"a.sql","contents":""}), None).is_ok()
@@ -1196,6 +1275,47 @@ mod tests {
                 None
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn default_database_fills_only_unnamed_calls_on_the_active_connection() {
+        let run = |input: Value| ToolCall::parse("run_sql", &input, Some("p1")).unwrap();
+        let db = |c: &ToolCall| match c {
+            ToolCall::RunSql { database, .. }
+            | ToolCall::GetSchema { database, .. }
+            | ToolCall::DescribeTable { database, .. } => database.clone(),
+            _ => None,
+        };
+
+        let mut c = run(json!({"sql":"select 1"}));
+        c.default_database(Some("p1"), Some("payments"));
+        assert_eq!(db(&c).as_deref(), Some("payments"), "active connection");
+
+        let mut c = run(json!({"sql":"select 1","database":"shop"}));
+        c.default_database(Some("p1"), Some("payments"));
+        assert_eq!(db(&c).as_deref(), Some("shop"), "the model's choice wins");
+
+        let mut c = run(json!({"sql":"select 1","profile_id":"p2"}));
+        c.default_database(Some("p1"), Some("payments"));
+        assert_eq!(db(&c), None, "another connection keeps its own default");
+
+        let mut c = run(json!({"sql":"select 1"}));
+        c.default_database(Some("p1"), Some("  "));
+        assert_eq!(db(&c), None, "no active database");
+
+        for name in ["get_schema", "describe_table"] {
+            let mut c = ToolCall::parse(name, &json!({"table":"t"}), Some("p1")).unwrap();
+            c.default_database(Some("p1"), Some("payments"));
+            assert_eq!(db(&c).as_deref(), Some("payments"), "{name}");
+        }
+        let mut c = ToolCall::parse("list_databases", &json!({}), Some("p1")).unwrap();
+        c.default_database(Some("p1"), Some("payments"));
+        assert_eq!(
+            c,
+            ToolCall::ListDatabases {
+                profile_id: "p1".into()
+            }
         );
     }
 

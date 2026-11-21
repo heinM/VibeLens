@@ -10,6 +10,14 @@ use crate::error::{CoreError, Result};
 use crate::model::{ProviderConfig, ProviderKind};
 use crate::profiles::atomic_write;
 
+/// The Ollama preset's context window, in tokens. Ollama's own context length must be at least
+/// this (the settings card says how to set it).
+pub(super) const OLLAMA_CONTEXT_WINDOW: u32 = 16_384;
+const OLLAMA_MAX_TOKENS: u32 = 4096;
+/// Bounds for a configured context window.
+const MIN_CONTEXT_WINDOW: u32 = 1024;
+const MAX_CONTEXT_WINDOW: u32 = 10_000_000;
+
 /// Built-in providers. The model id is deliberately empty for everything but Anthropic: model
 /// names churn every few months, so the user sets them in Settings.
 pub(super) fn presets() -> Vec<ProviderConfig> {
@@ -25,6 +33,7 @@ pub(super) fn presets() -> Vec<ProviderConfig> {
             extra_headers: Default::default(),
             requires_api_key,
             portkey: None,
+            context_window: None,
         };
     vec![
         base(
@@ -51,14 +60,21 @@ pub(super) fn presets() -> Vec<ProviderConfig> {
             "",
             true,
         ),
-        base(
-            "ollama",
-            "Ollama (local)",
-            ProviderKind::OpenAiCompatible,
-            "http://localhost:11434/v1",
-            "",
-            false,
-        ),
+        // Ollama serves a small context unless it is told otherwise (OLLAMA_CONTEXT_LENGTH or
+        // the model's num_ctx) and silently drops the oldest tokens beyond it. A modest window,
+        // and output limit to match, keeps the history the agent sends inside it.
+        ProviderConfig {
+            max_tokens: OLLAMA_MAX_TOKENS,
+            context_window: Some(OLLAMA_CONTEXT_WINDOW),
+            ..base(
+                "ollama",
+                "Ollama (local)",
+                ProviderKind::OpenAiCompatible,
+                "http://localhost:11434/v1",
+                "",
+                false,
+            )
+        },
         ProviderConfig {
             portkey: Some(crate::model::PortkeyOptions::default()),
             ..base(
@@ -108,6 +124,16 @@ pub(super) fn validate(cfg: &ProviderConfig) -> Result<()> {
     }
     if cfg.max_tokens == 0 || cfg.max_tokens > 1_000_000 {
         return bad("max tokens must be between 1 and 1,000,000");
+    }
+    if let Some(w) = cfg.context_window {
+        if !(MIN_CONTEXT_WINDOW..=MAX_CONTEXT_WINDOW).contains(&w) {
+            return bad("context window must be between 1,024 and 10,000,000 tokens, or empty");
+        }
+        if w <= cfg.max_tokens {
+            return bad(
+                "context window must be larger than max output tokens: the window holds the prompt and the answer",
+            );
+        }
     }
     if let Some(t) = cfg.temperature
         && (!t.is_finite() || !(0.0..=2.0).contains(&t))
@@ -296,6 +322,7 @@ mod tests {
             extra_headers: Default::default(),
             requires_api_key: true,
             portkey: None,
+            context_window: None,
         }
     }
 
@@ -318,6 +345,17 @@ mod tests {
         );
         assert_eq!(p[3].base_url, "http://localhost:11434/v1");
         assert!(!p[3].requires_api_key);
+        assert_eq!(p[3].context_window, Some(OLLAMA_CONTEXT_WINDOW));
+        assert!(
+            p[3].max_tokens < OLLAMA_CONTEXT_WINDOW / 2,
+            "room left for history"
+        );
+        assert!(
+            p.iter()
+                .filter(|x| x.id != "ollama")
+                .all(|x| x.context_window.is_none()),
+            "hosted providers keep the default budget"
+        );
         assert_eq!(p[4].kind, ProviderKind::Portkey);
         assert_eq!(p[4].base_url, "https://api.portkey.ai/v1");
         assert!(p[4].requires_api_key && p[4].model.is_empty() && p[4].portkey.is_some());
@@ -371,6 +409,18 @@ mod tests {
         c = custom("a");
         c.label = "  ".into();
         assert!(validate(&c).is_err());
+        c = custom("a");
+        c.context_window = Some(32_768);
+        assert!(validate(&c).is_ok());
+        c.context_window = Some(512);
+        assert!(validate(&c).is_err(), "too small to be real");
+        c.context_window = Some(c.max_tokens);
+        assert!(
+            validate(&c)
+                .unwrap_err()
+                .to_string()
+                .contains("larger than max output tokens")
+        );
     }
 
     #[test]
@@ -446,6 +496,19 @@ mod tests {
         assert!(dir.path().join("providers.json.corrupt").exists());
         store.upsert(custom("three")).await.unwrap();
         assert_eq!(store.saved().await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn configs_saved_before_the_context_window_setting_still_load() {
+        let old = r#"{"id":"ollama","label":"Ollama","kind":"openAiCompatible","baseUrl":"http://localhost:11434/v1","model":"qwen3","maxTokens":8192,"temperature":null}"#;
+        let cfg: ProviderConfig = serde_json::from_str(old).unwrap();
+        assert_eq!(cfg.context_window, None, "unset keeps the default budget");
+        let round = serde_json::to_value(ProviderConfig {
+            context_window: Some(32_768),
+            ..cfg
+        })
+        .unwrap();
+        assert_eq!(round["contextWindow"], 32_768);
     }
 
     #[tokio::test]

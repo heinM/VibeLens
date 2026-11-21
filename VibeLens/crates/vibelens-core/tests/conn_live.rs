@@ -472,6 +472,15 @@ async fn conn_postgres_connect_reuse_databases_and_tool_backend() {
         .unwrap();
     assert_eq!(meta.database, d.dbname);
 
+    // The agent's list_databases: names of databases that accept connections, no templates.
+    let names = l.backend.list_databases(&p.id).await.unwrap();
+    assert!(names.contains(&d.dbname), "{names:?}");
+    assert!(names.contains(&"postgres".to_string()), "{names:?}");
+    assert!(
+        !names.iter().any(|n| n.starts_with("template")),
+        "{names:?}"
+    );
+
     l.mgr.disconnect(&p.id).await.unwrap();
     assert!(l.mgr.status().is_empty());
 }

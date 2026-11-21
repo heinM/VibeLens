@@ -372,8 +372,22 @@ pub(super) fn assess(
     if f.access == AiDataAccess::None {
         return access_none(&f.name);
     }
-    // The SQL tools serve every SQL engine (Postgres, Iceberg); the rest are Valkey-only.
+    // The SQL tools serve every SQL engine (Postgres, Iceberg, Redshift); list_databases only
+    // those with databases to choose from; the rest are Valkey-only.
+    if matches!(call, ToolCall::ListDatabases { .. })
+        && !matches!(f.engine, EngineKind::Postgres | EngineKind::Redshift)
+    {
+        let hint = match f.engine {
+            EngineKind::Iceberg => "it has namespaces, not databases: use get_schema to list them",
+            _ => "use valkey_scan, valkey_get or valkey_command for it",
+        };
+        return Assessment::denied(format!(
+            "list_databases works on Postgres and Redshift connections; '{}' is not one: {hint}",
+            f.name
+        ));
+    }
     let engine_fits = match call {
+        ToolCall::ListDatabases { .. } => true,
         ToolCall::GetSchema { .. } | ToolCall::DescribeTable { .. } | ToolCall::RunSql { .. } => {
             matches!(
                 f.engine,
@@ -396,7 +410,10 @@ pub(super) fn assess(
     }
 
     match call {
-        ToolCall::GetSchema { .. } | ToolCall::ValkeyScan { .. } => Assessment::safe(),
+        // Names only, like the schema listing: structure, never data.
+        ToolCall::ListDatabases { .. }
+        | ToolCall::GetSchema { .. }
+        | ToolCall::ValkeyScan { .. } => Assessment::safe(),
         // Column defaults and index predicates can hold literal values.
         ToolCall::DescribeTable { .. } => Assessment {
             redact_values: f.access != AiDataAccess::Results,
@@ -991,6 +1008,38 @@ mod tests {
             false,
         );
         assert_eq!(r.risk, Denied);
+    }
+
+    #[test]
+    fn list_databases_is_safe_on_sql_servers_at_every_level_except_none() {
+        let call = ToolCall::ListDatabases {
+            profile_id: "p".into(),
+        };
+        for env in ENVS {
+            for a in [SchemaOnly, ResultsWithApproval, Results] {
+                for f in [pg(a, env), rs(a, env)] {
+                    let v = assess(&call, Some(&f), false);
+                    assert_eq!(v.risk, Safe, "{a:?} {env:?} {:?}", f.engine);
+                    assert!(!v.allow_write && !v.redact_values);
+                }
+            }
+            for f in [pg(NOTHING, env), rs(NOTHING, env)] {
+                let v = assess(&call, Some(&f), false);
+                assert_eq!(v.risk, Denied);
+                assert!(v.reason.unwrap().contains("aiDataAccess = none"));
+            }
+        }
+        let iceberg = assess(&call, Some(&ice(Results, Environment::Dev, false)), false);
+        assert_eq!(iceberg.risk, Denied);
+        assert!(iceberg.reason.unwrap().contains("get_schema"));
+        let valkey = assess(&call, Some(&vk(Results, Environment::Dev)), false);
+        assert_eq!(valkey.risk, Denied);
+        assert!(valkey.reason.unwrap().contains("valkey_scan"));
+        assert_eq!(
+            assess(&call, None, false).risk,
+            Denied,
+            "unknown connection"
+        );
     }
 
     #[test]

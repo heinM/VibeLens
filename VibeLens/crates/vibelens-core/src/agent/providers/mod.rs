@@ -478,6 +478,7 @@ mod tests {
             extra_headers: Default::default(),
             requires_api_key,
             portkey: None,
+            context_window: None,
         }
     }
 

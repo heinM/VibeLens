@@ -80,6 +80,11 @@ pub struct ProviderConfig {
     /// Routing options when `kind == Portkey`; ignored otherwise.
     #[serde(default)]
     pub portkey: Option<PortkeyOptions>,
+    /// The model's context window in tokens, when it is smaller than the agent assumes (a local
+    /// model). The conversation history sent each turn is cut to fit it, after leaving room for
+    /// the output and the system prompt. `None`: the agent's own budget applies.
+    #[serde(default)]
+    pub context_window: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -158,6 +163,21 @@ pub struct ApprovalTarget {
     pub detail: Option<String>,
 }
 
+/// Where an executed `run_sql` call ran, resolved by the agent loop from the stored profile and
+/// the same database resolution execution uses (never taken from text the model wrote), so the
+/// UI can reopen the statement against that connection and database. Carries no result rows.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SqlRun {
+    pub profile_id: String,
+    /// Postgres or Redshift: the database the statement ran against. `None` for Iceberg.
+    pub database: Option<String>,
+    /// The statement text exactly as executed.
+    pub sql: String,
+    /// Whether it ran as a read-only call (no approval to write was given).
+    pub read_only: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(
     tag = "type",
@@ -199,6 +219,10 @@ pub enum AgentEvent {
         ok: bool,
         summary: String,
         elapsed_ms: u64,
+        /// For a `run_sql` call that was executed: where it ran and how. `None` for every other
+        /// tool and for calls that never ran (denied, rejected, cancelled).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sql_run: Option<SqlRun>,
     },
     /// The agent wrote a workspace file; UI should open/refresh that tab.
     FileWritten {

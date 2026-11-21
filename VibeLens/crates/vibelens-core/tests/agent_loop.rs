@@ -333,6 +333,8 @@ struct FakeBackend {
     /// on the server" and records that it did.
     hang_until_cancelled: std::sync::atomic::AtomicBool,
     stopped_on_server: std::sync::atomic::AtomicBool,
+    /// The profile of every `list_databases` call, in call order.
+    database_lists: Mutex<Vec<String>>,
 }
 
 fn fake_error(kind: &str, msg: &str) -> CoreError {
@@ -506,6 +508,10 @@ impl ToolBackend for FakeBackend {
             elapsed_ms: 1,
         })
     }
+    async fn list_databases(&self, profile_id: &str) -> Result<Vec<String>> {
+        self.database_lists.lock().unwrap().push(profile_id.into());
+        Ok(vec!["payments".into(), "shop".into()])
+    }
     async fn list_files(&self) -> Result<Vec<WorkspaceFile>> {
         Ok(self
             .files
@@ -573,6 +579,7 @@ fn anthropic_cfg(base_url: &str) -> ProviderConfig {
         extra_headers: Default::default(),
         requires_api_key: true,
         portkey: None,
+        context_window: None,
     }
 }
 
@@ -588,6 +595,7 @@ fn openai_cfg(id: &str, base_url: &str, requires_key: bool) -> ProviderConfig {
         extra_headers: Default::default(),
         requires_api_key: requires_key,
         portkey: None,
+        context_window: None,
     }
 }
 
@@ -2870,6 +2878,7 @@ fn portkey_cfg(
             routing,
             user: Some("hein@example.com".into()),
         }),
+        context_window: None,
     }
 }
 
@@ -2975,4 +2984,187 @@ async fn portkey_configs_that_cannot_route_are_rejected_on_save() {
         matches!(&err, CoreError::Invalid(m) if m.contains("@provider-slug")),
         "{err:?}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Which database a call works in, list_databases, the run_sql target sent to the UI and the
+// history budget of a provider with a small context window
+// ---------------------------------------------------------------------------------------------
+
+/// The `sql_run` of the single `ToolFinished` event.
+fn sql_run_of(events: &[AgentEvent]) -> Option<SqlRun> {
+    events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolFinished { sql_run, .. } => Some(sql_run.clone()),
+            _ => None,
+        })
+        .expect("a ToolFinished event")
+}
+
+fn pg_profile(id: &str, access: AiDataAccess) -> ConnectionProfile {
+    profile(id, EngineKind::Postgres, Environment::Dev, access)
+}
+
+#[tokio::test]
+async fn list_databases_returns_names_on_the_active_connection() {
+    let h = Harness::anthropic(
+        one_call_replies("t1", "list_databases", json!({})),
+        vec![pg_profile("p1", AiDataAccess::SchemaOnly)],
+    )
+    .await;
+    let (events, content) = run_one_call(&h, false).await;
+    assert_eq!(
+        shape(&events)[1..4],
+        [
+            "proposed t1 list_databases Safe",
+            "tool-started t1",
+            "tool-finished t1 ok=true 2 databases",
+        ],
+        "runs without approval, even on a schema-only connection"
+    );
+    assert_eq!(*h.backend.database_lists.lock().unwrap(), vec!["p1"]);
+    assert!(
+        content.starts_with("<tool_result untrusted=\"true\">"),
+        "{content}"
+    );
+    let body: Value = serde_json::from_str(
+        content
+            .trim_start_matches("<tool_result untrusted=\"true\">")
+            .trim_end_matches("</tool_result>")
+            .trim(),
+    )
+    .unwrap();
+    assert_eq!(body, json!({"databases": ["payments", "shop"], "count": 2}));
+    assert_eq!(sql_run_of(&events), None);
+    // The model is told the tool exists and what `database` is for.
+    let system = h.llm.requests()[0].body["system"].to_string();
+    assert!(system.contains("list_databases names them"), "{system}");
+}
+
+#[tokio::test]
+async fn list_databases_is_refused_when_ai_access_is_none() {
+    let h = Harness::anthropic(
+        one_call_replies("t1", "list_databases", json!({"profile_id":"p1"})),
+        vec![pg_profile("p1", AiDataAccess::None)],
+    )
+    .await;
+    let (events, content) = run_one_call(&h, false).await;
+    assert_eq!(finished(&events), (false, "denied".into()));
+    assert!(content.contains("aiDataAccess = none"), "{content}");
+    assert!(h.backend.database_lists.lock().unwrap().is_empty());
+}
+
+/// A follow-up that names no database runs in the database the user is working in (or pinned),
+/// not in the connection's default; the UI is told where it ran.
+#[tokio::test]
+async fn a_call_without_a_database_runs_in_the_active_database_and_reports_where() {
+    let h = Harness::anthropic(
+        one_call_replies(
+            "t1",
+            "run_sql",
+            json!({"sql":"select count(*) from ledger","purpose":"count"}),
+        ),
+        vec![pg_profile("p1", AiDataAccess::Results)],
+    )
+    .await;
+    let ctx = AgentContext {
+        profile_id: Some("p1".into()),
+        database: Some("payments".into()),
+        ..Default::default()
+    };
+    let (_, mut rx) = h.start("s1", "anthropic", "how many?", ctx).await;
+    let events = collect(&h, "s1", &mut rx, |_| None).await;
+    let calls = h.backend.sql_calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].database.as_deref(), Some("payments"));
+    assert_eq!(
+        sql_run_of(&events),
+        Some(SqlRun {
+            profile_id: "p1".into(),
+            database: Some("payments".into()),
+            sql: "select count(*) from ledger".into(),
+            read_only: true,
+        })
+    );
+    // Serialised for the UI in camelCase, without any rows.
+    let wire = serde_json::to_value(
+        events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::ToolFinished { .. }))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(wire["sqlRun"]["profileId"], "p1");
+    assert_eq!(wire["sqlRun"]["readOnly"], true);
+    assert!(!wire.to_string().contains("alice"), "no row data: {wire}");
+}
+
+#[tokio::test]
+async fn an_approved_write_reports_that_it_did_not_run_read_only() {
+    let h = Harness::anthropic(
+        one_call_replies(
+            "t1",
+            "run_sql",
+            json!({"profile_id":"p1","database":"archive","sql":"delete from t","purpose":"x"}),
+        ),
+        vec![pg_profile("p1", AiDataAccess::Results)],
+    )
+    .await;
+    let (events, _) = run_one_call(&h, true).await;
+    let run = sql_run_of(&events).expect("an executed run_sql reports its target");
+    assert_eq!(
+        run.database.as_deref(),
+        Some("archive"),
+        "the model's choice"
+    );
+    assert!(!run.read_only);
+
+    // Rejected: never ran, nothing to reopen.
+    let h = Harness::anthropic(
+        one_call_replies(
+            "t1",
+            "run_sql",
+            json!({"profile_id":"p1","sql":"delete from t","purpose":"x"}),
+        ),
+        vec![pg_profile("p1", AiDataAccess::Results)],
+    )
+    .await;
+    let (events, _) = run_one_call(&h, false).await;
+    assert_eq!(sql_run_of(&events), None);
+}
+
+/// Runs one large read and returns what the model saw as its result on the next call.
+async fn result_seen_with_window(context_window: Option<u32>) -> String {
+    let llm = MockLlm::start(one_call_replies(
+        "t1",
+        "run_sql",
+        json!({"profile_id":"p1","sql":"select * from big","purpose":"x"}),
+    ))
+    .await;
+    let h = Harness::new(llm, vec![pg_profile("p1", AiDataAccess::Results)]);
+    *h.backend.sql_rows.lock().unwrap() = (0..40)
+        .map(|i| vec![json!(i), json!("x".repeat(500))])
+        .collect();
+    h.svc
+        .save_provider(
+            ProviderConfig {
+                context_window,
+                ..anthropic_cfg(&h.llm.base_url)
+            },
+            Some(SecretString::from(KEY.to_string())),
+        )
+        .await
+        .unwrap();
+    run_one_call(&h, false).await.1
+}
+
+#[tokio::test]
+async fn a_small_context_window_shrinks_the_history_sent() {
+    // Default budget: the ~20 KB result goes back to the model whole.
+    let full = result_seen_with_window(None).await;
+    assert!(full.len() > 15_000, "{}", full.len());
+    // A window that leaves only the minimum budget: the result is elided to fit.
+    let small = result_seen_with_window(Some(2048)).await;
+    assert_eq!(small, "[elided]");
 }

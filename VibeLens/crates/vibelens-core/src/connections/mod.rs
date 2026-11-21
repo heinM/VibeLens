@@ -1596,6 +1596,29 @@ impl ToolBackend for AppToolBackend {
         handle.describe_table(namespace, name).await
     }
 
+    async fn list_databases(&self, profile_id: &str) -> Result<Vec<String>> {
+        let profile = self.connections.profiles().get(profile_id)?;
+        match profile.engine {
+            EngineKind::Redshift => {
+                let engine = self.connections.redshift(profile_id).await?;
+                engine.list_databases().await
+            }
+            EngineKind::Postgres => {
+                let pg = self.connections.pg(profile_id, None).await?;
+                Ok(pg
+                    .list_databases()
+                    .await?
+                    .into_iter()
+                    .filter(|d| !d.is_template && d.allow_connections)
+                    .map(|d| d.name)
+                    .collect())
+            }
+            EngineKind::Iceberg | EngineKind::Valkey => Err(CoreError::Invalid(
+                "list_databases works on Postgres and Redshift connections only".into(),
+            )),
+        }
+    }
+
     async fn list_files(&self) -> Result<Vec<WorkspaceFile>> {
         self.workspace.list().await
     }

@@ -587,6 +587,11 @@ export interface ProviderConfig {
   requiresApiKey: boolean;
   /** Only for kind === "portkey". */
   portkey?: PortkeyOptions | null;
+  /**
+   * The model's context window in tokens (local models). The history sent each turn is cut to
+   * fit after leaving room for the output and the system prompt. null = the agent's default.
+   */
+  contextWindow?: number | null;
 }
 export interface ProviderSummary {
   config: ProviderConfig;
@@ -629,13 +634,26 @@ export interface ApprovalTarget {
    */
   detail?: string | null;
 }
+/**
+ * Where an executed run_sql call ran, resolved by Rust from the stored profile (never from text
+ * the model wrote). No result rows.
+ */
+export interface SqlRun {
+  profileId: string;
+  /** Postgres / Redshift database it ran against; null for Iceberg. */
+  database: string | null;
+  /** The statement exactly as executed. */
+  sql: string;
+  /** True when it ran as a read-only call. */
+  readOnly: boolean;
+}
 export type AgentEvent =
   | { type: "turnStarted"; turnId: string; providerId: string; model: string }
   | { type: "textDelta"; text: string }
   | { type: "toolCallProposed"; callId: string; tool: string; arguments: unknown; risk: ToolRisk; reason: string | null }
   | { type: "approvalRequired"; callId: string; tool: string; arguments: unknown; reason: string; preview: string | null; target?: ApprovalTarget | null }
   | { type: "toolStarted"; callId: string }
-  | { type: "toolFinished"; callId: string; ok: boolean; summary: string; elapsedMs: number }
+  | { type: "toolFinished"; callId: string; ok: boolean; summary: string; elapsedMs: number; sqlRun?: SqlRun | null }
   | { type: "fileWritten"; path: string }
   | { type: "turnFinished"; stopReason: string; usage: Usage | null }
   | { type: "failed"; error: ErrorPayload };

@@ -132,6 +132,12 @@ pub trait ToolBackend: Send + Sync {
     /// the file as it was when the change was put up for approval. If it has changed since (or
     /// appeared, or gone), nothing is written and the call fails.
     async fn write_file(&self, path: &str, contents: &str, expected: &FileVersion) -> Result<()>;
+    /// Names of the databases a `list_databases` call may show: on Postgres the server's
+    /// databases that accept connections (no templates), on Redshift those of the cluster or
+    /// workgroup. Other engines are refused. Default: not supported, so fakes need not implement it.
+    async fn list_databases(&self, _profile_id: &str) -> Result<Vec<String>> {
+        Err(crate::error::CoreError::NotImplemented("list_databases"))
+    }
     /// Full Iceberg table metadata (partition spec, sort order, snapshots) for `describe_table`.
     /// Default: not supported, so fakes and non-Iceberg backends need not implement it; callers
     /// fall back to `schema_metadata` on `CoreError::NotImplemented`.

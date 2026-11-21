@@ -540,6 +540,7 @@ impl Harness {
                 extra_headers: Default::default(),
                 requires_api_key: true,
                 portkey: None,
+                context_window: None,
             },
             Some(SecretString::from("sk-ant-test-key-0123456789".to_string())),
         )
@@ -1294,6 +1295,7 @@ mod real {
                 extra_headers: Default::default(),
                 requires_api_key: true,
                 portkey: None,
+                context_window: None,
             },
             Some(SecretString::from("sk-ant-test-key-0123456789".to_string())),
         )
