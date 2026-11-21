@@ -391,6 +391,42 @@ export interface SchemaObject {
   comment: string | null;
   estimatedRows: number | null;
   signature: string | null;
+  /** A partition of another table: still listed, but the tree nests it under its parent. */
+  isPartition: boolean;
+  parentSchema: string | null;
+  parentName: string | null;
+}
+export interface PartitionInfo {
+  schema: string;
+  name: string;
+  /** e.g. `FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')`. */
+  bound: string;
+  isDefault: boolean;
+  /** Itself partitioned: expands to its own partitions. */
+  isPartitioned: boolean;
+  estimatedRows: number | null;
+  sizeBytes: number | null;
+}
+/** pg_partman `part_config` settings; every field can be absent (partman 4 vs 5, unset columns). */
+export interface PartmanConfig {
+  control: string | null;
+  /** `1 day`, or a number for id-based sets. */
+  partitionInterval: string | null;
+  premake: number | null;
+  retention: string | null;
+  retentionKeepTable: boolean | null;
+  /** `on` / `off`. */
+  automaticMaintenance: string | null;
+}
+export interface PartitionListing {
+  /** e.g. `RANGE (created_at)`. */
+  partitionKey: string | null;
+  /** Direct children ordered by bound, the default partition last. */
+  partitions: PartitionInfo[];
+  /** More partitions exist than were returned. */
+  truncated: boolean;
+  /** Null when pg_partman is absent, does not manage the table, or cannot be read. */
+  partman: PartmanConfig | null;
 }
 export interface ColumnInfo {
   name: string;

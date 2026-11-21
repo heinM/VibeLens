@@ -5,7 +5,7 @@ import { useQueries, useQuery, useQueryClient, type UseQueryResult } from "@tans
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { AlertCircle, Copy, Database, Eye, FilePlus2, FileCode2, Folder, KeyRound, Layers, ListOrdered, Link2, Loader2, Network, RefreshCw, SquareFunction, Table2, Columns3, Code2 } from "lucide-react";
 import { asError } from "../../ipc/commands";
-import type { ConnectionProfile, ObjectKind } from "../../ipc/types";
+import type { ConnectionProfile, ObjectKind, SchemaObject } from "../../ipc/types";
 import { useUIStore } from "../../store/useUIStore";
 import { pgQueries } from "../../hooks/usePg";
 import { useTabActions, quoteIdent } from "../../hooks/useTabActions";
@@ -17,7 +17,9 @@ import { openErdTab, openTableTab } from "../table/openTableTab";
 import { generateInsert, generateSelect, generateUpdate } from "./sqlTemplates";
 import { TREE_ROW_H, TreeRow } from "./TreeRow";
 import {
+  boundLabel,
   buildPgRows,
+  collectPartitionRelations,
   compactCount,
   dbId,
   defaultExpanded,
@@ -27,9 +29,11 @@ import {
   isRelation,
   objKey,
   objectId,
+  partitionStats,
   schemaId,
   type PgRow,
   type QueryState,
+  type RelationRef,
 } from "./pgTreeModel";
 
 function toState<T>(q: UseQueryResult<T>): QueryState<T> {
@@ -79,31 +83,43 @@ export function PgTree({ profile, showSystem }: { profile: ConnectionProfile; sh
   const objectQs = useQueries({ queries: expandedSchemas.map((e) => pgQueries.objects(pid, e.db, e.schema)) });
 
   const expandedTables = useMemo(() => {
-    const out: { db: string; schema: string; table: string }[] = [];
+    const out: { db: string; schema: string; table: string; object: SchemaObject }[] = [];
     expandedSchemas.forEach((e, i) => {
-      for (const o of objectQs[i]?.data ?? []) if (isRelation(o.kind) && isExpanded(toggled, objectId(e.db, o))) out.push({ db: e.db, schema: e.schema, table: o.name });
+      for (const o of objectQs[i]?.data ?? []) if (!o.isPartition && isRelation(o.kind) && isExpanded(toggled, objectId(e.db, o))) out.push({ db: e.db, schema: o.schema, table: o.name, object: o });
     });
     return out;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [expandedSchemas, sig(objectQs), toggled]);
-  const describeQs = useQueries({ queries: expandedTables.map((t) => pgQueries.describe(pid, t.db, t.schema, t.table)) });
+
+  // Partition listings load only for expanded partitioned tables. The walk reads the query cache
+  // directly, so a listing that just arrived reveals the next level (expanded sub-partitions, columns
+  // of expanded partitions) on the following render, to any depth.
+  const partitionWork: { listings: RelationRef[]; describes: RelationRef[] } = { listings: [], describes: [] };
+  const getListing = (r: RelationRef) => qc.getQueryData(pgQueries.partitions(pid, r.db, r.schema, r.table).queryKey);
+  for (const t of expandedTables) if (t.object.kind === "partitionedTable") collectPartitionRelations(t.db, t.object, toggled, getListing, partitionWork);
+  const partitionQs = useQueries({ queries: partitionWork.listings.map((t) => pgQueries.partitions(pid, t.db, t.schema, t.table)) });
+  const describeTargets: RelationRef[] = [...expandedTables.map((t) => ({ db: t.db, schema: t.schema, table: t.table })), ...partitionWork.describes];
+  const describeQs = useQueries({ queries: describeTargets.map((t) => pgQueries.describe(pid, t.db, t.schema, t.table)) });
 
   const schemasSig = sig(schemaQs);
   const objectsSig = sig(objectQs);
   const describeSig = sig(describeQs);
+  const partitionsSig = sig(partitionQs);
+  const targetsKey = [...partitionWork.listings, ...describeTargets].map((t) => describeKey(t.db, t.schema, t.table)).join("|");
   const rows = useMemo(
     () =>
       buildPgRows({
         databases: toState(dbsQ),
         schemas: new Map(expandedDbs.map((db, i) => [db, toState(schemaQs[i])])),
         objects: new Map(expandedSchemas.map((e, i) => [objKey(e.db, e.schema), toState(objectQs[i])])),
-        describes: new Map(expandedTables.map((t, i) => [describeKey(t.db, t.schema, t.table), toState(describeQs[i])])),
+        describes: new Map(describeTargets.map((t, i) => [describeKey(t.db, t.schema, t.table), toState(describeQs[i])])),
+        partitions: new Map(partitionWork.listings.map((t, i) => [describeKey(t.db, t.schema, t.table), toState(partitionQs[i])])),
         toggled,
         showSystem,
         currentDb,
       }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [dbsQ.status, dbsQ.dataUpdatedAt, schemasSig, objectsSig, describeSig, toggled, showSystem, currentDb, expandedDbs, expandedSchemas, expandedTables],
+    [dbsQ.status, dbsQ.dataUpdatedAt, schemasSig, objectsSig, describeSig, partitionsSig, targetsKey, toggled, showSystem, currentDb, expandedDbs, expandedSchemas, expandedTables],
   );
 
   // First load: open the connection's own database and its main schema.
@@ -157,8 +173,13 @@ export function PgTree({ profile, showSystem }: { profile: ConnectionProfile; sh
   const refresh = useCallback(
     (row: PgRow) => {
       if (row.kind === "db" && row.db) void qc.invalidateQueries({ queryKey: ["pg", pid, row.db] });
-      else if (row.kind === "schema" && row.db && row.schema) void qc.invalidateQueries({ queryKey: ["pg", pid, row.db, "objects", row.schema] });
-      else if (row.object) void qc.invalidateQueries({ queryKey: ["pg", pid, row.db, "describe", row.object.schema, row.object.name] });
+      else if (row.kind === "schema" && row.db && row.schema) {
+        void qc.invalidateQueries({ queryKey: ["pg", pid, row.db, "objects", row.schema] });
+        void qc.invalidateQueries({ queryKey: ["pg", pid, row.db, "partitions", row.schema] });
+      } else if (row.object) {
+        void qc.invalidateQueries({ queryKey: ["pg", pid, row.db, "describe", row.object.schema, row.object.name] });
+        if (row.object.kind === "partitionedTable") void qc.invalidateQueries({ queryKey: ["pg", pid, row.db, "partitions", row.object.schema, row.object.name] });
+      }
     },
     [qc, pid],
   );
@@ -205,7 +226,7 @@ export function PgTree({ profile, showSystem }: { profile: ConnectionProfile; sh
       if (isRelation(o.kind)) {
         items.push("separator");
         items.push({ label: `Open ER diagram of ${o.schema}`, icon: <Network className="size-3.5" />, onSelect: () => openErdTab(pid, db, o.schema) });
-        items.push({ label: "Refresh columns", icon: <RefreshCw className="size-3.5" />, onSelect: () => refresh(row) });
+        items.push({ label: o.kind === "partitionedTable" ? "Refresh columns and partitions" : "Refresh columns", icon: <RefreshCw className="size-3.5" />, onSelect: () => refresh(row) });
       }
     } else if (row.kind === "column" && row.column) {
       items.push({ label: "Copy column name", onSelect: () => void copyToClipboard(row.column?.name ?? "") });
@@ -377,19 +398,22 @@ function PgTreeRow({
       const o = row.object;
       if (!o) return null;
       const fn = o.kind === "function" || o.kind === "procedure";
+      const part = row.partition;
       return (
         <TreeRow
           {...common}
           icon={kindIcon[o.kind]}
           label={o.name}
-          secondary={fn ? o.signature : undefined}
-          right={!fn && o.estimatedRows !== null ? compactCount(o.estimatedRows) : undefined}
-          title={o.comment ? `${o.name}: ${o.comment}` : o.name}
+          secondary={fn ? o.signature : part ? boundLabel(part.bound) : undefined}
+          right={part ? partitionStats(part) : !fn && o.estimatedRows !== null ? compactCount(o.estimatedRows) : undefined}
+          title={part ? `${o.schema}.${o.name}\n${part.bound}` : o.comment ? `${o.name}: ${o.comment}` : o.name}
           onClick={() => onSelect(row)}
           onDoubleClick={() => onActivate(row)}
         />
       );
     }
+    case "partitionSummary":
+      return <TreeRow depth={row.depth} muted label={<span className="text-xs">{row.label}</span>} title={row.label} onClick={() => onSelect(row)} />;
     case "column": {
       const c = row.column;
       if (!c) return null;

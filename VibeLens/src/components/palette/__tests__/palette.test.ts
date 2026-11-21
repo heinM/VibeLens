@@ -46,8 +46,8 @@ describe("catalog items", () => {
   it("functions carry their signature", () => {
     const a = goActions();
     const fns = functionItems(prof("p1", "X"), null, [
-      { schema: "shop", name: "order_total", kind: "function", comment: null, estimatedRows: null, signature: "(order_id bigint)" },
-      { schema: "shop", name: "orders", kind: "table", comment: null, estimatedRows: 1, signature: null },
+      { schema: "shop", name: "order_total", kind: "function", comment: null, estimatedRows: null, signature: "(order_id bigint)", isPartition: false, parentSchema: null, parentName: null },
+      { schema: "shop", name: "orders", kind: "table", comment: null, estimatedRows: 1, signature: null, isPartition: false, parentSchema: null, parentName: null },
     ], a);
     expect(fns).toHaveLength(1);
     expect(fns[0].subtitle).toBe("(order_id bigint)");

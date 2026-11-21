@@ -46,6 +46,23 @@ pub async fn pg_list_objects(
     h.list_objects(&schema).await.map_err(err)
 }
 
+/// Partitions (and pg_partman settings, when present) of one partitioned table.
+#[tauri::command]
+pub async fn pg_list_partitions(
+    state: State<'_, AppState>,
+    profile_id: String,
+    database: Option<String>,
+    schema: String,
+    table: String,
+) -> CmdResult<PartitionListing> {
+    let h = state
+        .connections
+        .pg(&profile_id, database.as_deref())
+        .await
+        .map_err(err)?;
+    h.list_partitions(&schema, &table).await.map_err(err)
+}
+
 #[tauri::command]
 pub async fn pg_describe_table(
     state: State<'_, AppState>,

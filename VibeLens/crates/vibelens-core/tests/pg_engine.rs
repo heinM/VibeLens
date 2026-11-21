@@ -480,6 +480,188 @@ async fn catalog_list_objects() {
     assert!(objs.iter().all(|o| o.schema == fx.schema));
 }
 
+const PARTITION_SETUP: &str = r#"
+CREATE TABLE $S.events (id bigint, created date NOT NULL, region text) PARTITION BY RANGE (created);
+CREATE TABLE $S.events_2024_10 PARTITION OF $S.events FOR VALUES FROM ('2024-10-01') TO ('2024-11-01');
+CREATE TABLE $S.events_2024_02 PARTITION OF $S.events FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
+CREATE TABLE $S.events_default PARTITION OF $S.events DEFAULT;
+CREATE TABLE $S.events_2025 PARTITION OF $S.events FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')
+    PARTITION BY LIST (region);
+CREATE TABLE $S.events_2025_eu PARTITION OF $S.events_2025 FOR VALUES IN ('eu');
+CREATE TABLE $S.plain (a int);
+INSERT INTO $S.events SELECT g, '2024-02-10', 'x' FROM generate_series(1, 100) g;
+ANALYZE $S.events;
+"#;
+
+#[tokio::test]
+async fn catalog_partitions_nest_under_their_parent() {
+    let d = require_pg!();
+    let fx = Fixture::new(&d, PARTITION_SETUP).await;
+    // A partition may live in another schema than its parent.
+    let other = Fixture::new(&d, "").await;
+    raw(&d)
+        .await
+        .batch_execute(&fx.q(&format!(
+            "CREATE TABLE {}.events_2023 PARTITION OF $S.events FOR VALUES FROM ('2023-01-01') TO ('2024-01-01')",
+            other.schema
+        )))
+        .await
+        .expect("cross-schema partition");
+    let h = connect(&d).await;
+
+    // list_objects still returns every partition, flagged with its parent.
+    let objs = h.list_objects(&fx.schema).await.expect("list_objects");
+    let get = |n: &str| {
+        objs.iter()
+            .find(|o| o.name == n)
+            .unwrap_or_else(|| panic!("{n} in {objs:?}"))
+    };
+    let events = get("events");
+    assert_eq!(events.kind, ObjectKind::PartitionedTable);
+    assert!(!events.is_partition && events.parent_name.is_none() && events.parent_schema.is_none());
+    assert!(!get("plain").is_partition);
+    for n in [
+        "events_2024_10",
+        "events_2024_02",
+        "events_default",
+        "events_2025",
+    ] {
+        let o = get(n);
+        assert!(o.is_partition, "{n}");
+        assert_eq!(o.parent_schema.as_deref(), Some(fx.schema.as_str()), "{n}");
+        assert_eq!(o.parent_name.as_deref(), Some("events"), "{n}");
+    }
+    // Sub-partitions are partitions of their own parent, not of the root.
+    assert_eq!(
+        get("events_2025_eu").parent_name.as_deref(),
+        Some("events_2025")
+    );
+    let others = h
+        .list_objects(&other.schema)
+        .await
+        .expect("list_objects other");
+    let o = others
+        .iter()
+        .find(|o| o.name == "events_2023")
+        .expect("cross-schema partition");
+    assert_eq!(o.parent_schema.as_deref(), Some(fx.schema.as_str()));
+    assert_eq!(o.parent_name.as_deref(), Some("events"));
+
+    // The agent's catalog dump is unchanged: the root only.
+    let meta = h
+        .schema_metadata(Some(&fx.schema), 100)
+        .await
+        .expect("meta");
+    let mut names: Vec<_> = meta.tables.iter().map(|t| t.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["events", "plain"]);
+
+    let l = h
+        .list_partitions(&fx.schema, "events")
+        .await
+        .expect("list_partitions");
+    assert_eq!(l.partition_key.as_deref(), Some("RANGE (created)"));
+    assert!(!l.truncated);
+    assert!(
+        l.partman.is_none(),
+        "pg_partman is not installed: no info, no error"
+    );
+    let got: Vec<(&str, &str)> = l
+        .partitions
+        .iter()
+        .map(|p| (p.schema.as_str(), p.name.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (other.schema.as_str(), "events_2023"),
+            (fx.schema.as_str(), "events_2024_02"),
+            (fx.schema.as_str(), "events_2024_10"),
+            (fx.schema.as_str(), "events_2025"),
+            (fx.schema.as_str(), "events_default"),
+        ],
+        "by bound, default last, any schema"
+    );
+    let p = |n: &str| l.partitions.iter().find(|p| p.name == n).unwrap();
+    assert_eq!(
+        p("events_2024_02").bound,
+        "FOR VALUES FROM ('2024-02-01') TO ('2024-03-01')"
+    );
+    assert_eq!(p("events_2024_02").estimated_rows, Some(100));
+    assert!(p("events_2024_02").size_bytes.is_some_and(|s| s > 0));
+    assert!(!p("events_2024_02").is_default && !p("events_2024_02").is_partitioned);
+    assert_eq!(p("events_default").bound, "DEFAULT");
+    assert!(p("events_default").is_default);
+    assert!(p("events_2025").is_partitioned && !p("events_2025").is_default);
+    assert!(p("events_2025").size_bytes.is_some(), "sum over the leaves");
+
+    // A partitioned partition expands again.
+    let sub = h
+        .list_partitions(&fx.schema, "events_2025")
+        .await
+        .expect("sub");
+    assert_eq!(sub.partition_key.as_deref(), Some("LIST (region)"));
+    assert_eq!(sub.partitions.len(), 1);
+    assert_eq!(sub.partitions[0].name, "events_2025_eu");
+    assert_eq!(sub.partitions[0].bound, "FOR VALUES IN ('eu')");
+
+    // A table without partitions, and one that does not exist, are not partitioned tables.
+    let leaf = h
+        .list_partitions(&fx.schema, "plain")
+        .await
+        .expect_err("plain table");
+    assert!(matches!(leaf, CoreError::NotFound(_)), "{leaf:?}");
+    assert!(h.list_partitions(&fx.schema, "nope").await.is_err());
+    // Names are bound parameters, never spliced into SQL.
+    assert!(
+        h.list_partitions("x' OR '1'='1", "events\"; DROP TABLE plain; --")
+            .await
+            .is_err()
+    );
+    assert!(
+        !h.list_objects(&fx.schema)
+            .await
+            .unwrap()
+            .iter()
+            .all(|o| o.name != "plain")
+    );
+}
+
+#[tokio::test]
+async fn catalog_partition_list_is_ordered_numerically_and_capped() {
+    let d = require_pg!();
+    let fx = Fixture::new(
+        &d,
+        r#"
+CREATE TABLE $S.many (k int NOT NULL) PARTITION BY LIST (k);
+DO $$ BEGIN
+  FOR i IN 1..1001 LOOP
+    EXECUTE format('CREATE TABLE $S.many_%s PARTITION OF $S.many FOR VALUES IN (%s)', i, i);
+  END LOOP;
+END $$;
+"#,
+    )
+    .await;
+    let h = connect(&d).await;
+    let l = h
+        .list_partitions(&fx.schema, "many")
+        .await
+        .expect("list_partitions");
+    assert!(l.truncated, "1001 partitions exceed the cap");
+    assert_eq!(l.partitions.len(), 1000);
+    let bounds: Vec<&str> = l.partitions.iter().map(|p| p.bound.as_str()).collect();
+    assert_eq!(
+        &bounds[..3],
+        [
+            "FOR VALUES IN (1)",
+            "FOR VALUES IN (2)",
+            "FOR VALUES IN (3)"
+        ]
+    );
+    assert_eq!(bounds[9], "FOR VALUES IN (10)", "10 after 9, not after 1");
+    assert_eq!(bounds[999], "FOR VALUES IN (1000)");
+}
+
 #[tokio::test]
 async fn catalog_describe_table() {
     let d = require_pg!();

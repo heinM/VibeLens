@@ -64,6 +64,7 @@ pub fn run() {
             commands::pg::pg_list_databases,
             commands::pg::pg_list_schemas,
             commands::pg::pg_list_objects,
+            commands::pg::pg_list_partitions,
             commands::pg::pg_describe_table,
             commands::pg::pg_execute,
             commands::pg::pg_cancel,

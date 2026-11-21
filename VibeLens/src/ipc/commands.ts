@@ -76,6 +76,8 @@ export const api = {
     invoke<T.SchemaInfo[]>("pg_list_schemas", { profileId, database }),
   pgListObjects: (profileId: string, database: string | null, schema: string) =>
     invoke<T.SchemaObject[]>("pg_list_objects", { profileId, database, schema }),
+  pgListPartitions: (profileId: string, database: string | null, schema: string, table: string) =>
+    invoke<T.PartitionListing>("pg_list_partitions", { profileId, database, schema, table }),
   pgDescribeTable: (profileId: string, database: string | null, schema: string, table: string) =>
     invoke<T.TableDescription>("pg_describe_table", { profileId, database, schema, table }),
   /**
