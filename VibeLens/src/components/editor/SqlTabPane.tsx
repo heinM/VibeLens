@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Group, Panel, Separator, useDefaultLayout } from "react-resizable-panels";
-import { AlertCircle, AlignLeft, ChevronDown, Gauge, ListVideo, Lock, LockOpen, Play, Save, Sparkles, Square, Zap } from "lucide-react";
+import { AlertCircle, AlignLeft, ChevronDown, Gauge, ListVideo, Lock, LockOpen, Play, Save, Sparkles, Square, X, Zap } from "lucide-react";
 import { api, asError } from "../../ipc/commands";
 import type { ErrorPayload } from "../../ipc/types";
 import { selectAiEnabled, useUIStore } from "../../store/useUIStore";
@@ -11,7 +11,7 @@ import { useConnect, useConnectionStatus } from "../../hooks/useConnectionStatus
 import { useProfile } from "../../hooks/useProfiles";
 import { useQueryRunner } from "../../hooks/useQueryRunner";
 import { WS_FILES_KEY } from "../../hooks/useWorkspaceFiles";
-import { Button, ConfirmDialog } from "../ui";
+import { Button, ConfirmDialog, IconButton } from "../ui";
 import { cn } from "../../lib/cn";
 import { ResultsPanel } from "../grid/ResultsPanel";
 import { MOD } from "../ui/platform";
@@ -442,6 +442,9 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
                   <Button size="sm" variant="secondary" onClick={fixWithAi} title="Ask the AI for a corrected statement. You review it before anything changes.">
                     <Sparkles className="size-3.5 text-accent" /> Fix with AI
                   </Button>
+                  <IconButton label="Dismiss" className="size-6 shrink-0" onClick={() => setFixDismissedRun(runner.runId)}>
+                    <X className="size-3.5" aria-hidden />
+                  </IconButton>
                 </div>
               )}
               {notice && (
