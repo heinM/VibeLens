@@ -11,30 +11,47 @@ use crate::model::{HttpEngineAuth, IcebergQueryEngine};
 /// going to be.
 pub(crate) const MAX_SESSION_START_TIMEOUT_SECS: u64 = 3600;
 
-/// Session configuration keys that load code into the cluster. A profile file can be edited by
-/// hand, so a key like this would let whoever can write the file run code as the Spark user.
-const CODE_LOADING_KEYS: &[&str] = &[
-    "spark.jars",
-    "spark.jars.packages",
-    "spark.jars.repositories",
-    "spark.jars.ivy",
-    "spark.jars.ivySettings",
-    "spark.jars.excludes",
-    "spark.files",
-    "spark.archives",
-    "spark.submit.pyFiles",
-    "spark.driver.extraJavaOptions",
-    "spark.executor.extraJavaOptions",
-    "spark.driver.extraClassPath",
-    "spark.executor.extraClassPath",
-    "spark.driver.extraLibraryPath",
-    "spark.executor.extraLibraryPath",
-    "spark.driver.defaultJavaOptions",
-    "spark.executor.defaultJavaOptions",
+/// The only Spark session configuration keys a profile may set. Everything else is refused
+/// with a message to configure it on the cluster: a profile file can be edited by hand, and a
+/// deny-list of dangerous keys cannot keep up with Spark (container images, plugins, executor
+/// environment, catalog URIs and storage endpoints all lead somewhere else).
+///
+/// Keys are compared exactly (case-sensitive) after trimming. `<C>` stands for the profile's
+/// `catalog`. `spark.sql.catalog.<C>` itself accepts only a value from
+/// [`SPARK_CATALOG_CLASSES`]. Values: no control characters, at most
+/// [`MAX_SESSION_CONF_VALUE`] characters, nothing that looks like a credential and no `${`.
+///
+/// The UI mirrors this list; change both together.
+pub const SPARK_SESSION_CONF_ALLOWED: &[&str] = &[
+    "spark.sql.catalog.<C>",
+    "spark.sql.catalog.<C>.type",
+    "spark.sql.catalog.<C>.warehouse",
+    "spark.sql.catalog.<C>.default-namespace",
+    "spark.sql.catalog.<C>.cache-enabled",
+    "spark.sql.catalog.<C>.cache.expiration-interval-ms",
+    "spark.sql.shuffle.partitions",
+    "spark.sql.session.timeZone",
+    "spark.sql.adaptive.enabled",
+    "spark.sql.adaptive.coalescePartitions.enabled",
+    "spark.executor.memory",
+    "spark.executor.cores",
+    "spark.executor.instances",
+    "spark.driver.memory",
+    "spark.driver.cores",
+    "spark.dynamicAllocation.enabled",
+    "spark.dynamicAllocation.minExecutors",
+    "spark.dynamicAllocation.maxExecutors",
+    "spark.dynamicAllocation.initialExecutors",
 ];
 
-/// Words in a configuration key that mark it as a credential.
-const SECRET_KEY_WORDS: &[&str] = &["secret", "password", "token", "credential"];
+/// The values `spark.sql.catalog.<C>` may have.
+pub const SPARK_CATALOG_CLASSES: &[&str] = &[
+    "org.apache.iceberg.spark.SparkCatalog",
+    "org.apache.iceberg.spark.SparkSessionCatalog",
+];
+
+/// Longest accepted `sessionConf` value, in characters.
+pub const MAX_SESSION_CONF_VALUE: usize = 512;
 
 fn invalid<T>(message: String) -> Result<T> {
     Err(CoreError::Invalid(message))
@@ -104,42 +121,67 @@ fn check_auth(url: &url::Url, auth: &HttpEngineAuth, engine: &str, what: &str) -
     Ok(())
 }
 
-/// Whether a Spark configuration entry looks like a credential.
-fn is_secret_conf(key: &str, value: &str) -> bool {
-    let k = key.trim().to_ascii_lowercase();
-    SECRET_KEY_WORDS.iter().any(|w| k.contains(w))
-        || k.ends_with(".key")
-        || k.ends_with("access.key")
-        || value
-            .trim_start()
-            .get(..7)
-            .is_some_and(|p| p.eq_ignore_ascii_case("bearer "))
+/// Whether a configuration value looks like a credential.
+fn is_secret_value(value: &str) -> bool {
+    let v = value.trim_start();
+    v.get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("bearer "))
+        || v.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("basic "))
+        || ["password=", "secret=", "token="]
+            .iter()
+            .any(|w| v.to_ascii_lowercase().contains(w))
 }
 
-/// The `sessionConf` rules: no credentials (they belong on the cluster, not in a plain-text
-/// profile) and nothing that loads code.
-pub(crate) fn check_session_conf(conf: &BTreeMap<String, String>) -> Result<()> {
+/// The `sessionConf` rules: only keys of [`SPARK_SESSION_CONF_ALLOWED`] (for `catalog`), with
+/// plain values. Credentials and anything else belong on the cluster, not in a plain-text
+/// profile.
+pub(crate) fn check_session_conf(conf: &BTreeMap<String, String>, catalog: &str) -> Result<()> {
+    let catalog = catalog.trim();
     for (key, value) in conf {
         let k = key.trim();
         if k.is_empty() {
             return invalid("a Spark session configuration key is empty".into());
         }
-        if k.chars().any(char::is_control) || value.chars().any(char::is_control) {
+        let shown: String = k.chars().filter(|c| !c.is_control()).take(128).collect();
+        let allowed = SPARK_SESSION_CONF_ALLOWED
+            .iter()
+            .any(|a| a.replace("<C>", catalog) == k);
+        if !allowed {
             return invalid(format!(
-                "Spark session configuration '{k}' contains a control character"
+                "Spark session configuration '{shown}' is not one VibeLens sets from a connection \
+                 profile (the profile file can be edited by hand). Configure it on the cluster \
+                 (spark-defaults.conf or the Livy server) instead"
             ));
         }
-        if is_secret_conf(k, value) {
+        if value.chars().any(char::is_control) {
             return invalid(format!(
-                "Spark session configuration '{k}' looks like a credential, and the profile file \
-                 is stored as plain text. Configure it on the cluster (spark-defaults.conf or the \
-                 Livy server) instead"
+                "Spark session configuration '{shown}' contains a control character"
             ));
         }
-        if CODE_LOADING_KEYS.iter().any(|c| c.eq_ignore_ascii_case(k)) {
+        if value.chars().count() > MAX_SESSION_CONF_VALUE {
             return invalid(format!(
-                "Spark session configuration '{k}' loads code into the cluster and is not \
-                 accepted from a connection profile. Configure it on the cluster instead"
+                "Spark session configuration '{shown}' is longer than {MAX_SESSION_CONF_VALUE} \
+                 characters"
+            ));
+        }
+        if value.contains("${") {
+            return invalid(format!(
+                "Spark session configuration '{shown}' contains '${{', which Spark would \
+                 substitute; write the value out"
+            ));
+        }
+        if is_secret_value(value) {
+            return invalid(format!(
+                "Spark session configuration '{shown}' looks like a credential, and the profile \
+                 file is stored as plain text. Configure it on the cluster instead"
+            ));
+        }
+        if k == format!("spark.sql.catalog.{catalog}")
+            && !SPARK_CATALOG_CLASSES.contains(&value.trim())
+        {
+            return invalid(format!(
+                "Spark session configuration '{shown}' must be one of {}",
+                SPARK_CATALOG_CLASSES.join(", ")
             ));
         }
     }
@@ -166,6 +208,80 @@ pub(crate) fn engine_target(engine: &IcebergQueryEngine) -> Option<String> {
         })
         .unwrap_or_else(|| "an unparsable URL".to_string());
     Some(format!("{name} at {place}, catalog '{}'", catalog.trim()))
+}
+
+/// The endpoint an engine secret belongs to:
+/// `"{kind}|{scheme}://{host}:{port}{path prefix}|{caCertPath or empty}"`. Stored in the vault
+/// next to the secret (`vault_keys::engine_secret_origin`) when the secret is written, and
+/// compared before the secret is used, so that a hand-edited URL, CA file or engine kind (or a
+/// test call naming another endpoint) never receives the stored password or token. `None` for
+/// engines without an HTTP endpoint, or a URL that does not parse.
+pub fn engine_origin(engine: &IcebergQueryEngine) -> Option<String> {
+    let (kind, url, ca) = match engine {
+        IcebergQueryEngine::Trino {
+            url, ca_cert_path, ..
+        } => ("trino", url, ca_cert_path),
+        IcebergQueryEngine::Spark {
+            url, ca_cert_path, ..
+        } => ("spark", url, ca_cert_path),
+        IcebergQueryEngine::Local | IcebergQueryEngine::Athena { .. } => return None,
+    };
+    let u = url::Url::parse(url.trim()).ok()?;
+    let host = u.host_str()?.to_ascii_lowercase();
+    let port = u.port_or_known_default()?;
+    let path = u.path().trim_end_matches('/');
+    let ca = ca.as_deref().map(str::trim).unwrap_or("");
+    Some(format!("{kind}|{}://{host}:{port}{path}|{ca}", u.scheme()))
+}
+
+/// What the approval card shows under the connection for a Trino or Spark engine: engine,
+/// host:port, URL path prefix, catalog, default namespace and the acting user. Never a
+/// credential. `None` for the other engines.
+pub fn engine_detail(opts: &crate::model::IcebergOptions) -> Option<String> {
+    let (name, url, catalog, user) = match &opts.query_engine {
+        IcebergQueryEngine::Trino {
+            url, catalog, user, ..
+        } => ("Trino", url, catalog, Some(user.trim().to_string())),
+        IcebergQueryEngine::Spark {
+            url,
+            catalog,
+            proxy_user,
+            ..
+        } => (
+            "Spark (Livy)",
+            url,
+            catalog,
+            proxy_user
+                .as_deref()
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(|p| format!("{p} (proxy user)")),
+        ),
+        IcebergQueryEngine::Local | IcebergQueryEngine::Athena { .. } => return None,
+    };
+    let mut parts = vec![name.to_string()];
+    if let Ok(u) = url::Url::parse(url.trim()) {
+        if let (Some(h), Some(p)) = (u.host_str(), u.port_or_known_default()) {
+            parts.push(format!("{h}:{p}"));
+        }
+        let path = u.path().trim_end_matches('/');
+        if !path.is_empty() {
+            parts.push(format!("path {path}"));
+        }
+    }
+    parts.push(format!("catalog {}", catalog.trim()));
+    if let Some(ns) = opts
+        .default_namespace
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        parts.push(format!("namespace {ns}"));
+    }
+    if let Some(u) = user.filter(|u| !u.is_empty()) {
+        parts.push(format!("as {u}"));
+    }
+    Some(parts.join(" · "))
 }
 
 /// The rules for the query engine of an Iceberg connection. Only Trino and Spark have any.
@@ -199,7 +315,7 @@ pub(crate) fn check_query_engine(engine: &IcebergQueryEngine) -> Result<()> {
                 plain_name(p, "Livy proxy user")?;
             }
             check_auth(&url, auth, "Livy", "Livy URL")?;
-            check_session_conf(session_conf)?;
+            check_session_conf(session_conf, catalog)?;
             if let Some(secs) = session_start_timeout_secs
                 && !(1..=MAX_SESSION_START_TIMEOUT_SECS).contains(secs)
             {
@@ -318,57 +434,74 @@ mod tests {
         )));
     }
 
-    /// Without this rule a key or token typed into the session configuration would be written
-    /// to the profile file in plain text, and a code-loading key would let whoever can edit
-    /// that file run code on the cluster.
+    /// Audit 2026-11-21, item 4: the deny-list was bypassable. Without the allow-list each of
+    /// these keys, written into a hand-edited profile, would change what the cluster runs or
+    /// where its data and credentials go.
     #[test]
-    fn session_conf_holds_no_secrets_and_loads_no_code() {
+    fn session_conf_is_an_allow_list() {
         for (k, v) in [
             ("spark.hadoop.fs.s3a.secret.key", "x"),
-            ("spark.hadoop.fs.s3a.access.key", "x"),
-            ("spark.sql.catalog.lake.token", "x"),
-            ("spark.sql.catalog.lake.credential", "id:secret"),
-            ("spark.hadoop.javax.jdo.option.ConnectionPassword", "x"),
-            ("spark.sql.catalog.lake.header.Authorization", "Bearer abc"),
-            ("spark.ssl.keyStore.key", "x"),
+            ("spark.kubernetes.container.image", "evil/image:latest"),
+            ("spark.plugins", "com.evil.Plugin"),
+            ("spark.sql.extensions", "com.evil.Ext"),
+            ("spark.executorEnv.AWS_ACCESS_KEY_ID", "x"),
+            ("spark.yarn.dist.jars", "s3://b/e.jar"),
+            ("spark.sql.catalog.lake.uri", "https://attacker.example"),
+            ("spark.sql.catalog.lake.catalog-impl", "x"),
+            ("spark.sql.catalog.lake.io-impl", "x"),
+            ("spark.hadoop.fs.s3a.endpoint", "https://attacker.example"),
+            ("spark.jars", "s3://bucket/evil.jar"),
+            ("spark.driver.extraJavaOptions", "-javaagent:x"),
+            (
+                "spark.sql.catalog.other",
+                "org.apache.iceberg.spark.SparkCatalog",
+            ),
+            ("SPARK.SQL.SHUFFLE.PARTITIONS", "8"),
         ] {
             let m = refused(check_query_engine(&spark(
                 "https://l",
                 HttpEngineAuth::None,
                 &[(k, v)],
             )));
-            assert!(m.contains("credential") && !m.contains("abc"), "{m}");
+            assert!(m.contains("on the cluster"), "{k}: {m}");
         }
-        for k in [
-            "spark.jars",
-            "spark.jars.packages",
-            "spark.files",
-            "spark.submit.pyFiles",
-            "spark.driver.extraJavaOptions",
-            "spark.executor.extraJavaOptions",
-            "spark.driver.extraClassPath",
-            "spark.executor.extraClassPath",
-            "SPARK.JARS",
+        for (k, v) in [
+            ("spark.sql.catalog.lake", "com.evil.Catalog"),
+            ("spark.sql.catalog.lake.warehouse", "${env:SECRET}"),
+            ("spark.sql.shuffle.partitions", "8\n9"),
+            ("spark.driver.memory", "Bearer abc"),
         ] {
             let m = refused(check_query_engine(&spark(
                 "https://l",
                 HttpEngineAuth::None,
-                &[(k, "s3://bucket/evil.jar")],
+                &[(k, v)],
             )));
-            assert!(m.contains("loads code"), "{m}");
+            assert!(!m.contains("abc"), "{m}");
         }
+        let long = "1".repeat(MAX_SESSION_CONF_VALUE + 1);
+        refused(check_query_engine(&spark(
+            "https://l",
+            HttpEngineAuth::None,
+            &[("spark.sql.shuffle.partitions", long.as_str())],
+        )));
+        let all: Vec<(String, &str)> = SPARK_SESSION_CONF_ALLOWED
+            .iter()
+            .map(|k| {
+                let key = k.replace("<C>", "lake");
+                let v = if key == "spark.sql.catalog.lake" {
+                    "org.apache.iceberg.spark.SparkSessionCatalog"
+                } else {
+                    "8"
+                };
+                (key, v)
+            })
+            .collect();
+        let pairs: Vec<(&str, &str)> = all.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        check_query_engine(&spark("https://l", HttpEngineAuth::None, &pairs)).unwrap();
         check_query_engine(&spark(
             "https://l",
             HttpEngineAuth::None,
-            &[
-                (
-                    "spark.sql.catalog.lake",
-                    "org.apache.iceberg.spark.SparkCatalog",
-                ),
-                ("spark.sql.catalog.lake.type", "rest"),
-                ("spark.sql.catalog.lake.uri", "https://catalog.example"),
-                ("spark.sql.shuffle.partitions", "8"),
-            ],
+            &[(" spark.sql.shuffle.partitions ", "8")],
         ))
         .unwrap();
     }
@@ -406,6 +539,59 @@ mod tests {
             "kind": "trino", "url": "https://t", "catalog": "c", "user": "u",
             "auth": {"kind": "kerberos"}}));
         assert!(bad.is_err());
+    }
+
+    #[test]
+    fn origins_change_with_endpoint_ca_and_kind() {
+        let o = engine_origin(&trino("https://T.example/trino/", basic())).unwrap();
+        assert_eq!(o, "trino|https://t.example:443/trino|");
+        assert_ne!(
+            Some(o.clone()),
+            engine_origin(&trino("https://t.example/other/", basic()))
+        );
+        assert_ne!(
+            Some(o.clone()),
+            engine_origin(&trino("https://t.example:8443/trino", basic()))
+        );
+        let mut with_ca = trino("https://t.example/trino", basic());
+        if let IcebergQueryEngine::Trino { ca_cert_path, .. } = &mut with_ca {
+            *ca_cert_path = Some("/tmp/evil.pem".into());
+        }
+        assert_ne!(Some(o.clone()), engine_origin(&with_ca));
+        assert_ne!(
+            Some(o),
+            engine_origin(&spark("https://t.example/trino", basic(), &[]))
+        );
+        assert_eq!(engine_origin(&IcebergQueryEngine::Local), None);
+    }
+
+    #[test]
+    fn engine_detail_names_endpoint_catalog_namespace_and_user() {
+        let opts = |engine| crate::model::IcebergOptions {
+            catalog: crate::model::IcebergCatalog::Hms {
+                address: "h".into(),
+                warehouse: "w".into(),
+            },
+            storage: Default::default(),
+            query_engine: engine,
+            default_namespace: Some("shop".into()),
+        };
+        assert_eq!(
+            engine_detail(&opts(trino("https://gw.example/trino/", basic()))).as_deref(),
+            Some(
+                "Trino · gw.example:443 · path /trino · catalog iceberg · namespace shop · as ana"
+            )
+        );
+        let mut s = spark("https://livy.example:8998", HttpEngineAuth::None, &[]);
+        if let IcebergQueryEngine::Spark { proxy_user, .. } = &mut s {
+            *proxy_user = Some("etl".into());
+        }
+        assert_eq!(
+            engine_detail(&opts(s)).as_deref(),
+            Some(
+                "Spark (Livy) · livy.example:8998 · catalog lake · namespace shop · as etl (proxy user)"
+            )
+        );
     }
 
     #[test]

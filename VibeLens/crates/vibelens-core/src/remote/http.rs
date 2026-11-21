@@ -123,6 +123,11 @@ fn describe_reqwest_error(e: reqwest::Error) -> String {
     msg
 }
 
+/// Body limit for answers that carry no rows (status, submission, cancel, delete).
+pub(crate) const SMALL_BODY: usize = 8 * 1024 * 1024;
+
+/// Cheap to clone: the connection pool is shared.
+#[derive(Clone)]
 pub(crate) struct HttpClient {
     http: reqwest::Client,
     base: url::Url,
@@ -203,6 +208,14 @@ impl HttpClient {
             // is carried into the next request.)
             .redirect(reqwest::redirect::Policy::none())
             .http1_only();
+        // A system proxy must never carry the credential for a server on this machine (the
+        // only place a credential may travel over plain http).
+        if base
+            .host_str()
+            .is_some_and(crate::cleartext::is_loopback_host)
+        {
+            builder = builder.no_proxy();
+        }
         if let Some(path) = ca_cert_path.map(str::trim).filter(|p| !p.is_empty()) {
             let pem = std::fs::read(path)
                 .map_err(|e| CoreError::Invalid(format!("cannot read the CA file {path}: {e}")))?;
@@ -264,6 +277,20 @@ impl HttpClient {
         headers: &[(&str, String)],
         body: Option<Body>,
     ) -> Result<Response> {
+        self.send_capped(method, url, headers, body, self.limits.max_body_bytes)
+            .await
+    }
+
+    /// [`send`](Self::send) with a smaller body limit (`max_body`, never above the client's).
+    pub(crate) async fn send_capped(
+        &self,
+        method: reqwest::Method,
+        url: &url::Url,
+        headers: &[(&str, String)],
+        body: Option<Body>,
+        max_body: usize,
+    ) -> Result<Response> {
+        let max_body = max_body.min(self.limits.max_body_bytes);
         if !same_endpoint(&self.base, url) {
             return Err(CoreError::Other(format!(
                 "refused to send a {} request to {}, which is not the configured endpoint {}",
@@ -322,11 +349,11 @@ impl HttpClient {
         loop {
             match resp.chunk().await {
                 Ok(Some(chunk)) => {
-                    if body.len() + chunk.len() > self.limits.max_body_bytes {
+                    if body.len() + chunk.len() > max_body {
                         return Err(CoreError::Other(format!(
                             "{} sent a response larger than {}; stopped reading it",
                             self.label,
-                            size_text(self.limits.max_body_bytes)
+                            size_text(max_body)
                         )));
                     }
                     body.extend_from_slice(&chunk);

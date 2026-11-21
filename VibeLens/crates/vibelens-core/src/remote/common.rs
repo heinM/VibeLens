@@ -120,13 +120,13 @@ pub(crate) async fn collect_script<S: Script>(
     engine: &S,
     sql: &str,
     opts: ExecOptions,
+    cancel: CancellationToken,
 ) -> Result<QueryResult> {
     let statements = crate::sql::split_statements(sql);
     if statements.is_empty() {
         return Ok(QueryResult::default());
     }
     let (tx, mut rx) = mpsc::channel::<QueryEvent>(32);
-    let cancel = CancellationToken::new();
     let runner = async {
         let end = engine.run(&statements, &opts, &cancel, &tx).await;
         drop(tx);

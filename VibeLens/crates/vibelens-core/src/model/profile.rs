@@ -393,6 +393,7 @@ impl ConnectionProfile {
         }
         if !uses_engine_secret {
             unused.push(vault_keys::engine_secret(id));
+            unused.push(vault_keys::engine_secret_origin(id));
         }
         unused
     }
@@ -487,5 +488,10 @@ pub mod vault_keys {
     /// Password or bearer token of a remote query engine (Trino, Spark through Livy).
     pub fn engine_secret(profile_id: &str) -> String {
         format!("profile:{profile_id}:engine-secret")
+    }
+    /// The endpoint [`engine_secret`] was saved for (`remote::config::engine_origin`). Not
+    /// secret, but kept next to it so a hand-edited profile cannot move the secret elsewhere.
+    pub fn engine_secret_origin(profile_id: &str) -> String {
+        format!("profile:{profile_id}:engine-secret-origin")
     }
 }

@@ -36,7 +36,7 @@ use super::common::{
     End, RowBuf, Run, Script, Stop, cap_cell, collect_script, elapsed_ms, emit, sleep_or_cancel,
     stream_script, which,
 };
-use super::http::{Body, HttpClient, HttpLimits, MAX_ERROR_TEXT, bounded};
+use super::http::{Body, HttpClient, HttpLimits, MAX_ERROR_TEXT, SMALL_BODY, bounded};
 use crate::error::{CoreError, Result};
 use crate::model::*;
 
@@ -66,11 +66,53 @@ pub struct SparkEngine {
     client: HttpClient,
     timing: RemoteTiming,
     /// The Livy session this engine created, once it is idle and switched to the catalog.
-    session: StdMutex<Option<u64>>,
+    session: StdMutex<Option<Live>>,
     /// One script at a time: a Livy session runs one statement at a time anyway, and the
     /// session is created and replaced under this lock.
     run_lock: tokio::sync::Mutex<()>,
     closed: AtomicBool,
+}
+
+/// A session this engine created: its id and the unique name it was created with. Livy reuses
+/// ids after a restart, so the name is what tells our session from someone else's.
+#[derive(Debug, Clone)]
+struct Live {
+    id: u64,
+    name: String,
+}
+
+/// Most columns a result may declare. A result is materialised per statement, so this bounds
+/// the per-row work and the column metadata.
+pub(crate) const MAX_COLUMNS: usize = 2000;
+
+/// Deletes a session that was created but not handed over yet when the future creating it is
+/// dropped (agent Stop, a timeout higher up), so that no session leaks without its id stored.
+struct DeleteOnDrop {
+    client: Option<HttpClient>,
+    id: u64,
+}
+
+impl DeleteOnDrop {
+    fn disarm(&mut self) {
+        self.client = None;
+    }
+}
+
+impl Drop for DeleteOnDrop {
+    fn drop(&mut self) {
+        let Some(client) = self.client.take() else {
+            return;
+        };
+        let id = self.id;
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                if let Ok(url) = client.url(&format!("/sessions/{id}")) {
+                    let del = client.send_capped(Method::DELETE, &url, &[], None, SMALL_BODY);
+                    let _ = tokio::time::timeout(Duration::from_secs(10), del).await;
+                }
+            });
+        }
+    }
 }
 
 /// What submitting a statement found.
@@ -92,7 +134,7 @@ impl SparkEngine {
         secret: Option<SecretString>,
         limits: HttpLimits,
     ) -> Result<Self> {
-        super::config::check_session_conf(&cfg.session_conf)?;
+        super::config::check_session_conf(&cfg.session_conf, &cfg.catalog)?;
         let client = HttpClient::new(
             "Livy",
             &cfg.url,
@@ -134,36 +176,89 @@ impl SparkEngine {
     /// Bounded, materialised execution: the result of the last statement that returns rows
     /// (or of the last statement when none does). Errors are returned as `Err`.
     pub async fn execute_collect(&self, sql: &str, opts: ExecOptions) -> Result<QueryResult> {
-        collect_script(self, sql, opts).await
+        collect_script(self, sql, opts, CancellationToken::new()).await
+    }
+
+    /// [`execute_collect`](Self::execute_collect) that stops when `cancel` fires, after the
+    /// running statement has been cancelled on the server.
+    pub async fn execute_collect_cancellable(
+        &self,
+        sql: &str,
+        opts: ExecOptions,
+        cancel: CancellationToken,
+    ) -> Result<QueryResult> {
+        collect_script(self, sql, opts, cancel).await
     }
 
     /// The id of the Livy session this engine holds, if any (diagnostics and tests).
     pub fn session_id(&self) -> Option<u64> {
-        *self.session.lock().unwrap_or_else(|e| e.into_inner())
+        self.live().map(|l| l.id)
     }
 
-    /// Deletes the Livy session, best effort. Later runs fail. A statement still running in the
-    /// session ends with it.
+    fn live(&self) -> Option<Live> {
+        self.session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Deletes the Livy session, best effort, if it is still the one this engine created. Later
+    /// runs fail. A statement still running in the session ends with it.
     pub async fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
-        let id = self
+        let live = self
             .session
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        if let Some(id) = id {
-            self.delete_session(id).await;
+        if let Some(live) = live
+            && matches!(self.check_live(&live).await, Ok(true))
+        {
+            self.delete_session(live.id).await;
         }
     }
 
-    fn set_session(&self, id: Option<u64>) {
-        *self.session.lock().unwrap_or_else(|e| e.into_inner()) = id;
+    fn set_session(&self, live: Option<Live>) {
+        *self.session.lock().unwrap_or_else(|e| e.into_inner()) = live;
+    }
+
+    /// Whether the session behind `live.id` is still ours (same name, same proxy user) and
+    /// usable. After a Livy restart the id may belong to someone else's session.
+    async fn check_live(&self, live: &Live) -> Run<bool> {
+        let resp = self
+            .request(Method::GET, &format!("/sessions/{}", live.id), None)
+            .await?;
+        if !resp.is_success() {
+            return Ok(false);
+        }
+        let v = parse(&resp.body)?;
+        let name_ok = v.get("name").and_then(Value::as_str) == Some(live.name.as_str());
+        let want_proxy = self.proxy_user();
+        let proxy_ok = match want_proxy {
+            Some(p) => v.get("proxyUser").and_then(Value::as_str) == Some(p),
+            None => true,
+        };
+        let state = v.get("state").and_then(Value::as_str).unwrap_or("");
+        let usable = !matches!(
+            state,
+            "dead" | "killed" | "error" | "shutting_down" | "success"
+        );
+        Ok(name_ok && proxy_ok && usable)
+    }
+
+    fn proxy_user(&self) -> Option<&str> {
+        self.cfg
+            .proxy_user
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
     }
 
     fn url(&self, path: &str) -> Run<url::Url> {
         self.client.url(path).map_err(Stop::Err)
     }
 
+    /// A request whose answer carries no rows: bounded by [`SMALL_BODY`].
     async fn request(
         &self,
         method: Method,
@@ -173,33 +268,35 @@ impl SparkEngine {
         let url = self.url(path)?;
         Ok(self
             .client
-            .send(method, &url, &[], body.map(Body::Json))
+            .send_capped(method, &url, &[], body.map(Body::Json), SMALL_BODY)
             .await?)
+    }
+
+    /// A statement status request, whose final answer carries the rows.
+    async fn request_result(&self, path: &str) -> Run<super::http::Response> {
+        let url = self.url(path)?;
+        Ok(self.client.send(Method::GET, &url, &[], None).await?)
     }
 
     /// The session to run in, creating it when there is none.
     async fn ensure_session(&self, cancel: &CancellationToken) -> Run<u64> {
-        if let Some(id) = self.session_id() {
-            return Ok(id);
+        if let Some(live) = self.live() {
+            return Ok(live.id);
         }
-        let id = self.create_session(cancel).await?;
-        self.set_session(Some(id));
+        let live = self.create_session(cancel).await?;
+        let id = live.id;
+        self.set_session(Some(live));
         Ok(id)
     }
 
-    async fn create_session(&self, cancel: &CancellationToken) -> Run<u64> {
+    async fn create_session(&self, cancel: &CancellationToken) -> Run<Live> {
+        let name = format!("vibelens-{}", uuid::Uuid::new_v4().simple());
         let mut body = json!({
             "kind": "sql",
-            "name": format!("vibelens-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]),
+            "name": name,
             "conf": self.cfg.session_conf,
         });
-        if let Some(p) = self
-            .cfg
-            .proxy_user
-            .as_deref()
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-        {
+        if let Some(p) = self.proxy_user() {
             body["proxyUser"] = json!(p);
         }
         // Not raced against cancellation: abandoning it could leave a session behind that we
@@ -213,15 +310,26 @@ impl SparkEngine {
         }
         let v = parse(&resp.body)?;
         let id = livy_id(&v, "session")?;
-        if let Err(stop) = self.wait_idle(id, cancel).await {
+        // From here until the session is stored, dropping this future deletes it.
+        let mut guard = DeleteOnDrop {
+            client: Some(self.client.clone()),
+            id,
+        };
+        let ready = match self.wait_idle(id, cancel).await {
+            Ok(()) => self.switch_catalog(id, cancel).await,
+            Err(stop) => Err(stop),
+        };
+        guard.disarm();
+        if let Err(stop) = ready {
             self.delete_session(id).await;
             return Err(stop);
         }
-        if let Err(stop) = self.switch_catalog(id, cancel).await {
+        // `close()` may have run while the session was starting: it would not have seen it.
+        if self.closed.load(Ordering::SeqCst) {
             self.delete_session(id).await;
-            return Err(stop);
+            return Err(CoreError::NotConnected("the Spark connection was closed".into()).into());
         }
-        Ok(id)
+        Ok(Live { id, name })
     }
 
     /// Polls the new session until it is `idle`, within the session start timeout.
@@ -373,7 +481,7 @@ impl SparkEngine {
                 biased;
                 _ = cancel.cancelled() => return Err(Stop::Err(CoreError::Cancelled)),
                 _ = until(deadline) => return Err(timeout(timeout_ms).into()),
-                r = self.request(Method::GET, &path, None) => r?,
+                r = self.request_result(&path) => r?,
             };
             if resp.status == 404 {
                 return Err(CoreError::Database(
@@ -465,23 +573,33 @@ impl SparkEngine {
             }
         };
         let deadline = opts.timeout_ms.map(|ms| t0 + Duration::from_millis(ms));
-        let output = self
+        let mut output = self
             .wait_statement(session, n, deadline, opts.timeout_ms, cancel)
             .await?;
         if output.get("status").and_then(Value::as_str) == Some("error") {
             return Err(CoreError::Database(self.failure_message(&output)).into());
         }
-        let result = output
-            .get("data")
-            .and_then(|d| d.get("application/json"))
-            .cloned()
+        // Taken out of the answer, not copied: a result can be large.
+        let mut result = output
+            .get_mut("data")
+            .and_then(|d| d.get_mut("application/json"))
+            .map(Value::take)
             .unwrap_or(Value::Null);
-        let fields = result
-            .get("schema")
-            .and_then(|s| s.get("fields"))
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        let fields = match result
+            .get_mut("schema")
+            .and_then(|s| s.get_mut("fields"))
+            .map(Value::take)
+        {
+            Some(Value::Array(f)) => f,
+            _ => Vec::new(),
+        };
+        if fields.len() > MAX_COLUMNS {
+            return Err(CoreError::Other(format!(
+                "Livy reported {} columns; VibeLens reads at most {MAX_COLUMNS}",
+                fields.len()
+            ))
+            .into());
+        }
         let mut row_count = 0usize;
         let mut truncated = false;
         if !fields.is_empty() {
@@ -505,29 +623,41 @@ impl SparkEngine {
                 },
             )
             .await?;
-            let rows = result
-                .get("data")
-                .and_then(Value::as_array)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
+            let rows = match result.get_mut("data").map(Value::take) {
+                Some(Value::Array(r)) => r,
+                _ => Vec::new(),
+            };
+            let total = rows.len();
             let mut buf = RowBuf::new(idx, opts.page_size);
             for row in rows {
                 if row_count >= opts.max_rows {
                     truncated = true;
                     break;
                 }
-                let values = row.as_array().map(Vec::as_slice).unwrap_or_default();
+                let Value::Array(values) = row else {
+                    return Err(
+                        CoreError::Other("Livy sent a row that is not a list".into()).into(),
+                    );
+                };
+                if values.len() != types.len() {
+                    return Err(CoreError::Other(format!(
+                        "Livy sent a row of {} values for {} columns",
+                        values.len(),
+                        types.len()
+                    ))
+                    .into());
+                }
                 let cells = types
                     .iter()
-                    .enumerate()
-                    .map(|(i, t)| spark_cell(t, values.get(i).cloned().unwrap_or(Value::Null)))
+                    .zip(values)
+                    .map(|(t, v)| spark_cell(t, v))
                     .collect();
                 buf.push(cells, tx).await?;
                 row_count += 1;
             }
             buf.flush(tx).await?;
             // Livy cuts SQL results at `livy.rsc.sql.num-rows` without saying so.
-            if rows.len() == LIVY_DEFAULT_ROW_CAP {
+            if total == LIVY_DEFAULT_ROW_CAP {
                 truncated = true;
             }
         }
@@ -584,8 +714,17 @@ impl Script for SparkEngine {
         cancel: &CancellationToken,
         tx: &mpsc::Sender<QueryEvent>,
     ) -> End {
-        // Both checks run over the whole script before anything is sent.
+        // Every check runs over the whole script before anything is sent.
         for (i, stmt) in statements.iter().enumerate() {
+            if let Some(why) = super::spark_scan::substitution_refusal(stmt) {
+                return End::Failed {
+                    statement_index: None,
+                    error: CoreError::PolicyDenied(format!(
+                        "{}not sent to Spark because {why}",
+                        which(i, statements.len())
+                    )),
+                };
+            }
             if let Some(kind) = super::spark_scan::session_statement(stmt) {
                 return End::Failed {
                     statement_index: None,
@@ -607,7 +746,38 @@ impl Script for SparkEngine {
                 error,
             };
         }
-        let _one_at_a_time = self.run_lock.lock().await;
+        // Waiting for another run to finish can be cancelled too.
+        let _one_at_a_time = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return End::Failed {
+                    statement_index: None,
+                    error: CoreError::Cancelled,
+                };
+            }
+            g = self.run_lock.lock() => g,
+        };
+        // The stored id must still name our session: after a Livy restart ids start again at 0
+        // and could belong to someone else's session.
+        if let Some(live) = self.live() {
+            match self.check_live(&live).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::info!(
+                        "Livy session {} is no longer ours; starting a new one",
+                        live.id
+                    );
+                    self.set_session(None);
+                }
+                Err(Stop::Gone) => return End::Gone,
+                Err(Stop::Err(error)) => {
+                    return End::Failed {
+                        statement_index: None,
+                        error,
+                    };
+                }
+            }
+        }
         for (idx, stmt) in statements.iter().enumerate() {
             match self.run_statement(idx, stmt, opts, cancel, tx).await {
                 Ok(()) => {}

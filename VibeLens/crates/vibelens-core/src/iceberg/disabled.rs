@@ -64,6 +64,14 @@ impl IcebergHandle {
     pub async fn execute_collect(&self, _sql: &str, _opts: ExecOptions) -> Result<QueryResult> {
         Err(off())
     }
+    pub async fn execute_collect_cancellable(
+        &self,
+        _sql: &str,
+        _opts: ExecOptions,
+        _cancel: CancellationToken,
+    ) -> Result<QueryResult> {
+        Err(off())
+    }
     pub async fn expire_snapshots(
         &self,
         _namespace: Vec<String>,

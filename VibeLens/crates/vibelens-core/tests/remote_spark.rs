@@ -80,6 +80,10 @@ struct Livy {
     statement_id: Box<dyn Fn(usize) -> Value + Send + Sync>,
     // Bookkeeping.
     session_polls: AtomicUsize,
+    /// Name and proxy user of the last session created, as `GET /sessions/{id}` reports them.
+    created: Mutex<(String, Value)>,
+    /// `GET /sessions/{id}` reports another name (Livy restarted, the id is someone else's).
+    foreign: std::sync::atomic::AtomicBool,
     code_by_stmt: Mutex<Vec<String>>,
     stmt_polls: AtomicUsize,
 }
@@ -94,6 +98,8 @@ impl Livy {
             gone: AtomicUsize::new(0),
             statement_id: Box::new(|n| json!(n)),
             session_polls: AtomicUsize::new(0),
+            created: Mutex::new((String::new(), Value::Null)),
+            foreign: std::sync::atomic::AtomicBool::new(false),
             code_by_stmt: Mutex::new(Vec::new()),
             stmt_polls: AtomicUsize::new(0),
         }
@@ -105,6 +111,12 @@ impl Livy {
             ("POST", ["sessions"]) => {
                 let id = self.session_ids.lock().unwrap().remove(0);
                 self.code_by_stmt.lock().unwrap().clear();
+                let body = req.json();
+                *self.created.lock().unwrap() = (
+                    body["name"].as_str().unwrap_or("").to_string(),
+                    body["proxyUser"].clone(),
+                );
+                self.foreign.store(false, Ordering::SeqCst);
                 Resp::json(201, &json!({"id": id, "state": "starting", "kind": "sql"}))
             }
             ("GET", ["sessions", _]) => {
@@ -114,7 +126,13 @@ impl Livy {
                 } else {
                     "idle"
                 };
-                Resp::ok(&json!({"id": 3, "state": state}))
+                let (name, proxy) = self.created.lock().unwrap().clone();
+                let name = if self.foreign.load(Ordering::SeqCst) {
+                    "someone-elses-session".to_string()
+                } else {
+                    name
+                };
+                Resp::ok(&json!({"id": 3, "state": state, "name": name, "proxyUser": proxy}))
             }
             ("DELETE", ["sessions", _]) => Resp::ok(&json!({"msg": "deleted"})),
             ("POST", ["sessions", _, "statements"]) => {
@@ -506,4 +524,203 @@ async fn session_conf_with_a_credential_is_refused_by_the_engine_too() {
         SparkEngine::new(cfg, Some(SecretString::from(TOKEN.to_string()))),
         Err(CoreError::Invalid(_))
     ));
+}
+
+// ---- Audit 2026-11-21 ---------------------------------------------------------------------
+
+/// Items 1 to 3: statements where Spark's lexer and parser read the text differently from the
+/// check. Without the refusals each runs something other than what was checked.
+#[tokio::test]
+async fn lexer_tricks_and_substitution_are_refused_before_any_request() {
+    let (server, _) = livy(Livy::new(|_| empty_ok())).await;
+    let e = engine(&server.url);
+    let ro = ExecOptions {
+        read_only: true,
+        ..opts()
+    };
+    for sql in [
+        "-- x \\\nSELECT '\nINSERT INTO lake.shop.orders SELECT * FROM lake.shop.orders -- '",
+        "SELECT 1 /* /* */ ' */ + reflect(\"a\",\"b\") + /* ' */ 2",
+        "SELECT * FROM (MAP a USING \"cat /var/run/secrets/kubernetes.io/serviceaccount/token\" FROM (SELECT 1 a) t) x",
+        "SELECT '${env:AWS_SECRET_ACCESS_KEY}', '${spark.hadoop.fs.s3a.secret.key}'",
+        "SELECT 1 -- ${system:line.separator} , reflect('a', 'b')",
+    ] {
+        let events = stream(&e, sql, ro.clone()).await;
+        assert_eq!(failure(&events).1, "policy_denied", "{sql}");
+    }
+    // `${` is refused in every mode, and so is a session change hidden behind a comment the
+    // check cannot read.
+    for sql in [
+        "INSERT INTO t SELECT '${env:AWS_SECRET_ACCESS_KEY}'",
+        "/* /* */ */ SET spark.sql.ansi.enabled=false",
+        "-- x \\\nUSE lake.other",
+    ] {
+        let events = stream(&e, sql, opts()).await;
+        let (_, code, msg) = failure(&events);
+        assert_eq!(code, "policy_denied", "{sql}: {msg}");
+    }
+    assert_eq!(server.count(), 0);
+}
+
+/// Item 8: after a Livy restart the stored id can be someone else's session. Without the name
+/// check our statements would run there and `close()` would delete it.
+#[tokio::test]
+async fn a_session_id_that_is_no_longer_ours_is_neither_used_nor_deleted() {
+    let (server, mock) = livy(Livy::new(|_| table(&[("n", "integer")], json!([[1]])))).await;
+    let e = engine(&server.url);
+    e.execute_collect("SELECT 1", ExecOptions::default())
+        .await
+        .unwrap();
+    mock.foreign.store(true, Ordering::SeqCst);
+    e.execute_collect("SELECT 1", ExecOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(server.calls("POST", "/sessions").len(), 2);
+    assert_eq!(e.session_id(), Some(4));
+    // Statements went to the new session only, after the switch.
+    let to_3 = server.calls("POST", "/sessions/3/statements").len();
+    let to_4 = server.calls("POST", "/sessions/4/statements").len();
+    assert_eq!((to_3, to_4), (2, 2), "USE + SELECT on each");
+
+    mock.foreign.store(true, Ordering::SeqCst);
+    e.close().await;
+    assert_eq!(server.calls("DELETE", "/sessions/3").len(), 0);
+    assert_eq!(server.calls("DELETE", "/sessions/4").len(), 0);
+}
+
+/// Item 6: a future dropped while the session starts (agent Stop) must not leak the session.
+#[tokio::test]
+async fn a_dropped_run_deletes_the_session_it_was_starting() {
+    let mut l = Livy::new(|_| empty_ok());
+    l.starting_polls = usize::MAX - 1;
+    let (server, _) = livy(l).await;
+    let e = engine(&server.url);
+    let run = e.execute_collect("SELECT 1", ExecOptions::default());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), run)
+            .await
+            .is_err()
+    );
+    for _ in 0..200 {
+        if !server.calls("DELETE", "/sessions/3").is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(server.calls("DELETE", "/sessions/3").len(), 1);
+    assert_eq!(e.session_id(), None);
+}
+
+/// Item 6: `close()` while a session is still starting: the new session is deleted, not kept.
+#[tokio::test]
+async fn closing_while_a_session_starts_deletes_it() {
+    let mut l = Livy::new(|_| empty_ok());
+    l.starting_polls = 6;
+    let (server, _) = livy(l).await;
+    let e = Arc::new(engine(&server.url));
+    let task = {
+        let e = e.clone();
+        tokio::spawn(async move { e.execute_collect("SELECT 1", ExecOptions::default()).await })
+    };
+    for _ in 0..200 {
+        if !server.calls("POST", "/sessions").is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    e.close().await;
+    let err = task.await.unwrap().unwrap_err();
+    assert!(matches!(err, CoreError::NotConnected(_)), "{err:?}");
+    assert_eq!(server.calls("DELETE", "/sessions/3").len(), 1);
+}
+
+/// Item 6: the bounded run cancels the Livy statement when its token fires, and waiting for
+/// another run to finish can be cancelled as well.
+#[tokio::test]
+async fn collect_runs_honour_their_token() {
+    let mut l = Livy::new(|_| empty_ok());
+    l.running_polls = usize::MAX;
+    let (server, _) = livy(l).await;
+    let e = Arc::new(engine(&server.url));
+    let first = tokio_util::sync::CancellationToken::new();
+    let task = {
+        let (e, first) = (e.clone(), first.clone());
+        tokio::spawn(async move {
+            e.execute_collect_cancellable("SELECT * FROM big", ExecOptions::default(), first)
+                .await
+        })
+    };
+    for _ in 0..200 {
+        if !server.calls("POST", "/sessions/3/statements").is_empty()
+            && server.calls("POST", "/sessions/3/statements").len() >= 2
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // A second run waits for the first; its own token gets it out.
+    let second = tokio_util::sync::CancellationToken::new();
+    let s = second.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        s.cancel();
+    });
+    let err = tokio::time::timeout(
+        Duration::from_secs(2),
+        e.execute_collect_cancellable("SELECT 2", ExecOptions::default(), second),
+    )
+    .await
+    .expect("the wait was cancelled")
+    .unwrap_err();
+    assert!(matches!(err, CoreError::Cancelled), "{err:?}");
+
+    first.cancel();
+    let err = task.await.unwrap().unwrap_err();
+    assert!(matches!(err, CoreError::Cancelled), "{err:?}");
+    assert_eq!(
+        server
+            .calls("POST", "/sessions/3/statements/1/cancel")
+            .len(),
+        1
+    );
+}
+
+/// Item 9: column counts, row shapes and status answers are bounded.
+#[tokio::test]
+async fn columns_rows_and_status_answers_are_bounded() {
+    let many: Vec<(String, String)> = (0..2001)
+        .map(|i| (format!("c{i}"), "integer".to_string()))
+        .collect();
+    let fields: Vec<(&str, &str)> = many.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let wide = table(&fields, json!([]));
+    let (server, _) = livy(Livy::new(move |_| wide.clone())).await;
+    let err = engine(&server.url)
+        .execute_collect("SELECT * FROM t", ExecOptions::default())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("columns"), "{err}");
+
+    let (server, _) = livy(Livy::new(|_| {
+        table(&[("a", "integer"), ("b", "integer")], json!([[1]]))
+    }))
+    .await;
+    let err = engine(&server.url)
+        .execute_collect("SELECT * FROM t", ExecOptions::default())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("1 values for 2 columns"), "{err}");
+
+    // A session status answer carries no rows: 8 MiB is plenty.
+    let big = "x".repeat(9 * 1024 * 1024);
+    let s = serve(Arc::new(move |req: &Req| match req.method.as_str() {
+        "POST" => Resp::json(201, &json!({"id": 3})),
+        "GET" => Resp::ok(&json!({"id": 3, "state": "starting", "pad": big})),
+        _ => Resp::ok(&json!({})),
+    }))
+    .await;
+    let err = engine(&s.url)
+        .execute_collect("SELECT 1", ExecOptions::default())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("larger than 8 MiB"), "{err}");
 }
