@@ -17,6 +17,7 @@ import { IcebergGlyph } from "../iceberg/IcebergGlyph";
 import { compactNumber } from "../iceberg/iceFormat";
 import { iceQueries } from "../iceberg/iceQueries";
 import { qualifiedName, selectAllSql } from "../iceberg/iceSql";
+import { dialectOf } from "../../lib/sqlIntel/dialect";
 import { joinNamespace, openIcebergTableTab } from "../iceberg/openIcebergTab";
 import { catalogSummary } from "../connections/icebergForm";
 import { TREE_ROW_H, TreeRow } from "./TreeRow";
@@ -58,6 +59,7 @@ export function IcebergTree({ profile }: { profile: ConnectionProfile }) {
 
   const ice = profile.iceberg;
   const catalogLabel = ice ? catalogSummary(ice.catalog) : "Catalog";
+  const dialect = dialectOf(profile);
 
   const topQ = useQuery(iceQueries.namespaces(pid, []));
 
@@ -198,15 +200,15 @@ export function IcebergTree({ profile }: { profile: ConnectionProfile }) {
       const ns = row.namespace;
       const name = row.table.name;
       items.push({ label: "Open table", hint: "double-click", icon: <TableProperties className="size-3.5" />, onSelect: () => openTable(row) });
-      items.push({ label: "Query in new SQL tab", icon: <FileCode2 className="size-3.5" />, onSelect: () => openIcebergSqlTab(pid, name, selectAllSql(ns, name)) });
+      items.push({ label: "Query in new SQL tab", icon: <FileCode2 className="size-3.5" />, onSelect: () => openIcebergSqlTab(pid, name, selectAllSql(ns, name, 100, dialect)) });
       items.push("separator");
-      items.push({ label: "Copy qualified name", icon: <Copy className="size-3.5" />, onSelect: () => void copyToClipboard(qualifiedName(ns, name)) });
+      items.push({ label: "Copy qualified name", icon: <Copy className="size-3.5" />, onSelect: () => void copyToClipboard(qualifiedName(ns, name, dialect)) });
       items.push("separator");
       items.push({ label: "Refresh", icon: <RefreshCw className="size-3.5" />, onSelect: () => refresh(row) });
     } else if (row.kind === "namespace" && row.namespace) {
       const ns = row.namespace;
       items.push({ label: row.expanded ? "Collapse" : "Expand", onSelect: () => toggle(row) });
-      items.push({ label: "Copy name", icon: <Copy className="size-3.5" />, onSelect: () => void copyToClipboard(ns.map((l) => qualifiedName([], l)).join(".")) });
+      items.push({ label: "Copy name", icon: <Copy className="size-3.5" />, onSelect: () => void copyToClipboard(ns.map((l) => qualifiedName([], l, dialect)).join(".")) });
       items.push("separator");
       items.push({ label: "Refresh", icon: <RefreshCw className="size-3.5" />, onSelect: () => refresh(row) });
     } else if (row.kind === "field" && row.field) {

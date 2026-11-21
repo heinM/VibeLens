@@ -63,7 +63,8 @@ export function summarizeToolArgs(tool: string, args: unknown): string {
       s = pick(args, "sql", "query", "statement");
       break;
     case "describe_table": {
-      const schema = pick(args, "schema");
+      // Postgres and Redshift send `schema`; Iceberg sends its namespace levels.
+      const schema = isRecord(args) && Array.isArray(args.namespace) ? args.namespace.join(".") || null : pick(args, "schema", "namespace");
       const table = pick(args, "table", "name");
       s = table ? (schema ? `${schema}.${table}` : table) : null;
       break;
@@ -83,7 +84,7 @@ export function summarizeToolArgs(tool: string, args: unknown): string {
       s = pick(args, "path", "dir", "directory");
       break;
     case "get_schema":
-      s = pick(args, "schema");
+      s = pick(args, "schema", "namespace", "database");
       break;
     default:
       break;

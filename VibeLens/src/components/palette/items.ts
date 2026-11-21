@@ -6,6 +6,7 @@ import type { Rankable } from "./rank";
 export type IconKey =
   | "pg"
   | "iceberg"
+  | "redshift"
   | "valkey"
   | "table"
   | "view"
@@ -84,25 +85,38 @@ function icebergWhere(p: ConnectionProfile): string {
   return c.kind === "rest" || c.kind === "sql" ? c.uri : c.kind === "hms" ? c.address : c.kind === "s3Tables" ? `S3 Tables · ${c.aws.region}` : `AWS Glue · ${c.aws.region}`;
 }
 
+/** Where a Redshift connection's warehouse is, for the palette row. */
+function redshiftWhere(p: ConnectionProfile): string {
+  const o = p.redshift;
+  if (!o) return "Amazon Redshift";
+  const name = o.target.kind === "provisioned" ? o.target.clusterIdentifier : o.target.workgroupName;
+  return [name || "Amazon Redshift", o.database, o.aws.region].filter(Boolean).join(" · ");
+}
+
 export function connectionItems(profiles: readonly ConnectionProfile[], stateOf: (id: string) => ConnectionState, a: GoActions): PaletteItem[] {
   return profiles.map((p): PaletteItem => {
     const pg = p.engine === "postgres";
     const ice = p.engine === "iceberg";
+    const rs = p.engine === "redshift";
     const state = stateOf(p.id);
     return {
       id: `conn:${p.id}`,
       group: "Connections",
       title: p.name || "(unnamed)",
-      search: ice ? `${icebergWhere(p)} iceberg lakehouse athena glue rest ${p.environment}` : `${p.host} ${pg ? "postgres postgresql" : "valkey redis"} ${p.environment}`,
-      icon: ice ? "iceberg" : pg ? "pg" : "valkey",
-      tone: ice ? "cyan" : pg ? "sky" : "rose",
-      crumbs: [ice ? icebergWhere(p) : `${p.host}:${p.port}`],
+      search: ice
+        ? `${icebergWhere(p)} iceberg lakehouse athena trino spark glue rest ${p.environment}`
+        : rs
+          ? `${redshiftWhere(p)} redshift warehouse aws ${p.environment}`
+          : `${p.host} ${pg ? "postgres postgresql" : "valkey redis"} ${p.environment}`,
+      icon: ice ? "iceberg" : rs ? "redshift" : pg ? "pg" : "valkey",
+      tone: ice ? "cyan" : rs ? "violet" : pg ? "sky" : "rose",
+      crumbs: [ice ? icebergWhere(p) : rs ? redshiftWhere(p) : `${p.host}:${p.port}`],
       meta: state === "connected" ? "connected" : state === "connecting" ? "connecting" : state === "error" ? "error" : undefined,
       env: p.environment,
       state,
       primary: state === "connected" ? "Focus" : "Connect",
       run: () => a.openConnection(p),
-      alt: { label: pg || ice ? "New SQL tab" : "New console", run: () => a.newTabOnConnection(p) },
+      alt: { label: pg || ice || rs ? "New SQL tab" : "New console", run: () => a.newTabOnConnection(p) },
     };
   });
 }

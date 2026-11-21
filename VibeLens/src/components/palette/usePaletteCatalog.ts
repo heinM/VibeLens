@@ -93,6 +93,7 @@ export function usePaletteCatalog(): PaletteCatalog {
         if (stateOf(p.id) === "disconnected") connect.mutate(p.id);
         if (p.engine === "postgres") newSqlTab({ profileId: p.id, database: p.database ?? null });
         else if (p.engine === "iceberg") openIcebergQueryTab(p);
+        else if (p.engine === "redshift") newSqlTab({ profileId: p.id, database: null });
         else newValkeyConsole({ profileId: p.id });
       },
       openTable: (p, db, schema, name) => {

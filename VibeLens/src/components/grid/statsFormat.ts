@@ -1,4 +1,5 @@
-// Formatting for the engine statistics shown in the results status line (Iceberg: DataFusion / Athena).
+// Formatting for the engine statistics shown in the results status line (Iceberg: DataFusion, Athena,
+// Trino, Spark; Redshift). Only Athena reports a cost; the others leave `costUsdEstimate` null.
 // Pure, so the rounding rules and the wording of the tooltips are unit-tested.
 import type { StatementStats } from "../../hooks/useQueryRunner";
 
@@ -52,6 +53,12 @@ export function engineBadge(engine: string): EngineBadge {
       return { label: "DataFusion · local", tone: "muted", title: "Ran on the embedded DataFusion engine on this computer. Nothing is billed." };
     case "athena":
       return { label: "Athena", tone: "accent", title: "Ran on Amazon Athena." };
+    case "trino":
+      return { label: "Trino", tone: "accent", title: "Ran on your Trino cluster." };
+    case "spark":
+      return { label: "Spark", tone: "accent", title: "Ran in a Spark session on Apache Livy." };
+    case "redshift":
+      return { label: "Redshift", tone: "accent", title: "Ran on Amazon Redshift through the Data API." };
     default:
       return { label: engine, tone: "muted", title: `Ran on ${engine}.` };
   }
@@ -73,7 +80,14 @@ export function costTooltip(bytesScanned: number | null | undefined): string {
 /** Tooltip of the data-scanned figure. */
 export function scannedTooltip(engine: string, bytes: number): string {
   const exact = `${bytes.toLocaleString("en-US")} bytes`;
-  return engine.toLowerCase() === "athena" ? `Data scanned by Athena for this query (${exact}). Athena bills by data scanned.` : `Data read from storage by this query (${exact}).`;
+  switch (engine.toLowerCase()) {
+    case "athena":
+      return `Data scanned by Athena for this query (${exact}). Athena bills by data scanned.`;
+    case "trino":
+      return `Data processed by Trino for this query (${exact}).`;
+    default:
+      return `Data read from storage by this query (${exact}).`;
+  }
 }
 
 /** First characters of an engine query id, enough to recognise it; the full id goes in the tooltip and the clipboard. */

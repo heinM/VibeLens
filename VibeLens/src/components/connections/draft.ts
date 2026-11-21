@@ -1,6 +1,8 @@
-import { newProfile } from "../../lib/defaults";
+import { newProfile, usesHostPort } from "../../lib/defaults";
 import type { AuthMethod, ConnectionProfile, EngineKind } from "../../ipc/types";
 import { cleanIceberg, secretKind, secretRequired } from "./icebergForm";
+import { cleanRedshift, normalizeRedshift } from "./redshiftForm";
+import { engineSecretArg, engineSecretMissing } from "./remoteEngineForm";
 
 /** How a write-only secret (password, SSH passphrase) is treated on save. */
 export interface SecretEdit {
@@ -22,6 +24,8 @@ export interface Draft {
   /** REST bearer token / OAuth2 client secret / SQL catalog (Postgres) password. */
   icebergSecret: SecretEdit;
   s3Keys: S3KeysEdit;
+  /** Trino / Spark (Livy) password or bearer token (`saveProfile`'s `engineSecret`). */
+  engineSecret: SecretEdit;
 }
 
 export const keepSecret = (): SecretEdit => ({ mode: "keep", value: "" });
@@ -38,8 +42,8 @@ export const keepS3Keys = (): S3KeysEdit => ({ mode: "keep", accessKeyId: "", se
 export const newS3Keys = (): S3KeysEdit => ({ mode: "set", accessKeyId: "", secretAccessKey: "" });
 
 export function initialDraft(existing: ConnectionProfile | null, engine: EngineKind = "postgres"): Draft {
-  if (existing) return { profile: structuredClone(existing), password: keepSecret(), sshSecret: keepSecret(), icebergSecret: keepSecret(), s3Keys: keepS3Keys() };
-  return { profile: newProfile(engine), password: newSecret(), sshSecret: newSecret(), icebergSecret: newSecret(), s3Keys: newS3Keys() };
+  if (existing) return { profile: structuredClone(existing), password: keepSecret(), sshSecret: keepSecret(), icebergSecret: keepSecret(), s3Keys: keepS3Keys(), engineSecret: keepSecret() };
+  return { profile: newProfile(engine), password: newSecret(), sshSecret: newSecret(), icebergSecret: newSecret(), s3Keys: newS3Keys(), engineSecret: newSecret() };
 }
 
 /** Switching engine on a new connection resets port, auth, TLS and options but keeps identity fields. */
@@ -54,8 +58,8 @@ export function switchEngine(p: ConnectionProfile, engine: EngineKind): Connecti
     environment: p.environment,
     aiDataAccess: p.aiDataAccess,
     color: p.color,
-    // Iceberg has no SSH tunnel option: the catalog and the object store are reached directly.
-    tunnel: engine === "iceberg" ? null : p.tunnel,
+    // Iceberg and Redshift have no SSH tunnel option: catalogs, object stores and AWS APIs are reached directly.
+    tunnel: usesHostPort(engine) ? p.tunnel : null,
   };
 }
 
@@ -98,6 +102,8 @@ export function testPasswordArg(draft: Draft): string | undefined {
 
 export interface IcebergSecretArgs {
   icebergSecret: string | undefined;
+  /** Trino / Spark password or token: undefined keeps, "" deletes. */
+  engineSecret: string | undefined;
   /** `{ "", "" }` deletes the stored pair; undefined keeps it. */
   s3Keys: { accessKeyId: string; secretAccessKey: string } | undefined;
 }
@@ -109,7 +115,9 @@ export interface IcebergSecretArgs {
 export function icebergSecretArgs(original: ConnectionProfile | null, draft: Draft): IcebergSecretArgs {
   const o = draft.profile.iceberg;
   const prev = original?.iceberg ?? null;
-  if (draft.profile.engine !== "iceberg" || !o) return { icebergSecret: undefined, s3Keys: undefined };
+  // Leaving Iceberg (or its remote engine) deletes a stored engine secret.
+  const engineSecret = engineSecretArg(original, draft.profile, draft.engineSecret);
+  if (draft.profile.engine !== "iceberg" || !o) return { icebergSecret: undefined, s3Keys: undefined, engineSecret };
 
   const kind = secretKind(o.catalog);
   const prevKind = prev ? secretKind(prev.catalog) : null;
@@ -128,16 +136,20 @@ export function icebergSecretArgs(original: ConnectionProfile | null, draft: Dra
   } else if (hadKeys) {
     s3Keys = { accessKeyId: "", secretAccessKey: "" };
   }
-  return { icebergSecret, s3Keys };
+  return { icebergSecret, s3Keys, engineSecret };
 }
 
 /**
  * Which required Iceberg secrets are still missing, given what is stored in the keychain.
  * Feeds `validateProfile` so the wizard can flag an empty token before a test or save.
  */
-export function missingIcebergSecrets(original: ConnectionProfile | null, draft: Draft, stored: { hasIcebergSecret: boolean; hasS3Keys: boolean } | undefined): { catalog: boolean; s3Keys: boolean } {
+export function missingIcebergSecrets(
+  original: ConnectionProfile | null,
+  draft: Draft,
+  stored: { hasIcebergSecret: boolean; hasS3Keys: boolean; hasEngineSecret?: boolean } | undefined,
+): { catalog: boolean; s3Keys: boolean; engine: boolean } {
   const o = draft.profile.iceberg;
-  if (draft.profile.engine !== "iceberg" || !o) return { catalog: false, s3Keys: false };
+  if (draft.profile.engine !== "iceberg" || !o) return { catalog: false, s3Keys: false, engine: false };
   const kind = secretKind(o.catalog);
   const prevKind = original?.iceberg ? secretKind(original.iceberg.catalog) : null;
   const kept = !!stored?.hasIcebergSecret && prevKind === kind && draft.icebergSecret.mode === "keep";
@@ -146,7 +158,8 @@ export function missingIcebergSecrets(original: ConnectionProfile | null, draft:
   const k = draft.s3Keys;
   const keysKept = !!stored?.hasS3Keys && original?.iceberg?.storage.kind === "s3Static" && k.mode === "keep";
   const s3Keys = o.storage.kind === "s3Static" && !keysKept && !(k.accessKeyId && k.secretAccessKey);
-  return { catalog, s3Keys };
+  const engine = engineSecretMissing(original, draft.profile, draft.engineSecret, stored?.hasEngineSecret);
+  return { catalog, s3Keys, engine };
 }
 
 /** Trims text fields so we never persist stray whitespace. */
@@ -162,6 +175,7 @@ export function cleanProfile(p: ConnectionProfile): ConnectionProfile {
     if (c.tunnel.auth.kind === "privateKey") c.tunnel.auth = { kind: "privateKey", path: c.tunnel.auth.path.trim() };
   }
   if (c.iceberg) c.iceberg = cleanIceberg(c.iceberg);
+  if (c.redshift) c.redshift = cleanRedshift(normalizeRedshift(c.redshift));
   const a = c.auth;
   if (a.kind === "secretsManager") a.secretArn = a.secretArn.trim();
   if (a.kind === "rdsIam" || a.kind === "elastiCacheIam") a.username = a.username.trim();

@@ -1,4 +1,4 @@
-import type { ConnectionProfile, EngineKind, IcebergOptions } from "../ipc/types";
+import type { ConnectionProfile, EngineKind, IcebergOptions, RedshiftOptions } from "../ipc/types";
 
 /** Defaults for a new Iceberg connection: a local REST catalog (matches docker-compose.dev.yml). */
 export function newIcebergOptions(): IcebergOptions {
@@ -10,13 +10,26 @@ export function newIcebergOptions(): IcebergOptions {
   };
 }
 
+/** Defaults for a new Redshift connection: a provisioned cluster, signed in as the caller's IAM identity. */
+export function newRedshiftOptions(region = ""): RedshiftOptions {
+  return {
+    target: { kind: "provisioned", clusterIdentifier: "" },
+    database: "dev",
+    aws: { identity: { kind: "profile", profileName: "" }, region },
+    auth: { kind: "iamIdentity" },
+  };
+}
+
+/** Engines reached at host:port. Iceberg and Redshift go through catalogs and AWS APIs instead. */
+export const usesHostPort = (engine: EngineKind): boolean => engine === "postgres" || engine === "valkey";
+
 /** A blank profile with the same defaults as the Rust `Default` impls. */
 export function newProfile(engine: EngineKind): ConnectionProfile {
   return {
     id: "",
     name: "",
     engine,
-    host: engine === "iceberg" ? "" : "localhost",
+    host: usesHostPort(engine) ? "localhost" : "",
     port: engine === "postgres" ? 5432 : engine === "valkey" ? 6379 : 0,
     database: engine === "postgres" ? "postgres" : null,
     auth: engine === "postgres" ? { kind: "password", username: "postgres" } : { kind: "none" },
@@ -30,5 +43,6 @@ export function newProfile(engine: EngineKind): ConnectionProfile {
     createdAt: null,
     updatedAt: null,
     iceberg: engine === "iceberg" ? newIcebergOptions() : null,
+    redshift: engine === "redshift" ? newRedshiftOptions() : null,
   };
 }

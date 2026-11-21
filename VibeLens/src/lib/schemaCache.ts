@@ -1,27 +1,34 @@
 // Shared, cached schema catalog for a (connection, database). Used by editor autocomplete,
 // the command palette and ER diagrams so the catalog is fetched once, not per feature.
 //
-// Two engines feed the same `SchemaMetadata` shape: Postgres (`pg_schema_metadata`, per database)
-// and Iceberg (`ice_schema_metadata`, whole catalog, schema = dotted namespace). Their cache keys
-// start with different roots (`pg` / `ice`) so the two can never be served for one another.
+// Three engines feed the same `SchemaMetadata` shape: Postgres (`pg_schema_metadata`, per database),
+// Iceberg (`ice_schema_metadata`, whole catalog, schema = dotted namespace) and Redshift
+// (`rs_schema_metadata`, per database, through the Data API). Their cache keys start with different
+// roots (`pg` / `ice` / `rs`) so one can never be served for another.
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../ipc/commands";
 import type { SchemaMetadata, TableDescription } from "../ipc/types";
 
 /** Engines that expose a browsable schema catalog. */
-export type CatalogEngine = "postgres" | "iceberg";
+export type CatalogEngine = "postgres" | "iceberg" | "redshift";
 
 /** Query key of the catalog. `database` is ignored for Iceberg (the catalog has no databases). */
 export const schemaMetadataKey = (profileId: string | null, database: string | null, engine: CatalogEngine = "postgres") =>
-  engine === "iceberg" ? (["ice", profileId, "schema-metadata"] as const) : (["pg", profileId, database, "schema-metadata"] as const);
+  engine === "iceberg"
+    ? (["ice", profileId, "schema-metadata"] as const)
+    : engine === "redshift"
+      ? (["rs", profileId, database, "schema-metadata"] as const)
+      : (["pg", profileId, database, "schema-metadata"] as const);
 
 /** True for a query key produced by `schemaMetadataKey` (either engine) for this profile. */
 export const isSchemaMetadataKeyOf = (key: readonly unknown[], profileId: string): boolean =>
-  (key[0] === "pg" && key[1] === profileId && key[3] === "schema-metadata") || (key[0] === "ice" && key[1] === profileId && key[2] === "schema-metadata");
+  ((key[0] === "pg" || key[0] === "rs") && key[1] === profileId && key[3] === "schema-metadata") || (key[0] === "ice" && key[1] === profileId && key[2] === "schema-metadata");
 
 /** Fetches the catalog from the engine's own command. */
 export function fetchSchemaMetadata(engine: CatalogEngine, profileId: string, database: string | null): Promise<SchemaMetadata> {
-  return engine === "iceberg" ? api.iceSchemaMetadata(profileId, null) : api.pgSchemaMetadata(profileId, database);
+  if (engine === "iceberg") return api.iceSchemaMetadata(profileId, null);
+  if (engine === "redshift") return api.rsSchemaMetadata(profileId, database);
+  return api.pgSchemaMetadata(profileId, database);
 }
 
 const STALE_MS = 5 * 60_000;

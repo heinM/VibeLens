@@ -336,6 +336,7 @@ export function useQueryRunner(): QueryRunner {
         profileName: args.profileName ?? null,
         environment: args.environment ?? null,
         // An Iceberg catalog has no databases: a stale tab.database must not be recorded against it.
+        // (Redshift keeps it: a tab can run in another database of the warehouse.)
         database: engine === "iceberg" ? null : args.database,
         engine,
         sql: args.sql,

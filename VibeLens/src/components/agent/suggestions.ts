@@ -21,7 +21,7 @@ export interface Suggestion {
 export interface SuggestionContext {
   engine: EngineKind | null;
   connectionName: string | null;
-  /** Postgres database name. */
+  /** Postgres or Redshift database name. */
   database: string | null;
   access: AiDataAccess | null;
   /** The active tab has text the agent could review. */
@@ -56,6 +56,26 @@ export function suggestionsFor(ctx: SuggestionContext): Suggestion[] {
         ? s("pg-review", "review", "Review the SQL in my editor", "Correctness, performance, indexes", "Review the SQL in my editor for correctness and performance. Suggest indexes or rewrites if they would help, and say what each would cost.")
         : s("pg-query", "query", "Write a query…", "Describe the result you want", "Write a query that ", { incomplete: true }),
       s("pg-doc", "doc", "Document the schema", "COMMENT ON for every table and column", "Write COMMENT ON statements for the tables and columns in this schema, based on their names, types and relationships. Mark any you are guessing at."),
+    ];
+  }
+
+  if (ctx.engine === "redshift") {
+    // Redshift: no pg_stat_statements, no CREATE INDEX, no COMMENT-heavy migrations. Its own system views instead.
+    const db = ctx.database?.trim() || "database";
+    return [
+      s("rs-schema", "schema", `Map out the ${db} schema`, "Tables, sort and distribution keys", `Map out the ${db} schema in this Redshift warehouse: the main tables, how they relate, and their sort and distribution keys. Group them by domain and point out anything that looks odd.`),
+      s(
+        "rs-slow",
+        "slow",
+        "Find slow queries in SYS_QUERY_HISTORY",
+        "Elapsed time, queue time, rows",
+        "Find the slowest recent queries in SYS_QUERY_HISTORY: show elapsed time, queue time and rows returned, and say which ones are worth optimising and why.",
+        { disabledReason: gate },
+      ),
+      s("rs-keys", "index", "Review sort and distribution keys", "From the table design in SVV_TABLE_INFO", "Review the sort and distribution keys of the largest tables (SVV_TABLE_INFO) and suggest changes, with the ALTER TABLE statements and what each would cost to apply."),
+      ctx.hasEditorText
+        ? s("rs-review", "review", "Review the SQL in my editor", "Correctness and Redshift performance", "Review the SQL in my editor for correctness and Redshift performance (joins on distribution keys, filters on sort keys, scans). Suggest rewrites if they would help.")
+        : s("rs-query", "query", "Write a query…", "Describe the result you want", "Write a Redshift query that ", { incomplete: true }),
     ];
   }
 

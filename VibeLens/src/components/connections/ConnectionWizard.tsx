@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Brain, CheckCircle2, Cog, Cpu, Database, HardDrive, KeyRound, Library, Lock, Network, Trash2 } from "lucide-react";
+import { Brain, CheckCircle2, Cog, Cpu, Database, HardDrive, KeyRound, Library, Lock, Network, Trash2, Warehouse } from "lucide-react";
 import { api, asError } from "../../ipc/commands";
-import type { ConnectionProfile, ErrorPayload, IcebergOptions, PresentedHostKey, TestResult } from "../../ipc/types";
+import type { ConnectionProfile, ErrorPayload, IcebergOptions, PresentedHostKey, RedshiftOptions, TestResult } from "../../ipc/types";
 import { cn } from "../../lib/cn";
 import { useUIStore } from "../../store/useUIStore";
 import { Button, ConfirmDialog, Dialog, EmptyState, EnvBadge, ErrorBox, Spinner } from "../ui";
@@ -12,6 +12,8 @@ import { cleanProfile, icebergSecretArgs, initialDraft, missingIcebergSecrets, s
 import { HostKeyTrustDialog } from "./HostKeyDialog";
 import { isHostKeyFingerprint, withTrustedHostKey } from "./hostKey";
 import { catalogSummary, engineSummary, normalizeIceberg, storageSummary } from "./icebergForm";
+import { normalizeRedshift, redshiftTargetName } from "./redshiftForm";
+import { RedshiftSection } from "./sections/RedshiftSection";
 import { AdvancedSection } from "./sections/AdvancedSection";
 import { AiAccessSection } from "./sections/AiAccessSection";
 import { AuthSection } from "./sections/AuthSection";
@@ -28,6 +30,7 @@ import { errorCountBySection, firstErrorSection, validateProfile, type SectionId
 const NAV: { id: SectionId; label: string; icon: typeof Database }[] = [
   { id: "general", label: "General", icon: Database },
   { id: "auth", label: "Authentication", icon: KeyRound },
+  { id: "warehouse", label: "Warehouse", icon: Warehouse },
   { id: "catalog", label: "Catalog", icon: Library },
   { id: "storage", label: "Storage", icon: HardDrive },
   { id: "queryEngine", label: "Query engine", icon: Cpu },
@@ -37,11 +40,16 @@ const NAV: { id: SectionId; label: string; icon: typeof Database }[] = [
   { id: "advanced", label: "Advanced", icon: Cog },
 ];
 
-/** Sections shown per engine. Iceberg swaps Authentication for Catalog and drops Network, TLS and Advanced. */
+/**
+ * Sections shown per engine. Iceberg swaps Authentication for Catalog and drops Network, TLS and Advanced.
+ * Redshift has one Warehouse section (target, database, AWS identity, sign-in): the Data API is reached
+ * through AWS with IAM, so there is no host, port, password, TLS or tunnel to set.
+ */
 const ENGINE_SECTIONS: Record<ConnectionProfile["engine"], SectionId[]> = {
   postgres: ["general", "auth", "network", "tls", "ai", "advanced"],
   valkey: ["general", "auth", "network", "tls", "ai", "advanced"],
   iceberg: ["general", "catalog", "storage", "queryEngine", "ai"],
+  redshift: ["general", "warehouse", "ai"],
 };
 
 type TestState =
@@ -157,6 +165,17 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
     },
     [touch],
   );
+  const setEngineSecret = useCallback(
+    (engineSecret: SecretEdit) => {
+      touch();
+      setDraft((d) => ({ ...d, engineSecret }));
+    },
+    [touch],
+  );
+  const patchRedshift = useCallback(
+    (fn: (o: RedshiftOptions) => RedshiftOptions) => patch((p) => (p.redshift ? { ...p, redshift: normalizeRedshift(fn(p.redshift)) } : p)),
+    [patch],
+  );
 
   const onClose = useCallback(() => {
     if (confirmingRef.current) return; // Esc belongs to the dialog on top (delete confirmation, host key)
@@ -206,9 +225,9 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
     setSaveError(null);
     try {
       const { password, sshSecret } = secretArgs(existing, draft);
-      const { icebergSecret, s3Keys } = icebergSecretArgs(existing, draft);
+      const { icebergSecret, s3Keys, engineSecret } = icebergSecretArgs(existing, draft);
       const forgetHostKey = !!existing?.tunnel?.knownHostFingerprint && !profile.tunnel?.knownHostFingerprint;
-      await api.saveProfile(cleanProfile(profile), password, sshSecret, icebergSecret, s3Keys, forgetHostKey);
+      await api.saveProfile(cleanProfile(profile), password, sshSecret, icebergSecret, s3Keys, forgetHostKey, engineSecret);
       await qc.invalidateQueries({ queryKey: ["profiles"] });
       closeWizard();
     } catch (e) {
@@ -248,7 +267,7 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
   });
 
   const err = useCallback((field: string) => (submitted ? errors[field] : undefined), [submitted, errors]);
-  const props: SectionProps = { draft, profile, editing, original: existing, patch, patchIceberg, setPassword, setSshSecret, setIcebergSecret, setS3Keys, err };
+  const props: SectionProps = { draft, profile, editing, original: existing, patch, patchIceberg, patchRedshift, setPassword, setSshSecret, setIcebergSecret, setS3Keys, setEngineSecret, err };
   const visible = ENGINE_SECTIONS[profile.engine];
   const current: SectionId = visible.includes(section) ? section : "general";
 
@@ -258,6 +277,7 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
     catalog: ice ? catalogSummary(ice.catalog) : "",
     storage: ice ? storageSummary(ice.storage) : "",
     queryEngine: ice ? engineSummary(ice.queryEngine) : "",
+    warehouse: profile.redshift ? redshiftTargetName(profile.redshift.target) || (profile.redshift.target.kind === "serverless" ? "Serverless" : "Provisioned") : "",
     auth: { none: "None", password: "Password", rdsIam: "RDS IAM", secretsManager: "Secrets Manager", elastiCacheIam: "ElastiCache IAM", accessToken: "Access token" }[profile.auth.kind],
     network: profile.tunnel ? "SSH tunnel" : "Direct",
     tls: { verifyFull: "Verify full", require: "No verification", disable: "Off" }[profile.tls.mode],
@@ -340,6 +360,7 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
                 {current === "catalog" && <IcebergCatalogSection {...props} />}
                 {current === "storage" && <IcebergStorageSection {...props} />}
                 {current === "queryEngine" && <IcebergEngineSection {...props} />}
+                {current === "warehouse" && <RedshiftSection {...props} />}
                 {current === "network" && <NetworkSection {...props} />}
                 {current === "tls" && <TlsSection {...props} />}
                 {current === "ai" && <AiAccessSection {...props} />}

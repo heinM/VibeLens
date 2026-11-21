@@ -2,14 +2,17 @@ import type { AwsTarget, ConnectionProfile, IcebergOptions } from "../../ipc/typ
 import { REGION_RE, SECRET_ARN_RE, awsTargetError } from "./awsHelpers";
 import { isHostKeyFingerprint } from "./hostKey";
 import { S3_TABLES_ARN_RE, headerRowError, headerRows, httpUrlError, isAwsCatalog, isS3Url, sqlFlavour } from "./icebergForm";
+import { validateRedshift } from "./redshiftForm";
+import { isRemoteEngine, validateRemoteEngine } from "./remoteEngineForm";
 
-export type SectionId = "general" | "auth" | "network" | "tls" | "ai" | "advanced" | "catalog" | "storage" | "queryEngine";
+export type SectionId = "general" | "auth" | "network" | "tls" | "ai" | "advanced" | "catalog" | "storage" | "queryEngine" | "warehouse";
 export type FieldErrors = Record<string, string>;
 
 export function sectionOf(field: string): SectionId {
   if (field.startsWith("ice.catalog")) return "catalog";
   if (field.startsWith("ice.storage")) return "storage";
   if (field.startsWith("ice.engine")) return "queryEngine";
+  if (field.startsWith("rs.")) return "warehouse";
   if (field.startsWith("auth") || field.startsWith("aws")) return "auth";
   if (field.startsWith("tunnel")) return "network";
   if (field.startsWith("tls")) return "tls";
@@ -23,6 +26,8 @@ const intIn = (v: number, min: number, max: number) => Number.isInteger(v) && v 
 export interface MissingSecrets {
   catalog: boolean;
   s3Keys: boolean;
+  /** Trino / Spark password or token. */
+  engine?: boolean;
 }
 
 const prefixed = (errs: FieldErrors, prefix: string): FieldErrors => Object.fromEntries(Object.entries(errs).map(([k, v]) => [`${prefix}${k}`, v]));
@@ -107,6 +112,7 @@ export function validateIceberg(o: IcebergOptions, missing: MissingSecrets = { c
     if (q.outputLocation?.trim() && !isS3Url(q.outputLocation)) e["ice.engine.output"] = "Use an s3:// path, for example s3://my-athena-results/vibelens/.";
     if (q.aws) Object.assign(e, awsErrors(q.aws, "ice.engine."));
   }
+  if (isRemoteEngine(q)) Object.assign(e, validateRemoteEngine(q, missing.engine ?? false));
   return e;
 }
 
@@ -120,6 +126,13 @@ export function validateProfile(p: ConnectionProfile, others: ConnectionProfile[
   if (p.engine === "iceberg") {
     if (!p.iceberg) e["ice.catalog.uri"] = "Catalog settings are missing.";
     else Object.assign(e, validateIceberg(p.iceberg, missing));
+    return e;
+  }
+
+  if (p.engine === "redshift") {
+    // No host, port, password, TLS or tunnel: the Data API is reached through AWS with IAM.
+    if (!p.redshift) e["rs.clusterIdentifier"] = "Warehouse settings are missing.";
+    else Object.assign(e, validateRedshift(p.redshift));
     return e;
   }
 
@@ -182,7 +195,7 @@ export function validateProfile(p: ConnectionProfile, others: ConnectionProfile[
         e["pg.pgproxy.healthUrl"] = "A full URL such as http://pgproxy.internal:8080, or leave empty.";
       }
     }
-  } else {
+  } else if (p.engine === "valkey") {
     if (!p.valkey.keyDelimiter) e["valkey.keyDelimiter"] = "Key delimiter can't be empty.";
     if (!intIn(p.valkey.scanCount, 1, 100_000)) e["valkey.scanCount"] = "1-100000.";
     if (!intIn(p.valkey.connectTimeoutSecs, 1, 600)) e["valkey.connectTimeoutSecs"] = "1-600 seconds.";
@@ -192,13 +205,13 @@ export function validateProfile(p: ConnectionProfile, others: ConnectionProfile[
 }
 
 export function errorCountBySection(errors: FieldErrors): Record<SectionId, number> {
-  const out: Record<SectionId, number> = { general: 0, auth: 0, network: 0, tls: 0, ai: 0, advanced: 0, catalog: 0, storage: 0, queryEngine: 0 };
+  const out: Record<SectionId, number> = { general: 0, auth: 0, network: 0, tls: 0, ai: 0, advanced: 0, catalog: 0, storage: 0, queryEngine: 0, warehouse: 0 };
   for (const k of Object.keys(errors)) out[sectionOf(k)] += 1;
   return out;
 }
 
 export function firstErrorSection(errors: FieldErrors): SectionId | null {
-  const order: SectionId[] = ["general", "auth", "catalog", "storage", "queryEngine", "network", "tls", "ai", "advanced"];
+  const order: SectionId[] = ["general", "auth", "warehouse", "catalog", "storage", "queryEngine", "network", "tls", "ai", "advanced"];
   const counts = errorCountBySection(errors);
   return order.find((s) => counts[s] > 0) ?? null;
 }

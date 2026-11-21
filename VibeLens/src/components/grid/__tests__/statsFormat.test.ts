@@ -77,7 +77,8 @@ describe("engine badge", () => {
     expect(engineBadge("DataFusion").label).toBe("DataFusion · local");
     expect(engineBadge("athena").label).toBe("Athena");
     expect(engineBadge("athena").tone).toBe("accent");
-    expect(engineBadge("trino").label).toBe("trino");
+    expect(engineBadge("trino").label).toBe("Trino");
+    expect(engineBadge("presto").label).toBe("presto");
   });
 });
 
@@ -104,6 +105,26 @@ describe("statsView", () => {
   });
   it("keeps a zero scan (a metadata-only query)", () => {
     expect(statsView({ engine: "athena", bytesScanned: 0, costUsdEstimate: 4.77e-5, engineQueryId: null }).scanned?.text).toBe("0 B scanned");
+  });
+});
+
+describe("remote engines (Trino, Spark, Redshift)", () => {
+  it("names each engine and shows no cost when the engine gives none", () => {
+    for (const [engine, label] of [
+      ["trino", "Trino"],
+      ["spark", "Spark"],
+      ["redshift", "Redshift"],
+    ] as const) {
+      const v = statsView({ engine, bytesScanned: engine === "trino" ? 2048 : null, costUsdEstimate: null, engineQueryId: "q-1" });
+      expect(v.engine.label).toBe(label);
+      expect(v.cost).toBeNull();
+      expect(v.queryId).toEqual({ short: "q-1", full: "q-1" });
+    }
+  });
+  it("describes Trino's processed bytes without talking about Athena billing", () => {
+    expect(scannedTooltip("trino", 2048)).toMatch(/processed by Trino/);
+    expect(scannedTooltip("trino", 2048)).not.toMatch(/bills/);
+    expect(statsView({ engine: "spark", bytesScanned: null, costUsdEstimate: null, engineQueryId: "3/7" }).scanned).toBeNull();
   });
 });
 

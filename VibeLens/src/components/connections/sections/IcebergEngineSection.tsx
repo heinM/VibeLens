@@ -1,11 +1,13 @@
 import { useId } from "react";
-import { Check, Cpu, Cloud, Minus } from "lucide-react";
+import { Check, Cpu, Cloud, Flame, Minus, Server } from "lucide-react";
 import type { IcebergQueryEngine } from "../../../ipc/types";
 import { cn } from "../../../lib/cn";
 import { Input } from "../../ui";
 import { FormField, Notice, RadioCards, invalidRing } from "../../ui/formKit";
 import { blankEngine, catalogAws, isAwsCatalog } from "../icebergForm";
+import { isRemoteEngine } from "../remoteEngineForm";
 import { Group, OptionalAwsIdentity } from "./IcebergShared";
+import { RemoteEngineFields } from "./RemoteEngineFields";
 import type { SectionProps } from "./types";
 
 type Fact = { ok: boolean | "partial"; text: string };
@@ -23,8 +25,9 @@ function Facts({ items }: { items: Fact[] }) {
   );
 }
 
-/** Which engine runs SQL: embedded DataFusion on this computer, or Amazon Athena. */
-export function IcebergEngineSection({ profile, patchIceberg, err }: SectionProps) {
+/** Which engine runs SQL: embedded DataFusion on this computer, Amazon Athena, or the user's Trino or Spark (Livy). */
+export function IcebergEngineSection(props: SectionProps) {
+  const { profile, patchIceberg, err } = props;
   const uid = useId();
   const ice = profile.iceberg;
   if (!ice) return null;
@@ -77,6 +80,38 @@ export function IcebergEngineSection({ profile, patchIceberg, err }: SectionProp
                 </>
               ),
             },
+            {
+              value: "trino",
+              title: "Trino",
+              icon: <Server className="size-4" />,
+              description: (
+                <>
+                  Runs on your Trino cluster (for example on EKS), through a Trino catalog that points at this Iceberg catalog. Works with every catalog type.
+                  <Facts
+                    items={[
+                      { ok: true, text: "Full DML where the Trino Iceberg connector allows it" },
+                      { ok: "partial", text: "Each statement starts fresh: USE, SET SESSION and transactions are refused" },
+                    ]}
+                  />
+                </>
+              ),
+            },
+            {
+              value: "spark",
+              title: "Spark (Livy)",
+              icon: <Flame className="size-4" />,
+              description: (
+                <>
+                  Runs in a Spark session on Apache Livy, such as EMR on EKS's interactive endpoint. Works with every catalog type.
+                  <Facts
+                    items={[
+                      { ok: true, text: "Spark SQL with the Iceberg extensions configured on the cluster" },
+                      { ok: "partial", text: "The first query waits for the session to start; Livy may cap results (1000 rows by default)" },
+                    ]}
+                  />
+                </>
+              ),
+            },
           ]}
         />
       </Group>
@@ -104,6 +139,8 @@ export function IcebergEngineSection({ profile, patchIceberg, err }: SectionProp
           />
         </Group>
       )}
+
+      {isRemoteEngine(q) && <RemoteEngineFields {...props} engine={q} setEngine={setEngine} />}
     </div>
   );
 }

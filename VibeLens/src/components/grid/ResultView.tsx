@@ -2,7 +2,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Check, ChevronDown, Copy, Grid3x3, Braces, AlignLeft, Loader2, Zap } from "lucide-react";
 import type { Cell } from "../../ipc/types";
-import type { SqlDialect } from "../../lib/sqlIntel/dialect";
+import { DIALECT_ENGINE, type SqlDialect } from "../../lib/sqlIntel/dialect";
 import { ErrorBox } from "../ui";
 import { Chip, Segmented } from "../ui/wsKit";
 import { useMenu } from "../ui/Menu";
@@ -220,7 +220,7 @@ export const ResultView = memo(function ResultView({
         )}
         {view === "plan" && textSections && (
           <div className="h-full overflow-auto bg-bg">
-            <TextPlanView sections={textSections} engine={meta.stats?.engine ?? (context?.dialect === "athena" ? "athena" : "datafusion")} sql={context?.sql ?? undefined} profileId={context?.profileId} />
+            <TextPlanView sections={textSections} engine={meta.stats?.engine ?? (context?.dialect ? DIALECT_ENGINE[context.dialect] : "datafusion")} sql={context?.sql ?? undefined} profileId={context?.profileId} />
           </div>
         )}
         {view === "text" && <pre className="selectable h-full overflow-auto bg-bg p-3 font-mono text-[12px] leading-5 text-fg">{textView}</pre>}

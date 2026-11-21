@@ -1,4 +1,5 @@
-// The navigator body for the focused connection: Postgres object tree or Valkey key tree.
+// The navigator body for the focused connection: Postgres object tree, Iceberg catalog, Redshift
+// schemas or Valkey key tree.
 import { useEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Eye, EyeOff, Plug, RefreshCw, Search, X } from "lucide-react";
@@ -10,6 +11,7 @@ import { Button, EmptyState, ErrorBox, IconButton, Spinner } from "../ui";
 import { cn } from "../../lib/cn";
 import { IcebergTree } from "./IcebergTree";
 import { PgTree } from "./PgTree";
+import { RedshiftTree } from "./RedshiftTree";
 import { SectionHeader } from "./TreeRow";
 import { ValkeyTree, normalisePattern } from "./ValkeyTree";
 
@@ -36,11 +38,14 @@ export function Explorer() {
   const state = status?.state ?? "disconnected";
   const isPg = profile?.engine === "postgres";
   const isIce = profile?.engine === "iceberg";
+  const isRs = profile?.engine === "redshift";
+  const isVk = profile?.engine === "valkey";
 
   const refresh = () => {
     if (!profile) return;
     if (profile.engine === "postgres") void qc.invalidateQueries({ queryKey: ["pg", profile.id] });
     else if (profile.engine === "iceberg") void qc.invalidateQueries({ queryKey: ["ice", profile.id] });
+    else if (profile.engine === "redshift") void qc.invalidateQueries({ queryKey: ["rs", profile.id] });
     else {
       void qc.resetQueries({ predicate: (q) => q.queryKey[0] === "vk" && q.queryKey[1] === profile.id && q.queryKey[3] === "scan" });
       void qc.invalidateQueries({ queryKey: ["vk", profile.id, "dbs"] });
@@ -77,6 +82,8 @@ export function Explorer() {
     body = <PgTree key={profile.id} profile={profile} showSystem={showSystem} />;
   } else if (isIce) {
     body = <IcebergTree key={profile.id} profile={profile} />;
+  } else if (isRs) {
+    body = <RedshiftTree key={profile.id} profile={profile} showSystem={showSystem} />;
   } else {
     body = <ValkeyTree key={profile.id} profile={profile} pattern={pattern} />;
   }
@@ -90,7 +97,7 @@ export function Explorer() {
         actions={
           connected && (
             <>
-              {isPg && (
+              {(isPg || isRs) && (
                 <IconButton label={showSystem ? "Hide system objects" : "Show system objects"} onClick={() => setShowSystem((v) => !v)} className={cn(showSystem && "text-accent")}>
                   {showSystem ? <Eye className="size-3.5" /> : <EyeOff className="size-3.5" />}
                 </IconButton>
@@ -102,7 +109,7 @@ export function Explorer() {
           )
         }
       />
-      {connected && !isPg && !isIce && (
+      {connected && isVk && (
         <div className="shrink-0 border-b border-border px-2 py-1.5">
           <div className="flex h-7 items-center gap-1.5 rounded-md border border-border bg-bg px-2 focus-within:border-accent/70 focus-within:ring-1 focus-within:ring-accent/40">
             <Search className="size-3.5 shrink-0 text-muted" />

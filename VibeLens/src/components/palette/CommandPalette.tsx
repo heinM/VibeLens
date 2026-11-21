@@ -28,6 +28,7 @@ import {
   Zap,
   XCircle,
 } from "lucide-react";
+import { Warehouse } from "lucide-react";
 import { useProfiles } from "../../hooks/useProfiles";
 import { useConnect, useConnectionStatuses, useDisconnect } from "../../hooks/useConnectionStatus";
 import { useTabActions } from "../../hooks/useTabActions";
@@ -57,6 +58,7 @@ import "./palette.css";
 const ICONS: Record<IconKey, ReactNode> = {
   pg: <Database className="size-3.5" />,
   iceberg: <IcebergGlyph className="size-3.5" />,
+  redshift: <Warehouse className="size-3.5" />,
   valkey: <Zap className="size-3.5" />,
   table: <Table2 className="size-3.5" />,
   view: <Eye className="size-3.5" />,
@@ -150,14 +152,15 @@ function useCommandItems(onAskClearHistory: () => void): PaletteItem[] {
     });
     const connectedPg = list.filter((p) => p.engine === "postgres" && stateOf(p.id) === "connected");
     const connectedIce = list.filter((p) => p.engine === "iceberg" && stateOf(p.id) === "connected");
+    const connectedRs = list.filter((p) => p.engine === "redshift" && stateOf(p.id) === "connected");
     const iceberg = resolveIcebergTarget({ profiles: list, activeTabProfileId: tab?.profileId, activeProfileId: ui.activeProfileId, stateOf });
     const env: CommandEnv = {
       aiMode,
       theme,
       profiles: list,
       stateOf,
-      // Connections "Refresh schema cache" touches: Postgres and Iceberg.
-      connectedPg: connectedPg.length + connectedIce.length,
+      // Connections "Refresh schema cache" touches: Postgres, Iceberg and Redshift.
+      connectedPg: connectedPg.length + connectedIce.length + connectedRs.length,
       hasValkeyProfile: list.some((p) => p.engine === "valkey"),
       historyCount,
       iceberg,
@@ -182,6 +185,7 @@ function useCommandItems(onAskClearHistory: () => void): PaletteItem[] {
         refreshSchema: () => {
           for (const p of connectedPg) void qc.invalidateQueries({ queryKey: ["pg", p.id] });
           for (const p of connectedIce) void qc.invalidateQueries({ queryKey: ["ice", p.id] });
+          for (const p of connectedRs) void qc.invalidateQueries({ queryKey: ["rs", p.id] });
         },
         refreshFiles: () => void qc.invalidateQueries({ queryKey: WS_FILES_KEY }),
         openErd: (t) => openErdTab(t.profileId, t.database, t.schema),

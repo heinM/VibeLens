@@ -7,6 +7,7 @@ import type { QueryEvent } from "../../ipc/types";
 const api = vi.hoisted(() => ({
   pgExecute: vi.fn(async (_a: unknown) => "pg-1"),
   iceExecute: vi.fn(async (_a: unknown) => "ice-1"),
+  rsExecute: vi.fn(async (_a: unknown) => "rs-1"),
   pgCancel: vi.fn(async (_id: string) => undefined),
 }));
 vi.mock("../../ipc/commands", () => ({ api, asError: (e: unknown) => e }));
@@ -65,6 +66,36 @@ describe("executeOnEngine", () => {
   });
 });
 
+describe("executeOnEngine (redshift)", () => {
+  it("runs Redshift through rsExecute with the tab's database, never through pgExecute", async () => {
+    expect(await executeOnEngine("redshift", { ...base, options: { readOnly: true }, confirmed: true })).toBe("rs-1");
+    expect(api.pgExecute).not.toHaveBeenCalled();
+    expect(api.iceExecute).not.toHaveBeenCalled();
+    expect(api.rsExecute).toHaveBeenCalledWith({ profileId: "p1", database: "orders", sql: "select 1", options: { readOnly: true }, confirmed: true, onEvent });
+  });
+
+  it("passes a null database through (the connection's own database)", async () => {
+    await executeOnEngine("redshift", { ...base, database: null });
+    expect((api.rsExecute.mock.calls[0][0] as { database: unknown }).database).toBeNull();
+  });
+
+  it("keeps the confirm_required rejection for the production confirm flow", async () => {
+    api.rsExecute.mockRejectedValueOnce({ code: "confirm_required", message: "writes to prod" });
+    await expect(executeOnEngine("redshift", base)).rejects.toEqual({ code: "confirm_required", message: "writes to prod" });
+  });
+
+  it("is a SQL engine, and an unknown engine is refused rather than run as Postgres", async () => {
+    expect(runsSql("redshift")).toBe(true);
+    await expect(executeOnEngine("mystery" as never, base)).rejects.toMatchObject({ code: "unsupported" });
+    expect(api.pgExecute).not.toHaveBeenCalled();
+  });
+
+  it("is cancelled with pgCancel like the other engines", async () => {
+    await cancelQuery("rs-1");
+    expect(api.pgCancel).toHaveBeenCalledWith("rs-1");
+  });
+});
+
 describe("cancel", () => {
   it("uses pgCancel for Iceberg queries too (shared running-queries map)", async () => {
     await cancelQuery("ice-1");
@@ -102,6 +133,19 @@ describe("DDL invalidation", () => {
     expect(stale(qc, ["ice", "p1", "tables", "shop"])).toBe(true);
     expect(stale(qc, ["ice", "p2", "tables", "shop"])).toBe(false);
     expect(stale(qc, schemaMetadataKey("p1", "orders"))).toBe(false);
+  });
+
+  it("keeps the Redshift catalog apart from Postgres and refreshes only it after Redshift DDL", () => {
+    const qc = new QueryClient();
+    seed(qc);
+    qc.setQueryData(schemaMetadataKey("p1", "dev", "redshift"), { n: 3 });
+    qc.setQueryData(["rs", "p1", null, "tables", "public"], []);
+    expect(schemaMetadataKey("p1", "dev", "redshift")[0]).toBe("rs");
+    invalidateAfterDdl(qc, "redshift", "p1");
+    expect(stale(qc, schemaMetadataKey("p1", "dev", "redshift"))).toBe(true);
+    expect(stale(qc, ["rs", "p1", null, "tables", "public"])).toBe(true);
+    expect(stale(qc, schemaMetadataKey("p1", "orders"))).toBe(false);
+    expect(stale(qc, schemaMetadataKey("p1", null, "iceberg"))).toBe(false);
   });
 
   it("refreshes only the Postgres catalog after Postgres DDL", () => {
