@@ -106,6 +106,21 @@ export function buildRsRows(m: RsModelInput): RsRow[] {
   return out;
 }
 
+/**
+ * Query-key prefixes a Refresh invalidates (keys of `rsQueries`: ['rs', profile, db, kind, schema, name]).
+ * A schema refresh covers its table list AND the columns of every table under it, so an expanded table
+ * never keeps stale columns; a table refresh covers its columns; anything else the whole connection.
+ */
+export function rsRefreshKeys(profileId: string, db: string | null, row?: Pick<RsRow, "kind" | "schema" | "table">): (readonly unknown[])[] {
+  if (row?.kind === "table" && row.schema && row.table) return [["rs", profileId, db, "describe", row.schema, row.table.name]];
+  if (row?.kind === "schema" && row.schema)
+    return [
+      ["rs", profileId, db, "tables", row.schema],
+      ["rs", profileId, db, "describe", row.schema],
+    ];
+  return [["rs", profileId]];
+}
+
 /** Schemas and tables whose children are needed, given the expansion state. */
 export function expandedRsSchemas(schemas: readonly string[] | undefined, toggled: ReadonlyMap<string, boolean>): string[] {
   return (schemas ?? []).filter((s) => rsIsExpanded(toggled, rsSchemaId(s)));
