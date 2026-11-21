@@ -173,6 +173,15 @@ describe("buildCommands", () => {
       expect(t).toContain(want);
   });
 
+  it("offers workspace file import only when the action is wired, and runs it", () => {
+    expect(titles(env())).not.toContain("Import files into workspace");
+    const importWorkspaceFiles = vi.fn();
+    const e = env({ actions: { ...actions(), importWorkspaceFiles } });
+    expect(titles(e)).toContain("Import files into workspace");
+    buildCommands(e).find((c) => c.id === "cmd:import-workspace-files")!.run();
+    expect(importWorkspaceFiles).toHaveBeenCalledTimes(1);
+  });
+
   it("hides the agent panel toggle in classic mode", () => {
     expect(titles(env({ aiMode: "classic" }))).not.toContain("Toggle agent panel");
     expect(titles(env({ aiMode: null }))).not.toContain("Toggle agent panel");

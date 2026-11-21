@@ -53,6 +53,7 @@ import { mruRanks, readMru, recordMru } from "./mru";
 import { positionsToRanges, splitTerms } from "./fuzzy";
 import { rankItems, type Ranked } from "./rank";
 import { usePaletteCatalog, type PaletteCatalog } from "./usePaletteCatalog";
+import { importWorkspaceFiles } from "../../lib/workspaceImport";
 import "./palette.css";
 
 const ICONS: Record<IconKey, ReactNode> = {
@@ -172,6 +173,7 @@ function useCommandItems(onAskClearHistory: () => void): PaletteItem[] {
         newValkeyConsole: () => newValkeyConsole(),
         newConnection: () => useUIStore.getState().openWizard(),
         importConnections: () => useUIStore.getState().setImportOpen(true),
+        importWorkspaceFiles: () => void importWorkspaceFiles(qc, useUIStore.getState().activeProfileId),
         openSettings: () => useUIStore.getState().setSettingsOpen(true),
         setAiMode: (m) => useUIStore.getState().setAiMode(m),
         toggleTheme: () => {

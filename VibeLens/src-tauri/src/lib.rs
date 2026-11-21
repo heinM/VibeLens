@@ -107,6 +107,8 @@ pub fn run() {
             commands::workspace::ws_list,
             commands::workspace::ws_read,
             commands::workspace::ws_write,
+            commands::workspace::ws_import_files,
+            commands::workspace::ws_reveal,
         ])
         .run(tauri::generate_context!())
         .expect("error while running VibeLens");

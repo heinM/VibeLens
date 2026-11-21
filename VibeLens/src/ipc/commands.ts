@@ -222,6 +222,10 @@ export const api = {
   wsList: () => invoke<T.WorkspaceFile[]>("ws_list"),
   wsRead: (path: string) => invoke<string>("ws_read", { path }),
   wsWrite: (path: string, contents: string) => invoke<void>("ws_write", { path, contents }),
+  /** Native file picker, then copies the chosen files into the workspace. null = cancelled. Rust picks and checks every path. */
+  wsImportFiles: () => invoke<T.WorkspaceImportOutcome | null>("ws_import_files"),
+  /** Shows the workspace folder in the system file manager. */
+  wsReveal: () => invoke<void>("ws_reveal"),
 };
 
 export type Api = typeof api;

@@ -14,6 +14,8 @@ export interface CommandActions {
   newConnection: () => void;
   /** Opens the importer (DataGrip, DBeaver, Azure Data Studio, pgAdmin, pg_service.conf). */
   importConnections?: () => void;
+  /** Native picker, then copies the chosen files into the workspace folder. */
+  importWorkspaceFiles?: () => void;
   openSettings: () => void;
   setAiMode: (m: AiMode) => void;
   toggleTheme: () => void;
@@ -88,6 +90,9 @@ export function buildCommands(env: CommandEnv): PaletteItem[] {
   }
   if (env.connectedPg > 0) out.push(cmd("refresh-schema", "Database", "Refresh schema cache", { icon: "refresh", run: a.refreshSchema, search: "reload catalog tables metadata", meta: env.connectedPg > 1 ? `${env.connectedPg} connections` : undefined }));
   out.push(cmd("refresh-files", "Database", "Refresh workspace files", { icon: "refresh", run: a.refreshFiles, search: "reload worksheets" }));
+  if (a.importWorkspaceFiles) {
+    out.push(cmd("import-workspace-files", "Database", "Import files into workspace", { icon: "file", run: a.importWorkspaceFiles, search: "add copy bring worksheets sql file folder open" }));
+  }
 
   for (const p of env.profiles) {
     const st = env.stateOf(p.id);

@@ -550,6 +550,16 @@ export interface WorkspaceFile {
   size: number;
   modified: string | null;
 }
+/** One file `ws_import_files` left out. `name` is the file name only. */
+export interface ImportSkip {
+  name: string;
+  reason: string;
+}
+export interface WorkspaceImportOutcome {
+  /** Workspace-relative paths created, in the order picked. */
+  imported: string[];
+  skipped: ImportSkip[];
+}
 
 // ---------- agent ----------
 export type ProviderKind = "anthropic" | "openAiCompatible" | "portkey";
