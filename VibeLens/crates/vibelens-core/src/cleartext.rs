@@ -193,6 +193,12 @@ pub fn check_profile(profile: &ConnectionProfile) -> Result<()> {
             )
             | None => Ok(()),
         },
+        // No secret is stored or sent (IAM-signed calls to the regional HTTPS endpoint), but
+        // every identifier that is signed and sent to AWS is validated on save and on use.
+        EngineKind::Redshift => match &profile.redshift {
+            Some(o) => crate::redshift::validate_options(o),
+            None => invalid("Redshift connection options are required".into()),
+        },
     }
 }
 
@@ -413,6 +419,7 @@ mod tests {
             created_at: None,
             updated_at: None,
             iceberg: None,
+            redshift: None,
         }
     }
 

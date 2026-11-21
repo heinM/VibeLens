@@ -102,6 +102,7 @@ pub fn base_profile(id: &str, options: IcebergOptions) -> ConnectionProfile {
         created_at: None,
         updated_at: None,
         iceberg: Some(options),
+        redshift: None,
     }
 }
 

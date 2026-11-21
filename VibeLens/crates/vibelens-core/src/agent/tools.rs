@@ -321,12 +321,12 @@ fn spec(name: &str, description: &str, properties: Value, required: &[&str]) -> 
 /// when to use each tool, what comes back, and what the user will be asked to approve.
 pub(super) fn tool_specs() -> Vec<ToolSpec> {
     let profile_id = json!({ "type": "string", "description": "Connection id from list_connections. Defaults to the user's active connection when omitted." });
-    let database = json!({ "type": "string", "description": "Postgres database name. Defaults to the connection's default database. Ignored for Apache Iceberg connections." });
+    let database = json!({ "type": "string", "description": "Postgres or Amazon Redshift database name. Defaults to the connection's default database. Ignored for Apache Iceberg connections." });
     let db = json!({ "type": "integer", "minimum": 0, "maximum": 255, "description": "Valkey logical database number. Default 0. Cluster-mode connections only have 0." });
     vec![
         spec(
             "list_connections",
-            "List the user's saved database connections: id, name, engine (postgres, valkey or iceberg), environment (dev/test/staging/prod) and ai_data_access (none, schemaOnly, resultsWithApproval, results). \
+            "List the user's saved database connections: id, name, engine (postgres, valkey, iceberg or redshift), environment (dev/test/staging/prod) and ai_data_access (none, schemaOnly, resultsWithApproval, results). \
              Call this first when you do not know which connection to use. It never returns hosts or credentials. ai_data_access tells you what you may see: 'none' means do not touch the connection; \
              'schemaOnly' means table/column structure only, no row data; the 'results' levels allow query results (the second one asks the user before each query).",
             json!({}),
@@ -361,6 +361,7 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
              On Apache Iceberg connections: name tables as namespace.table; the dialect is DataFusion SQL on the local engine and Trino/Athena SQL on an Athena engine. Time travel on the local engine reads a table as of a snapshot with a quoted name, ns.\"table@<snapshot_id>\". \
              Iceberg writes (INSERT, CREATE TABLE AS, and on Athena DML/DDL) need approval and create a new table snapshot. The local engine can only append with INSERT, so UPDATE, DELETE and MERGE need an Athena connection. \
              Athena bills per TB scanned: select only the columns you need, filter on partition columns and always add LIMIT. \
+             On Amazon Redshift connections the dialect is Redshift SQL; each statement commits on its own (no transactions: BEGIN, COMMIT and ROLLBACK are refused), and read-only statements are checked to be plain queries rather than run in a READ ONLY transaction. \
              For anything beyond a quick query, or any change to data or schema, prefer write_file to save the SQL as a .sql file for the user to review and run themselves. `purpose` is shown to the user next to the SQL, so state plainly why you are running it.",
             json!({
                 "profile_id": profile_id.clone(), "database": database.clone(),

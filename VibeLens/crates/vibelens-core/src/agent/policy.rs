@@ -24,11 +24,15 @@
 //! | valkey write | denied | approval (result withheld) | approval | approval |
 //! | list_connections, list_files, read_file | safe | safe | safe | safe |
 //! | write_file | approval | approval | approval | approval |
+//!
+//! Amazon Redshift connections get the Postgres semantics, with two differences: transaction
+//! control (`BEGIN`, `COMMIT`, …) is refused outright, because the Data API commits each statement
+//! on its own; and the approval card names the cluster or workgroup, database and region.
 
 use super::tools::ToolCall;
 use crate::model::{
     AiDataAccess, ApprovalTarget, ConnectionProfile, EngineKind, Environment, IcebergQueryEngine,
-    ToolRisk, effective_database,
+    RedshiftOptions, ToolRisk, effective_database,
 };
 use crate::sql::{SqlClassification, StatementClass, classify};
 
@@ -42,9 +46,12 @@ pub(super) struct ProfileFacts {
     /// Iceberg connection whose SQL runs on Amazon Athena (billed per TB scanned, full DML)
     /// rather than the embedded engine (append-only). `false` for every other engine.
     pub athena: bool,
-    /// The profile's configured database (Postgres only; `None` when unset or another engine).
-    /// Always resolved through [`effective_database`], the rule execution uses.
+    /// The profile's configured database (Postgres and Redshift; `None` when unset or another
+    /// engine). Always resolved through [`effective_database`], the rule execution uses.
     pub database: Option<String>,
+    /// Redshift connection options (cluster or workgroup, region; identifiers, no secret), for
+    /// the approval card's target line. `None` for every other engine.
+    pub redshift: Option<RedshiftOptions>,
 }
 
 impl From<&ConnectionProfile> for ProfileFacts {
@@ -58,10 +65,17 @@ impl From<&ConnectionProfile> for ProfileFacts {
                 && p.iceberg
                     .as_ref()
                     .is_some_and(|o| matches!(o.query_engine, IcebergQueryEngine::Athena { .. })),
-            database: p
-                .database
+            database: match p.engine {
+                EngineKind::Redshift => p.redshift.as_ref().map(|o| o.database.clone()),
+                _ => p
+                    .database
+                    .clone()
+                    .filter(|_| p.engine == EngineKind::Postgres),
+            },
+            redshift: p
+                .redshift
                 .clone()
-                .filter(|_| p.engine == EngineKind::Postgres),
+                .filter(|_| p.engine == EngineKind::Redshift),
         }
     }
 }
@@ -73,7 +87,8 @@ impl From<&ConnectionProfile> for ProfileFacts {
 /// that touch no connection.
 pub(super) fn approval_target(call: &ToolCall, f: &ProfileFacts) -> Option<ApprovalTarget> {
     call.profile_id()?;
-    let postgres = f.engine == EngineKind::Postgres;
+    // Redshift resolves its database with the same rule (the profile's database is never empty).
+    let postgres = matches!(f.engine, EngineKind::Postgres | EngineKind::Redshift);
     let requested = match call {
         ToolCall::RunSql { database, .. }
         | ToolCall::GetSchema { database, .. }
@@ -99,11 +114,23 @@ pub(super) fn approval_target(call: &ToolCall, f: &ProfileFacts) -> Option<Appro
 /// `'orders-db', database 'payments' (not this connection's default database 'shop')` for
 /// Postgres, just the quoted connection name for Iceberg (which has no database to choose).
 fn sql_target_text(f: &ProfileFacts, requested: Option<&str>) -> String {
-    if f.engine != EngineKind::Postgres {
+    if !matches!(f.engine, EngineKind::Postgres | EngineKind::Redshift) {
         return format!("'{}'", f.name);
     }
     let database = effective_database(f.database.as_deref(), requested);
     let default = effective_database(f.database.as_deref(), None);
+    if let Some(o) = &f.redshift {
+        // `Redshift · {cluster or workgroup} · {database} · {region}`, from the profile.
+        let target = crate::redshift::describe_target(o, &database);
+        return if database == default {
+            format!("'{}' ({target})", f.name)
+        } else {
+            format!(
+                "'{}' ({target}; not this connection's default database '{default}')",
+                f.name
+            )
+        };
+    }
     if database == default {
         format!("'{}', database '{database}'", f.name)
     } else {
@@ -305,7 +332,10 @@ pub(super) fn assess(
     // The SQL tools serve every SQL engine (Postgres, Iceberg); the rest are Valkey-only.
     let engine_fits = match call {
         ToolCall::GetSchema { .. } | ToolCall::DescribeTable { .. } | ToolCall::RunSql { .. } => {
-            matches!(f.engine, EngineKind::Postgres | EngineKind::Iceberg)
+            matches!(
+                f.engine,
+                EngineKind::Postgres | EngineKind::Iceberg | EngineKind::Redshift
+            )
         }
         _ => f.engine == EngineKind::Valkey,
     };
@@ -314,6 +344,7 @@ pub(super) fn assess(
             EngineKind::Postgres => ("a Postgres", "use run_sql, get_schema or describe_table"),
             EngineKind::Valkey => ("a Valkey", "use valkey_scan, valkey_get or valkey_command"),
             EngineKind::Iceberg => ("an Iceberg", "use run_sql, get_schema or describe_table"),
+            EngineKind::Redshift => ("a Redshift", "use run_sql, get_schema or describe_table"),
         };
         return Assessment::denied(format!(
             "connection '{}' is {have} connection; {hint} for it",
@@ -385,6 +416,12 @@ fn iceberg_write_note(f: &ProfileFacts, c: &SqlClassification) -> String {
 /// The target always comes before the statement summary and the model's `purpose`, so neither
 /// can push it out of view. The preview is exactly the text that is executed.
 fn assess_sql(f: &ProfileFacts, database: Option<&str>, sql: &str, purpose: &str) -> Assessment {
+    // The engine refuses these too; refusing here tells the model why before the user is asked.
+    if f.engine == EngineKind::Redshift
+        && let Err(e) = crate::redshift::check_transaction_control(sql)
+    {
+        return Assessment::denied(e.to_string());
+    }
     let c = classify(sql);
     let preview = Some(sql.to_string());
     let target = sql_target_text(f, database);
@@ -434,6 +471,8 @@ fn assess_sql(f: &ProfileFacts, database: Option<&str>, sql: &str, purpose: &str
             };
             let note = if class == StatementClass::Session {
                 String::new()
+            } else if f.engine == EngineKind::Redshift {
+                " Redshift commits each statement on its own: a failure part-way leaves the earlier statements applied.".to_string()
             } else {
                 iceberg_write_note(f, &c)
             };
@@ -509,6 +548,7 @@ mod tests {
             access,
             athena: false,
             database: Some("shop".into()),
+            redshift: None,
         }
     }
     fn ice(access: AiDataAccess, env: Environment, athena: bool) -> ProfileFacts {
@@ -519,6 +559,7 @@ mod tests {
             access,
             athena,
             database: None,
+            redshift: None,
         }
     }
     fn vk(access: AiDataAccess, env: Environment) -> ProfileFacts {
@@ -529,6 +570,29 @@ mod tests {
             access,
             athena: false,
             database: None,
+            redshift: None,
+        }
+    }
+    fn rs(access: AiDataAccess, env: Environment) -> ProfileFacts {
+        use crate::model::{AwsIdentity, AwsTarget, RedshiftAuth, RedshiftTarget};
+        ProfileFacts {
+            name: "warehouse".into(),
+            engine: EngineKind::Redshift,
+            environment: env,
+            access,
+            athena: false,
+            database: Some("dev".into()),
+            redshift: Some(RedshiftOptions {
+                target: RedshiftTarget::Serverless {
+                    workgroup_name: "analytics-wg".into(),
+                },
+                database: "dev".into(),
+                aws: AwsTarget {
+                    identity: AwsIdentity::DefaultChain,
+                    region: "eu-west-1".into(),
+                },
+                auth: RedshiftAuth::IamIdentity,
+            }),
         }
     }
     fn sql(s: &str) -> ToolCall {
@@ -1342,6 +1406,7 @@ mod tests {
                 query_engine: IcebergQueryEngine::Local,
                 default_namespace: None,
             }),
+            redshift: None,
         };
         assert!(!ProfileFacts::from(&p).athena);
         p.iceberg.as_mut().unwrap().query_engine = IcebergQueryEngine::Athena {
@@ -1518,6 +1583,7 @@ mod tests {
             created_at: None,
             updated_at: None,
             iceberg: None,
+            redshift: None,
         };
         assert_eq!(ProfileFacts::from(&p).database.as_deref(), Some("shop"));
         p.engine = EngineKind::Valkey;
@@ -1591,5 +1657,138 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- Amazon Redshift -----------------------------------------------------------------
+
+    #[test]
+    fn redshift_uses_the_sql_tools_with_postgres_access_semantics() {
+        let get = ToolCall::GetSchema {
+            profile_id: "p".into(),
+            database: None,
+            schema: None,
+        };
+        for env in ENVS {
+            assert_eq!(assess(&get, Some(&rs(SchemaOnly, env)), false).risk, Safe);
+            assert_eq!(assess(&get, Some(&rs(NOTHING, env)), false).risk, Denied);
+            let q = sql("select * from sales limit 10");
+            assert_eq!(assess(&q, Some(&rs(SchemaOnly, env)), false).risk, Denied);
+            assert_eq!(
+                assess(&q, Some(&rs(ResultsWithApproval, env)), false).risk,
+                NeedsApproval
+            );
+            assert_eq!(assess(&q, Some(&rs(Results, env)), false).risk, Safe);
+            let w = assess(&sql("delete from sales"), Some(&rs(SchemaOnly, env)), false);
+            assert_eq!(w.risk, NeedsApproval);
+            assert!(w.allow_write && w.redact_values);
+            assert!(
+                w.reason
+                    .unwrap()
+                    .contains("commits each statement on its own"),
+                "a write says it is not transactional"
+            );
+        }
+        let v = assess(
+            &vcmd(&["GET", "k"]),
+            Some(&rs(Results, Environment::Dev)),
+            false,
+        );
+        assert_eq!(v.risk, Denied);
+        assert!(v.reason.unwrap().contains("a Redshift connection"));
+    }
+
+    #[test]
+    fn redshift_refuses_transaction_control_at_every_access_level() {
+        for a in [SchemaOnly, ResultsWithApproval, Results] {
+            for s in [
+                "BEGIN",
+                "begin; delete from t; commit",
+                "START TRANSACTION",
+                "delete from t; ROLLBACK",
+                "END",
+                "ABORT",
+            ] {
+                let r = assess(&sql(s), Some(&rs(a, Environment::Dev)), false);
+                assert_eq!(r.risk, Denied, "{s}");
+                assert!(
+                    r.reason
+                        .unwrap()
+                        .contains("commits each statement on its own"),
+                    "{s}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn redshift_approval_names_workgroup_database_and_region() {
+        let f = rs(ResultsWithApproval, Environment::Prod);
+        let r = assess(&sql_on(None, "select 1"), Some(&f), false)
+            .reason
+            .unwrap();
+        assert!(
+            r.contains("'warehouse' (Redshift · analytics-wg · dev · eu-west-1)"),
+            "{r}"
+        );
+        let r = assess(&sql_on(Some("sales"), "delete from t"), Some(&f), false)
+            .reason
+            .unwrap();
+        assert!(
+            r.contains("Redshift · analytics-wg · sales · eu-west-1")
+                && r.contains("not this connection's default database 'dev'")
+                && r.starts_with("PRODUCTION connection 'warehouse'"),
+            "{r}"
+        );
+        let t = approval_target(&sql_on(Some(" sales "), "select 1"), &f).unwrap();
+        assert_eq!(t.engine, EngineKind::Redshift);
+        assert_eq!(
+            (t.database.as_deref(), t.default_database.as_deref()),
+            (Some("sales"), Some("dev"))
+        );
+        let t = approval_target(&sql_on(None, "select 1"), &f).unwrap();
+        assert_eq!(t.database.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn facts_carry_the_redshift_database_and_target() {
+        use crate::model::{AwsIdentity, AwsTarget, RedshiftAuth, RedshiftTarget};
+        let opts = RedshiftOptions {
+            target: RedshiftTarget::Provisioned {
+                cluster_identifier: "dw".into(),
+            },
+            database: "analytics".into(),
+            aws: AwsTarget {
+                identity: AwsIdentity::DefaultChain,
+                region: "us-east-1".into(),
+            },
+            auth: RedshiftAuth::IamIdentity,
+        };
+        let p = ConnectionProfile {
+            id: "r".into(),
+            name: "dw".into(),
+            engine: EngineKind::Redshift,
+            host: String::new(),
+            port: 0,
+            // A stale Postgres field is not the Redshift database.
+            database: Some("ignored".into()),
+            auth: crate::model::AuthMethod::None,
+            tls: Default::default(),
+            tunnel: None,
+            environment: Environment::Dev,
+            ai_data_access: Results,
+            color: None,
+            pg: Default::default(),
+            valkey: Default::default(),
+            created_at: None,
+            updated_at: None,
+            iceberg: None,
+            redshift: Some(opts.clone()),
+        };
+        let f = ProfileFacts::from(&p);
+        assert_eq!(f.database.as_deref(), Some("analytics"));
+        assert_eq!(f.redshift, Some(opts));
+        let mut pg = p.clone();
+        pg.engine = EngineKind::Postgres;
+        assert_eq!(ProfileFacts::from(&pg).redshift, None);
     }
 }

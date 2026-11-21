@@ -174,6 +174,33 @@ ConnectionManager ──iceberg(profile)──► IcebergHandle (single-flight, 
   - Under `schemaOnly`, engine errors collapse to a fixed sentence, because DataFusion cast errors echo values.
 - **Catalog DB migration.** A SQL catalog lacking `iceberg_type` is migrated automatically only on `dev` profiles; otherwise the connection fails with the exact `ALTER TABLE`.
 
+## 7b. Amazon Redshift (Data API, IAM)
+
+```text
+ConnectionManager ──redshift(profile)──► RedshiftEngine (single-flight, cached by profile fingerprint; no socket, no tunnel)
+                                          └── aws-sdk-redshiftdata client, SigV4 with the profile's AwsTarget
+                                              ExecuteStatement(ClientToken) → DescribeStatement (100 ms → 1 s) → GetStatementResult pages
+                                              cancel / timeout → CancelStatement · browser: ListDatabases / ListSchemas / ListTables / DescribeTable
+```
+
+Design: `docs/REMOTE_ENGINES_AND_REDSHIFT.md` §3. No database password exists on the machine: auth is
+`iamIdentity` (the IAM identity is the database user), `dbUser` (temporary credentials for one user,
+provisioned only) or `secret` (a Secrets Manager ARN the Data API reads server-side).
+
+- **Validation** (`redshift/validate.rs`, via `cleartext::check_profile` on save and on use): cluster
+  identifier, workgroup, database, db user, region and secret ARN against AWS's documented rules, so
+  nothing unexpected is signed and sent. No endpoint override in the profile.
+- **Read-only.** No read-only session exists, so the pre-submit check is the enforcement: the
+  classifier must parse and class every statement read-only; Redshift `SHOW …` forms are admitted by a
+  narrow text check. Fails closed.
+- **No transactions.** Each statement commits on its own, so `BEGIN`/`COMMIT`/`ROLLBACK`/`START
+  TRANSACTION`/`END`/`ABORT` (and savepoints) are refused in every mode with that reason.
+- **Bounds.** `max_rows` with `truncated`, `MAX_CELL_BYTES` markers, `PAGE_BYTE_BUDGET` page cuts,
+  error text at 4 KiB, listings at a fixed page count.
+- **Agent.** Postgres `aiDataAccess` semantics; the approval reason names
+  `Redshift · {cluster or workgroup} · {database} · {region}`; the run_sql database is pinned once as
+  for Postgres; agent timeout 120 s.
+
 ## 8. Known limitations (V1), stated plainly
 
 * **Valkey cluster mode through an SSH tunnel doesn't work.** Cluster redirects (`MOVED`) point at node IPs the tunnel doesn't forward. ElastiCache Serverless behaves the same way. Workaround: run VibeLens where the VPC is routable (VPN/Direct Connect), or use a non-cluster replica.
@@ -188,6 +215,7 @@ ConnectionManager ──iceberg(profile)──► IcebergHandle (single-flight, 
   * no scan statistics;
   * Lake Formation is not applied, because the engine reads S3 with the user's own credentials.
 * **Athena** is tested against a mock endpoint only. The header-row and `UpdateCount` handling rest on the documented API shape until test plan ICE-60 to ICE-65 runs on a real account.
+* **Redshift** is tested against a mock Data API only (RS-01 to RS-10 are manual). Results are limited to 100 MB per statement by the Data API, and there are no multi-statement transactions.
 * **Windows** compiles in CI but hasn't had a manual test pass.
 
 ## 9. Roadmap
