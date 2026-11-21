@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { blankCustom, configToSave, draftFrom, isCustomProvider, isDirty, parseTemperature, validateProvider } from "../providerDraft";
+import { blankCustom, configToSave, contextWindowError, draftFrom, isCustomProvider, isDirty, looksLikeOllama, parseTemperature, validateProvider } from "../providerDraft";
 
 describe("provider drafts", () => {
   const cfg = { ...blankCustom("custom-abc12345"), baseUrl: "http://localhost:11434/v1/", model: " m ", requiresApiKey: false };
@@ -36,5 +36,33 @@ describe("provider drafts", () => {
     expect(isDirty(k, cfg)).toBe(true);
     k.apiKey = { mode: "set", value: "" };
     expect(isDirty(k, cfg)).toBe(false);
+  });
+});
+
+describe("context window", () => {
+  const cfg = { ...blankCustom("custom-abc12345"), baseUrl: "http://localhost:11434/v1", maxTokens: 4096 };
+
+  it("is optional and saved as null when empty", () => {
+    expect(contextWindowError(cfg)).toBeUndefined();
+    expect(configToSave(draftFrom(cfg))?.contextWindow).toBeNull();
+    expect(configToSave(draftFrom({ ...cfg, contextWindow: 16384 }))?.contextWindow).toBe(16384);
+  });
+  it("mirrors the Rust bounds and must exceed the output limit", () => {
+    expect(contextWindowError({ ...cfg, contextWindow: 512 })).toMatch(/1,024/);
+    expect(contextWindowError({ ...cfg, contextWindow: 20_000_000 })).toMatch(/10,000,000/);
+    expect(contextWindowError({ ...cfg, contextWindow: 4096.5 })).toMatch(/whole number/);
+    expect(contextWindowError({ ...cfg, contextWindow: Number.NaN })).toMatch(/whole number/);
+    expect(contextWindowError({ ...cfg, contextWindow: 4096 })).toMatch(/larger than max output tokens/);
+    expect(contextWindowError({ ...cfg, contextWindow: 4097 })).toBeUndefined();
+    expect(Object.keys(validateProvider(draftFrom({ ...cfg, contextWindow: 100 })))).toEqual(["contextWindow"]);
+  });
+  it("recognises Ollama for the settings hint", () => {
+    expect(looksLikeOllama({ id: "ollama", baseUrl: "" })).toBe(true);
+    expect(looksLikeOllama(cfg)).toBe(true);
+    expect(looksLikeOllama({ id: "custom-x", baseUrl: "https://api.x.ai/v1" })).toBe(false);
+    expect(looksLikeOllama({ id: "custom-x", baseUrl: "not a url" })).toBe(false);
+  });
+  it("counts a changed window as an edit", () => {
+    expect(isDirty(draftFrom({ ...cfg, contextWindow: 8192 }), cfg)).toBe(true);
   });
 });

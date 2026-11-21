@@ -10,7 +10,21 @@ import { Badge, Button, ConfirmDialog, ErrorBox, Input } from "../ui";
 import { FormField, NumberField, SegmentedControl, Switch, invalidRing } from "../ui/formKit";
 import { secretArg } from "../connections/draft";
 import { SecretField } from "../connections/SecretField";
-import { PORTKEY_BASE_URL, configToSave, defaultPortkey, draftFrom, isCustomProvider, isDirty, routingValue, validateProvider, withRoutingValue, type ProviderDraft } from "./providerDraft";
+import {
+  MAX_CONTEXT_WINDOW,
+  MIN_CONTEXT_WINDOW,
+  PORTKEY_BASE_URL,
+  configToSave,
+  defaultPortkey,
+  draftFrom,
+  isCustomProvider,
+  isDirty,
+  looksLikeOllama,
+  routingValue,
+  validateProvider,
+  withRoutingValue,
+  type ProviderDraft,
+} from "./providerDraft";
 
 const KIND_LABEL: Record<ProviderKind, string> = { anthropic: "Anthropic", openAiCompatible: "OpenAI-compatible", portkey: "Portkey" };
 
@@ -204,6 +218,28 @@ export function ProviderCard({
           <div className="grid gap-3 sm:grid-cols-2">
             <FormField label="Max output tokens" htmlFor={`${uid}-mt`} error={e("maxTokens")}>
               <NumberField id={`${uid}-mt`} value={c.maxTokens} min={1} invalid={!!e("maxTokens")} onChange={(v) => set({ maxTokens: v ?? Number.NaN })} />
+            </FormField>
+            <FormField
+              label="Context window (tokens)"
+              htmlFor={`${uid}-cw`}
+              optional
+              error={e("contextWindow")}
+              hint={
+                looksLikeOllama(c)
+                  ? "Ollama's own context length must be at least this, or it silently drops the start of the conversation: set OLLAMA_CONTEXT_LENGTH for the server, or num_ctx for the model."
+                  : "For models with a small window, such as local ones: the conversation sent each turn is cut to fit. Empty: no limit."
+              }
+            >
+              <NumberField
+                id={`${uid}-cw`}
+                value={c.contextWindow ?? null}
+                min={MIN_CONTEXT_WINDOW}
+                max={MAX_CONTEXT_WINDOW}
+                allowEmpty
+                placeholder="Not set"
+                invalid={!!e("contextWindow")}
+                onChange={(v) => set({ contextWindow: v })}
+              />
             </FormField>
             <FormField label="Temperature" htmlFor={`${uid}-temp`} optional error={e("temperature")} hint="0 to 2. Empty uses the provider's default.">
               <Input

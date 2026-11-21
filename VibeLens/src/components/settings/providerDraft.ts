@@ -33,6 +33,7 @@ export function blankPortkey(id: string): ProviderConfig {
     extraHeaders: {},
     requiresApiKey: true,
     portkey: defaultPortkey(),
+    contextWindow: null,
   };
 }
 
@@ -104,10 +105,33 @@ export function blankCustom(id: string): ProviderConfig {
     temperature: null,
     extraHeaders: {},
     requiresApiKey: true,
+    contextWindow: null,
   };
 }
 
-export type ProviderErrors = Partial<Record<"label" | "baseUrl" | "maxTokens" | "temperature" | "portkey", string>>;
+export type ProviderErrors = Partial<Record<"label" | "baseUrl" | "maxTokens" | "contextWindow" | "temperature" | "portkey", string>>;
+
+/** Mirrors the context window bounds in `store::validate` (vibelens-core). */
+export const MIN_CONTEXT_WINDOW = 1024;
+export const MAX_CONTEXT_WINDOW = 10_000_000;
+
+/** True for the built-in Ollama provider or anything pointed at Ollama's default port. */
+export function looksLikeOllama(c: Pick<ProviderConfig, "id" | "baseUrl">): boolean {
+  if (c.id === "ollama") return true;
+  try {
+    return new URL(c.baseUrl.trim()).port === "11434";
+  } catch {
+    return false;
+  }
+}
+
+export function contextWindowError(c: Pick<ProviderConfig, "contextWindow" | "maxTokens">): string | undefined {
+  const w = c.contextWindow;
+  if (w == null) return undefined;
+  if (!Number.isInteger(w) || w < MIN_CONTEXT_WINDOW || w > MAX_CONTEXT_WINDOW) return "A whole number from 1,024 to 10,000,000, or leave empty.";
+  if (Number.isInteger(c.maxTokens) && w <= c.maxTokens) return "Must be larger than max output tokens: the window holds the prompt and the answer.";
+  return undefined;
+}
 
 export function parseTemperature(text: string): number | null | "invalid" {
   const t = text.trim();
@@ -128,6 +152,8 @@ export function validateProvider(d: ProviderDraft): ProviderErrors {
   }
   const mt = d.config.maxTokens;
   if (!Number.isInteger(mt) || mt < 1 || mt > 1_000_000) e.maxTokens = "A whole number from 1 to 1,000,000.";
+  const cw = contextWindowError(d.config);
+  if (cw) e.contextWindow = cw;
   if (parseTemperature(d.temperature) === "invalid") e.temperature = "A number from 0 to 2, or leave empty.";
   const pk = portkeyError(d.config);
   if (pk) e.portkey = pk;
@@ -143,6 +169,7 @@ export function configToSave(d: ProviderDraft): ProviderConfig | null {
     label: d.config.label.trim(),
     baseUrl: d.config.baseUrl.trim().replace(/\/+$/, ""),
     model: d.config.model.trim(),
+    contextWindow: d.config.contextWindow ?? null,
     temperature: temperature === "invalid" ? null : temperature,
   };
 }
