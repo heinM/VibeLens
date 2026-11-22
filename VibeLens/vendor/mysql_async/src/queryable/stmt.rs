@@ -323,12 +323,19 @@ impl crate::Conn {
     {
         let num = num.into();
         debug_assert!(num > 0);
-        let packets = self.read_packets(num).await?;
-        let defs = packets
-            .into_iter()
-            .map(|x| ParseBuf(&x).parse(()))
-            .collect::<std::result::Result<Vec<Column>, _>>()
-            .map_err(Error::from)?;
+        // VibeLens patch: each definition is one packet (up to max_allowed_packet), so 4096 of
+        // them could add up to hundreds of GiB. Real definitions are a few hundred bytes; their
+        // total is capped at MAX_COLUMN_DEFS_BYTES, checked as each one arrives.
+        let mut defs = Vec::with_capacity(num.min(crate::conn::MAX_COLUMNS));
+        let mut total = 0usize;
+        for _ in 0..num {
+            let packet = self.read_packet().await?;
+            total += packet.len();
+            if total > crate::conn::MAX_COLUMN_DEFS_BYTES {
+                return Err(DriverError::PacketTooLarge.into());
+            }
+            defs.push(ParseBuf(&packet).parse::<Column>(()).map_err(Error::from)?);
+        }
 
         if !self.has_capabilities(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
             self.read_packet().await?;

@@ -25,8 +25,12 @@ MySQL connections and changes the following, each marked `VibeLens patch` in the
      `DriverError::UnknownAuthPlugin`; a second switch returns `UnexpectedPacket` instead of
      `unreachable!`; the parsec `unwrap` returns `InvalidParsecSalt`.
    - `src/conn/routines/helpers.rs`, `handle_result_set`: a result header announcing 0 or more
-     than `MAX_COLUMNS` (4096, MySQL's own limit) columns is refused; `Conn::read_packets`
-     pre-allocates at most `MAX_COLUMNS` entries whatever count it is given.
+     than `MAX_COLUMNS` (4096, MySQL's own limit) columns is refused.
+   - `src/queryable/stmt.rs`, `read_column_defs`: definitions are read one at a time, the
+     pre-allocation is capped at `MAX_COLUMNS`, and all definitions of one result set together
+     may take at most `MAX_COLUMN_DEFS_BYTES` (16 MiB; each is one packet of up to
+     `max_allowed_packet`, so 4096 of them could otherwise reach hundreds of GiB). The now
+     unused `Conn::read_packets` is removed.
    Other `unwrap`/`expect`/`unreachable!` sites in the handshake, auth and result-header paths
    were reviewed: they are behind conditions the driver itself sets (TLS options present,
    prepared-statement metadata, settings queries VibeLens does not issue) or in tests.

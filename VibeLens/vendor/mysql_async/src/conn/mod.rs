@@ -62,6 +62,8 @@ const DEFAULT_WAIT_TIMEOUT: usize = 28800;
 /// VibeLens patch: most columns a result set may announce (MySQL's own table limit). A larger
 /// count from the server is refused before anything is allocated for it.
 pub(crate) const MAX_COLUMNS: usize = 4096;
+/// VibeLens patch: most bytes all column definitions of one result set may take together.
+pub(crate) const MAX_COLUMN_DEFS_BYTES: usize = 16 * 1024 * 1024;
 
 fn disconnect(mut conn: Conn) {
     let disconnected = conn.inner.disconnected;
@@ -932,15 +934,6 @@ impl Conn {
         }
     }
 
-    /// Returns future that reads packets from a server.
-    pub(crate) async fn read_packets(&mut self, n: usize) -> Result<Vec<PooledBuf>> {
-        // VibeLens patch: `n` can come from the server; do not pre-allocate on its word.
-        let mut packets = Vec::with_capacity(n.min(MAX_COLUMNS));
-        for _ in 0..n {
-            packets.push(self.read_packet().await?);
-        }
-        Ok(packets)
-    }
 
     pub(crate) async fn write_packet(&mut self, data: PooledBuf) -> Result<()> {
         crate::io::WritePacket::new(&mut *self, data)
