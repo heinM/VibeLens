@@ -6,6 +6,12 @@ describe("isSsoExpired", () => {
     expect(isSsoExpired({ message: "SSO session expired — sign in again" })).toBe(true);
     expect(isSsoExpired("[auth] authentication failed: SSO session expired — sign in again")).toBe(true);
     expect(isSsoExpired({ message: "password authentication failed" })).toBe(false);
+    expect(isSsoExpired({ code: "auth", message: "authentication failed: SSO session expired — sign in again" })).toBe(true);
+    expect(isSsoExpired("authentication failed: SSO session expired — sign in again")).toBe(true);
+    // The same words from a database server are not the app's own error.
+    expect(isSsoExpired({ code: "database", message: "SSO session expired — sign in again" })).toBe(false);
+    expect(isSsoExpired("database error: ERROR: SSO session expired — sign in again")).toBe(false);
+    expect(isSsoExpired({ code: "auth", message: "role said: SSO session expired" })).toBe(false);
     expect(isSsoExpired(null)).toBe(false);
     expect(isSsoExpired("")).toBe(false);
   });

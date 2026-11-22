@@ -231,7 +231,16 @@ impl WorkspaceFs {
         if !link_meta.is_file() {
             return Err(invalid("not a regular file".into()));
         }
-        let file = fs::File::open(src)?;
+        // The entry could be swapped between the check above and this open, so the open itself
+        // refuses a symbolic link and never blocks on a FIFO; the checks below see what was opened.
+        let mut open = fs::OpenOptions::new();
+        open.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = open.open(src)?;
         let meta = file.metadata()?;
         if !meta.is_file() {
             return Err(invalid("not a regular file".into()));

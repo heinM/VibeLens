@@ -2,10 +2,16 @@
 // connection uses, so the navigator can offer "Sign in again" next to the error.
 import type { AwsProfileSummary, SsoSessionInfo } from "../ipc/types";
 
-/** The text the backend uses (aws/sso.rs `SESSION_EXPIRED`), matched loosely on purpose. */
-export function isSsoExpired(error: { message: string } | string | null | undefined): boolean {
-  const text = typeof error === "string" ? error : error?.message;
-  return !!text && /sso session expired/i.test(text);
+/**
+ * True for the backend's own expired-session error (`CoreError::Auth` with the text from
+ * aws/sso.rs `SESSION_EXPIRED`). The same words inside another kind of error, such as text a
+ * database server sent back, do not count: a server must not be able to raise a sign-in prompt.
+ */
+export function isSsoExpired(error: { code?: string; message: string } | string | null | undefined): boolean {
+  if (!error) return false;
+  if (typeof error === "string") return /^(\[auth\]\s*)?authentication failed: sso session expired/i.test(error.trim());
+  if (error.code !== undefined && error.code !== "auth") return false;
+  return /^(authentication failed: )?sso session expired/i.test(error.message.trim());
 }
 
 export interface SsoLogin {

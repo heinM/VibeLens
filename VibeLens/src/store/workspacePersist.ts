@@ -52,6 +52,9 @@ export function toPersisted(tabs: readonly WorkspaceTab[], activeTabId: string |
   const out: PersistedTab[] = [];
   for (const t of tabs.slice(0, MAX_PERSISTED_TABS)) {
     const tooBig = utf8Exceeds(t.contents, MAX_PERSISTED_TEXT_BYTES);
+    // A saved file with no unsaved edits is read from the workspace again on restore, so its
+    // text is not copied into localStorage: only unsaved work is kept there.
+    const onDisk = !!t.path && !t.dirty;
     out.push({
       id: t.id,
       kind: t.kind,
@@ -60,7 +63,7 @@ export function toPersisted(tabs: readonly WorkspaceTab[], activeTabId: string |
       database: t.database,
       valkeyDb: t.valkeyDb,
       path: t.path,
-      contents: tooBig ? "" : t.contents,
+      contents: tooBig || onDisk ? "" : t.contents,
       dirty: tooBig ? false : t.dirty,
       objectRef: t.objectRef,
     });

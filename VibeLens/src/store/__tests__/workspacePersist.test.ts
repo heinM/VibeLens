@@ -43,7 +43,8 @@ describe("persisted workspace round trip", () => {
     const back = roundTrip(tabs, "b");
     expect(back.activeTabId).toBe("b");
     expect(back.tabs.map((t) => t.id)).toEqual(["a", "b", "c"]);
-    expect(back.tabs.map(toWorkspaceTab)).toEqual(tabs.map((t) => ({ ...t, selectedText: null })));
+    // A saved file without unsaved edits is restored from the workspace, not from storage.
+    expect(back.tabs.map(toWorkspaceTab)).toEqual(tabs.map((t) => ({ ...t, selectedText: null, contents: t.id === "a" ? "" : t.contents })));
   });
 
   it("never writes selection, results, errors or run state", () => {

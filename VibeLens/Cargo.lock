@@ -10107,6 +10107,7 @@ dependencies = [
  "iceberg-datafusion",
  "iceberg-storage-opendal",
  "keyring-core",
+ "libc",
  "mysql_async",
  "quick-xml 0.42.0",
  "redis",

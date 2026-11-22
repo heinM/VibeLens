@@ -105,13 +105,21 @@ describe("workspace store persistence", () => {
     expect(b.useWorkspaceStore.getState().tabs[0].contents).toBe("from file");
   });
 
-  it("keeps the restored text when the file cannot be read", async () => {
+  it("does not copy a saved file's text into storage: it comes back from the file, or empty", async () => {
     const a = await freshStore();
     a.useWorkspaceStore.getState().openTab({ kind: "sql", path: "gone.sql", contents: "kept", dirty: false });
     a.workspaceStorage.flush();
     const b = await freshStore();
     b.api.wsRead.mockRejectedValue(new Error("not found"));
     await b.useWorkspaceStore.getState().refreshFileTabs();
-    expect(b.useWorkspaceStore.getState().tabs[0].contents).toBe("kept");
+    expect(b.useWorkspaceStore.getState().tabs[0]).toMatchObject({ path: "gone.sql", contents: "", dirty: false });
+  });
+
+  it("keeps unsaved edits to a file", async () => {
+    const a = await freshStore();
+    a.useWorkspaceStore.getState().openTab({ kind: "sql", path: "wip.sql", contents: "unsaved", dirty: true });
+    a.workspaceStorage.flush();
+    const b = await freshStore();
+    expect(b.useWorkspaceStore.getState().tabs[0]).toMatchObject({ contents: "unsaved", dirty: true });
   });
 });

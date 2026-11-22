@@ -170,11 +170,12 @@ impl PgHandle {
 
         let rows = query(
             &c,
-            "SELECT c.oid, cn.nspname::text, c.relname::text, COALESCE(pg_get_expr(c.relpartbound, c.oid), ''), c.relkind = 'p' \
+            "SELECT c.oid, cn.nspname::text, c.relname::text, left(COALESCE(pg_get_expr(c.relpartbound, c.oid), ''), 2000), c.relkind = 'p' \
              FROM pg_inherits i \
              JOIN pg_class c ON c.oid = i.inhrelid \
              JOIN pg_namespace cn ON cn.oid = c.relnamespace \
-             WHERE i.inhparent = $1 AND c.relispartition",
+             WHERE i.inhparent = $1 AND c.relispartition \
+             LIMIT 20001",
             &[&parent_oid],
         )
         .await?;
@@ -188,6 +189,8 @@ impl PgHandle {
                 get::<bool>(r, 4)?,
             ));
         }
+        // The query is bounded on the server (rows, and the length of each bound), so a table
+        // with an absurd partition count or huge LIST bounds cannot exhaust memory here.
         // The server cannot order bounds as text sensibly (`FROM (10)` sorts before `FROM (9)`),
         // so order here, then cap, then ask for sizes of the kept partitions only.
         heads.sort_by(|a, b| {
