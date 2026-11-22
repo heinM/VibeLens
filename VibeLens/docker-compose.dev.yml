@@ -4,7 +4,8 @@
 #   scripts/seed/valkey-seed.sh | docker compose -f docker-compose.dev.yml exec -T valkey valkey-cli
 #   export VG_TEST_PG="host=127.0.0.1 port=55432 user=postgres password=vibelens dbname=vibelens_test"
 #   export VG_TEST_VALKEY=redis://127.0.0.1:56379
-#   export VG_TEST_REQUIRE=pg,valkey   # optional: a test that would skip for lack of one of these fails
+#   export VG_TEST_MYSQL="host=127.0.0.1 port=53306 user=root password=vibelens dbname=shop"
+#   export VG_TEST_REQUIRE=pg,valkey,mysql   # optional: a test that would skip for lack of one of these fails
 #   cargo test -p vibelens-core
 services:
   postgres:
@@ -22,6 +23,23 @@ services:
   valkey:
     image: valkey/valkey:8
     ports: ["127.0.0.1:56379:6379"]
+  # MySQL 8.4 LTS with a demo `shop` database (scripts/seed/mysql-shop.sql, first start only).
+  # VibeLens connection: MySQL, host 127.0.0.1, port 53306, database shop, user vibelens /
+  # vibelens (or vibelens_ro / vibelens, SELECT only, for agent use). TLS "Require": the image
+  # generates a self-signed certificate, and caching_sha2_password sends the password only over
+  # TLS, so "Disable" fails the first login. Verify full needs a certificate for 127.0.0.1
+  # (docs/TEST_PLAN.md, MY-T1).
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: vibelens
+    ports: ["127.0.0.1:53306:3306"]
+    volumes:
+      - ./scripts/seed/mysql-shop.sql:/docker-entrypoint-initdb.d/01-shop.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -pvibelens --silent"]
+      interval: 2s
+      retries: 30
 
   # --- Apache Iceberg: REST catalog (official Apache test fixture) + S3-compatible storage ---
   # VibeLens connection: Iceberg → REST, URI http://localhost:8181, auth none,

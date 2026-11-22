@@ -368,3 +368,188 @@ Trino and Spark need no new command: they run through `ice_execute`.
 - UI: validation, draft and dispatch tests in Vitest.
 - Not covered by automation: a real Trino, Livy or Redshift. First use against the EKS cluster
   and a warehouse is a manual test (`docs/TEST_PLAN.md` gets the cases).
+
+---
+
+## 6. MySQL
+
+Status: implemented 2026-11-22 on `feat/mysql`. MySQL 8.x, Aurora MySQL and RDS MySQL; MariaDB
+may work but is not a goal. Code: `crates/vibelens-core/src/mysql/`, `src-tauri/src/commands/mysql.rs`,
+`vendor/mysql_async/` (patched driver), UI under `src/` (`mysqlForm.ts`, `MysqlTree.tsx`, the
+`mysql` dialect in `lib/sqlIntel`).
+
+### 6.1 Driver: `mysql_async`, vendored with a four-point patch
+
+Both candidates were read at their current versions (`mysql_async` 0.37.1 with `mysql_common`
+0.37.3; `sqlx-mysql` 0.8.6, the version already in `Cargo.lock`) against the requirements:
+
+| Requirement | `sqlx-mysql` 0.8.6 | `mysql_async` 0.37.1 |
+|---|---|---|
+| rustls only, no OpenSSL / native-tls | `tls-rustls` feature, but it is a feature of the whole `sqlx` crate, which the Iceberg SQL catalog also uses | `default-features = false` + `rustls-tls`, `aws-lc-rs`; `cargo tree -i openssl-sys` and `-i native-tls` are empty |
+| Custom root store, hostname verification, TLS name ≠ dialed address (SSH tunnel) | CA file path only; verifies the name it dials, so a tunnel to `127.0.0.1` cannot be verified as the real host | Root certificates as buffers, built-in roots can be switched off, `tls_hostname_override` |
+| Cleartext plugin only when wanted | Accepts `mysql_clear_password` when `enable_cleartext_plugin` | Same option |
+| No RSA public-key retrieval from an unverified server | Always retrieves the key without TLS; also pulls `rsa` 0.9 (RUSTSEC-2023-0071) into the build | Retrieves it without TLS too (own RSA code, no `rsa` crate) |
+| Multi-statements off | `CLIENT_MULTI_STATEMENTS` hard-coded | Hard-coded |
+| No server-initiated file reads | Does not advertise `CLIENT_LOCAL_FILES` | Advertises it; reads a file only if a handler is registered |
+
+Neither meets every point as published. `mysql_async` needs smaller changes, keeps TLS
+configurable enough for tunnels and custom CAs, and adds no RustSec advisory, so it is used,
+vendored in `vendor/mysql_async` the way `vendor/sqlx-sqlite` is (`[patch.crates-io]`). The
+upstream copy is its own commit; the patch is the next one and is listed in
+`vendor/mysql_async/PATCH.md`:
+
+1. `CLIENT_LOCAL_FILES` and `CLIENT_MULTI_STATEMENTS` are never advertised.
+2. A `LOCAL INFILE` request (0xFB) is never answered with a file: no handler is consulted, the
+   connection is closed.
+3. `caching_sha2_password` full authentication sends the password only over TLS; without TLS it
+   fails (`InsecureFullAuth`) instead of asking the server for an RSA key. A Unix socket no longer
+   counts as secure (VibeLens never uses one: `prefer_socket(false)`).
+4. An auth switch to `mysql_clear_password` is answered only when enabled *and* over TLS.
+
+### 6.2 Design
+
+- **Profile.** `EngineKind::Mysql` uses `host`, `port`, `database` (required: the default
+  database), `auth` (`password` or `rdsIam`), `tls` and `tunnel`, like Postgres.
+  `ConnectionProfile.mysql: MysqlOptions` holds `connectTimeoutSecs` (1–600), `statementTimeoutMs`,
+  `idleDisconnectSecs` and `maxPoolSize` (1–32). Rules in `mysql/validate.rs`, run on save and on
+  every connect and test (`cleartext::check_profile`).
+- **Connect.** One `deadpool` pool per (profile, database); `create()` resolves credentials per
+  physical connection (a fresh RDS IAM token each time, signed for the real host and port).
+  The SSH tunnel and its pinned host key are the Postgres ones; the driver dials the tunnel's
+  local port and verifies TLS against the profile's host. Driver options: `prefer_socket(false)`
+  (otherwise the driver switches to the Unix socket the *server* names, which through a tunnel
+  would be a socket of a server on this machine), `max_allowed_packet` fixed at 64 MiB (never
+  taken from the server), `secure_auth`, statement cache off.
+- **Pool hygiene.** A run that ends cleanly returns its connection after `COM_RESET_CONNECTION`
+  (rolls back, drops temporary tables, releases table locks and `GET_LOCK`s, resets session and
+  user variables) and `USE` of the pool's database, which the reset does not restore. Every other
+  ending closes the connection.
+- **Execution.** Scripts are split on the client (`mysql/check.rs`, a lexer that follows
+  `sql_lex.cc`: `#` and `-- ` comments ending at `\n` only, `--` without a following space is not a
+  comment, block comments do not nest, `/*! */` and `/*+ */` are recognised, backslash escapes,
+  backticks, `BEGIN … END` bodies of `CREATE PROCEDURE/FUNCTION/TRIGGER/EVENT` kept whole).
+  `DELIMITER` is refused with advice. Each statement is one `COM_QUERY` (text protocol); rows
+  stream into `QueryEvent::Rows` pages. A script that leaves a transaction open is rolled back
+  with a message.
+- **Catalog.** `information_schema` only; names are sent as `CONVERT(X'…' USING utf8mb4)` hex
+  literals, which no `sql_mode` reads differently, so a database or table name cannot change the
+  query. Listings are bounded (10 000 databases, 20 000 objects, 200 000 detail rows, 60 s).
+- **Values.** BIGINT and DECIMAL → strings; other integers and finite floats → numbers; BIT →
+  binary digits; JSON → parsed (text when it does not parse or nests deeper than 128); dates as
+  sent (`0000-00-00` included); binary strings, BLOB, GEOMETRY, VECTOR and text that is not
+  UTF-8 → `{"$bytes"}`; over 1 MiB → `$truncated`.
+- **Commands.** `my_list_databases`, `my_list_objects`, `my_describe_table`,
+  `my_schema_metadata`, `my_execute` (cancel with `pg_cancel`); `sql_classify` takes an optional
+  `engine`. Capabilities are unchanged.
+
+### 6.3 The security rules
+
+- **R1 (vault only, bound to its endpoint).** The password is in the vault (`profile:{id}:password`)
+  and, for MySQL, stored with its origin (`profile:{id}:password-origin`: host, port, user, TLS
+  mode, CA path and SHA-256 of its contents, RDS bundle switch, SSH tunnel endpoint) in the order
+  unbind, write, bind. The credential source hands it out only while the profile's origin is the
+  same (`mysql::secret::load_password`), so a hand-edited `profiles.json` or a direct
+  `test_connection` cannot send it elsewhere; saving a profile that points elsewhere without a
+  new password deletes it. RDS IAM tokens are minted per connection and never stored. Errors
+  carry no password (`map_error` never formats options).
+- **R2 (no secret in cleartext to another machine).** Stricter than Postgres: a password to any
+  host other than `localhost`, `127.0.0.0/8` or `::1`, or through any SSH tunnel, needs
+  `verifyFull`; an RDS IAM token needs `verifyFull` always. Checked in Rust on save and before
+  the tunnel or any credential is touched. Below that, the patched driver sends no password and
+  no cleartext-plugin answer without TLS, whatever the server asks.
+- **R3 (only the configured endpoint, no redirects).** The protocol has no redirects; the
+  driver never follows a server-named Unix socket (`prefer_socket(false)`).
+- **R4 (TLS verified).** `verifyFull` uses OS roots, the bundled RDS CA bundle when switched on,
+  and the profile's CA file, with the driver's own Mozilla roots off, and verifies the profile's
+  host name even through a tunnel. `require` (encrypt without verification) remains for this
+  machine only when a credential is sent, with the UI warning, as for Postgres.
+- **R5 (read-only before submission, fail closed).** Every statement of a read-only run (agent
+  reads, and editor runs in read-only mode) must pass `mysql::check_read_only` before it is sent:
+  first keyword `SELECT`, `WITH`, `TABLE`, `VALUES`, `SHOW`, `DESCRIBE`/`DESC` or `EXPLAIN`; lexing
+  must give the same tokens with and without backslash escapes (so `NO_BACKSLASH_ESCAPES` and
+  `ANSI_QUOTES` cannot change the meaning); no executable comment, hint, `:=`, `;`, backslash or
+  non-ASCII outside quotes, control character, or `\r` inside a line comment; no `INTO`,
+  `OUTFILE`, `DUMPFILE`, `FOR UPDATE/SHARE/CONNECTION`, `LOCK`, `SET` (except `CHARACTER SET`),
+  `HANDLER`, `DO`, `CALL`, `LOAD`, `KILL`, `USE` (except index hints) or any other write,
+  session or administration keyword as a bare word; `SHOW CREATE USER` refused (password
+  hashes); and every function call must be a MySQL built-in on the read-only allow-list
+  (schema-qualified or backtick-quoted calls are stored or loadable functions and are refused).
+  Then the run is inside `START TRANSACTION READ ONLY`; after every statement the server's status
+  flags must still say "in a read-only transaction", otherwise the run stops and the session is
+  closed.
+- **R6 (bounded).** `max_rows` with `truncated` (a cut read-only result kills the statement and
+  closes the connection; the rest of the script is not run), `MAX_CELL_BYTES`,
+  `PAGE_BYTE_BUDGET`, one packet (row) at most 64 MiB, server error text at 4 KiB, catalog
+  listings capped.
+- **R7 (agent sees what `AiDataAccess` allows; card shows the target).** The Postgres matrix
+  with MySQL's classifier. The database is resolved once with `effective_database` and pinned
+  for execution; the card's detail line is `MySQL · host:port · as user [· via SSH host:port]`
+  from the profile. Refused at every access level, even with approval
+  (`mysql::agent_refusal`): `INTO OUTFILE/DUMPFILE`, `LOAD DATA/XML`, `LOAD_FILE()`,
+  `SET GLOBAL/PERSIST`, `KILL`, `SHUTDOWN`, `RESTART`, `CLONE`, `INSTALL/UNINSTALL`, anything
+  with `SONAME`, `USE`, `DELIMITER`, and executable comments (the card would not read as what
+  runs). Database errors under a withholding policy collapse to `SQLSTATE` + a fixed sentence
+  (the message carries `SQLSTATE xxxxx`).
+- **R8 (cancel and timeout stop the server).** Cancel, a timeout, a dropped run (agent tool
+  timeout, aborted task) and a closed result channel send `KILL QUERY <id>` from a separate,
+  freshly authenticated connection, then close the connection. The per-statement timeout is
+  enforced on the client for every statement and by `max_execution_time` on the server for
+  `SELECT`s. Agent SQL keeps the 30 s statement and 150 s script budgets.
+- **R9 (validation in Rust; enums refused, not defaulted).** All rules above are in Rust;
+  `engine: "mysql"` with another auth kind, a missing database or out-of-range options is
+  refused on save and on use. The UI repeats them for convenience.
+
+### 6.4 MySQL threats and the tests that use the hostile input
+
+| Threat | Closed by | Test |
+|---|---|---|
+| Server reads a local file (`LOCAL INFILE`) | Capability not advertised; request never answered, connection closed (driver patch 1, 2) | `mysql_hostile::a_local_infile_request_gets_no_file` (fake server requests a secret file), `::the_client_takes_up_neither_local_files_nor_multi_statements`, `mysql_engine::load_data_local_is_refused_even_when_the_server_allows_it` (server `local_infile=ON`) |
+| Auth downgrade: RSA key retrieval, cleartext, native hash over an unverified channel | Patch 3, 4; `verifyFull` required for remote passwords and IAM | `mysql_hostile::no_password_and_no_rsa_key_request_without_tls`, `::no_cleartext_password_without_tls_even_when_enabled`, `mysql_engine::full_authentication_never_happens_without_tls`, `mysql::validate` tests, `mysql_engine::manager::an_unsafe_profile_is_refused_before_connecting` |
+| Read-only bypasses (`INTO OUTFILE`, `LOAD_FILE`, `SET GLOBAL`, `KILL`, `HANDLER`, `DO`, `CALL`, `:=`, `GET_LOCK`, `SLEEP`/`BENCHMARK`, UDFs, `/*! */`, `/*+ */`, backslash tricks, `#`/`--` lexing, `DELIMITER`) | `check_read_only` + `START TRANSACTION READ ONLY` + status check | `mysql::check::tests::hostile_reads_are_refused` (60+ inputs), `mysql_engine::read_only_runs_refuse_before_sending_and_inside_the_transaction`, `mysql::exec::tests::the_transaction_and_the_after_statement_check_hold_without_the_text_check`, agent `policy::tests::mysql_reads_with_side_effects_are_not_safe` |
+| One approved statement smuggles a second | Client split; `CLIENT_MULTI_STATEMENTS` off (patch 1) | `mysql::exec::tests::the_server_runs_no_second_statement_in_one_query` (`SELECT 1; DROP TABLE …` in one COM_QUERY: 1064, table still there) |
+| A stopped agent turn leaves a query running | `KILL QUERY` on cancel, timeout, drop | `mysql_engine::cancel_stops_the_statement_on_the_server`, `::a_timeout_stops_any_statement_on_the_server` (SELECT and DO), `::a_dropped_run_kills_its_statement`, `::manager::the_agent_backend_runs_pinned_reads_and_stops_on_cancel` (all check `PROCESSLIST`) |
+| Unbounded results | Row cap while streaming, cell and page caps, 64 MiB packets | `mysql_engine::rows_are_capped_while_streaming`, `::odd_values_map_without_loss_or_panic` (1.1 MB cell) |
+| Hostile or odd values | `mysql/cells.rs` (no panics, no lossy text) | `mysql::cells` tests (zero dates, invalid UTF-8, BIT, huge DECIMAL, deep JSON, binary), `mysql_hostile::hostile_rows_are_mapped_or_refused_without_panicking` (invalid UTF-8, 9-byte BIT, row lying about its length), `::an_unknown_column_type_is_an_error_not_a_panic`, `mysql_engine::odd_values_map_without_loss_or_panic` |
+
+Removing patch 1, 3 or 4 makes the corresponding `mysql_hostile` tests fail (checked by reverting
+them locally).
+
+### 6.5 Residual risks
+
+- **Functions inside views and the read-only transaction.** The text check sees the statement,
+  not what it reaches. A read-only `SELECT` from an existing view (or a generated column) whose
+  definition calls a stored function, or a loadable function (UDF) installed on the server,
+  still runs that function. `START TRANSACTION READ ONLY` stops its table writes, but not what
+  a UDF does outside the database (`sys_exec`-style), nor `GET_LOCK`, `SLEEP` or user-variable
+  assignments inside a stored function. The role used with the agent should have no `EXECUTE`
+  and the server no untrusted UDFs (the seed's `vibelens_ro` user shows the shape). This is the
+  MySQL form of the Redshift Lambda UDF caveat.
+- **What a read may read.** `SELECT authentication_string FROM mysql.user`,
+  `performance_schema` statement history, `SHOW PROCESSLIST` and binary-log reads are reads;
+  only privileges stop them. A least-privilege role is the boundary, as for Postgres.
+- **Passwords to this machine without TLS.** Allowed (for local development); full
+  authentication then fails by design until a TLS login has filled the server's cache.
+- **The bastion-to-database hop.** With a tunnel `verifyFull` is still required (every MySQL
+  login carries a credential), so the hop from the bastion to the database is encrypted and
+  verified too. This is stricter than Postgres, where a password may cross it in the clear.
+- **`require` (no verification) on this machine** is accepted, as on Postgres.
+- **Lexer drift.** The checker follows MySQL 8.0/8.4's lexer; a future server version that
+  lexes differently could disagree. Multi-statements being off limits the damage to the
+  statement itself, and the read-only transaction and status check still apply.
+- **The vendored driver** must be refreshed by hand for upstream fixes (its `PATCH.md` says how).
+- **Not tested against a live server:** Aurora MySQL, RDS IAM end to end (token signing is
+  tested offline), MariaDB, the SSH tunnel path for MySQL (shared code, tested with Postgres and
+  Valkey). See `docs/TEST_PLAN.md` §11c.
+
+### 6.6 Testing
+
+- Unit: lexer, classifier and refusals, splitter, value mapping, validation, password binding,
+  driver options, policy and approval text.
+- Hostile server: `tests/mysql_hostile.rs`, an in-process fake speaking the protocol; runs
+  everywhere.
+- Live: `tests/mysql_engine.rs` and the database-backed tests in `mysql::exec`, gated by
+  `VG_TEST_MYSQL="host=… port=… user=… password=… dbname=…"` (service `mysql` in
+  `VG_TEST_REQUIRE`); the verified-TLS test also needs `VG_TEST_MYSQL_CA` (service `mysql-tls`).
+  `docker-compose.dev.yml` has a `mysql` service (8.4, `127.0.0.1:53306`) seeded from
+  `scripts/seed/mysql-shop.sql`.
+- UI: Vitest for the form rules, tree model, dialect, splitter and dispatch.
