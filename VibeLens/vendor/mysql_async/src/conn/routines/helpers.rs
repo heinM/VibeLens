@@ -108,6 +108,13 @@ impl Conn {
         P: Protocol,
     {
         let column_count = packet.read_lenenc_int()?;
+        // VibeLens patch: the count comes from the server; cap it before it sizes anything.
+        if column_count == 0 || column_count > crate::conn::MAX_COLUMNS as u64 {
+            return Err(crate::DriverError::UnexpectedPacket {
+                payload: Vec::new(),
+            }
+            .into());
+        }
         // Reading 1st byte only if metadata skip is not possible, otherwise it can be a part of the first column definition.
         // Reading column metadata only if it is not skipped - if skip is not possible or if metadata is present.
         let meta = if !(P::metadata_skip_possible(self) && packet.first() == Some(&0x00)) {

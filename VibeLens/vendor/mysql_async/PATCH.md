@@ -1,6 +1,6 @@
 This is the upstream `mysql_async` 0.37.1 crate (crates.io sources; the `[[test]]` targets
 that point at files not shipped here are removed from `Cargo.toml`). VibeLens uses it for
-MySQL connections and changes four things, each marked `VibeLens patch` in the source:
+MySQL connections and changes the following, each marked `VibeLens patch` in the source:
 
 1. `src/opts/mod.rs`, `Opts::get_capabilities`: `CLIENT_LOCAL_FILES` and
    `CLIENT_MULTI_STATEMENTS` are no longer advertised. The server then refuses
@@ -18,11 +18,23 @@ MySQL connections and changes four things, each marked `VibeLens patch` in the s
    the new `DriverError::InsecureFullAuth`; nothing is sent.
 4. `src/conn/mod.rs`, `perform_auth_switch`: an auth switch to `mysql_clear_password` is
    answered only when the caller enabled the plugin *and* the connection is encrypted.
+5. No server bytes can abort the process (release builds use `panic = "abort"`):
+   - `perform_auth_switch`: a switch to `client_ed25519` (which, without the crate's
+     `client_ed25519` feature, reaches an unconditional panic in `mysql_common`'s scramble) or
+     to MariaDB `parsec` (an `unwrap` in `continue_parsec_auth`) fails with
+     `DriverError::UnknownAuthPlugin`; a second switch returns `UnexpectedPacket` instead of
+     `unreachable!`; the parsec `unwrap` returns `InvalidParsecSalt`.
+   - `src/conn/routines/helpers.rs`, `handle_result_set`: a result header announcing 0 or more
+     than `MAX_COLUMNS` (4096, MySQL's own limit) columns is refused; `Conn::read_packets`
+     pre-allocates at most `MAX_COLUMNS` entries whatever count it is given.
+   Other `unwrap`/`expect`/`unreachable!` sites in the handshake, auth and result-header paths
+   were reviewed: they are behind conditions the driver itself sets (TLS options present,
+   prepared-statement metadata, settings queries VibeLens does not issue) or in tests.
 
 VibeLens adds its own checks on top (TLS required for passwords to other machines, the
 cleartext plugin enabled only for RDS IAM tokens over verified TLS); see
 `crates/vibelens-core/src/mysql/` and `docs/REMOTE_ENGINES_AND_REDSHIFT.md`, section "MySQL".
-Drop this copy only for an upstream release that offers all four as options.
+Drop this copy only for an upstream release that offers all of these.
 
 Helpers left unused by (2) and (3) are removed so the crate builds without warnings:
 `Conn::is_socket`, `Conn::write_bytes` (`src/conn/mod.rs`) and `Stream::is_socket`

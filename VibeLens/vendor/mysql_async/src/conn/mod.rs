@@ -59,6 +59,10 @@ pub mod stmt_cache;
 const DEFAULT_WAIT_TIMEOUT: usize = 28800;
 
 /// Helper that asynchronously disconnects the given connection on the default tokio executor.
+/// VibeLens patch: most columns a result set may announce (MySQL's own table limit). A larger
+/// count from the server is refused before anything is allocated for it.
+pub(crate) const MAX_COLUMNS: usize = 4096;
+
 fn disconnect(mut conn: Conn) {
     let disconnected = conn.inner.disconnected;
 
@@ -653,9 +657,22 @@ impl Conn {
                         return Err(DriverError::CleartextPluginDisabled.into());
                     }
                 }
-                x @ AuthPlugin::Ed25519 => x.gen_data(self.inner.opts.pass(), &self.inner.nonce),
-                // For parsec at this point we need to send an empty packet first
-                _x @ AuthPlugin::MariadbParsec { .. } => None,
+                // VibeLens patch: MariaDB's client_ed25519 and parsec are refused. Without the
+                // `client_ed25519` feature the first reaches an unconditional panic in
+                // mysql_common, the second an `unwrap`; either would let a server abort the
+                // process. See vendor/mysql_async/PATCH.md.
+                AuthPlugin::Ed25519 => {
+                    return Err(DriverError::UnknownAuthPlugin {
+                        name: "client_ed25519".into(),
+                    }
+                    .into());
+                }
+                AuthPlugin::MariadbParsec { .. } => {
+                    return Err(DriverError::UnknownAuthPlugin {
+                        name: "parsec".into(),
+                    }
+                    .into());
+                }
                 x @ AuthPlugin::Other(_) => x.gen_data(self.inner.opts.pass(), &self.inner.nonce),
             };
 
@@ -669,7 +686,11 @@ impl Conn {
 
             Ok(())
         } else {
-            unreachable!("auth_switched flag should be checked by caller")
+            // VibeLens patch: a second auth switch is an error, not a panic.
+            Err(DriverError::UnexpectedPacket {
+                payload: vec![0xFE],
+            }
+            .into())
         }
     }
 
@@ -763,7 +784,7 @@ impl Conn {
                 .inner
                 .auth_plugin
                 .gen_data(self.inner.opts.pass(), &self.inner.nonce)
-                .unwrap();
+                .ok_or(DriverError::InvalidParsecSalt)?;
 
             self.write_struct(&plugin_data.into_owned()).await?;
             // After client response, server will send either ok or error.
@@ -913,7 +934,8 @@ impl Conn {
 
     /// Returns future that reads packets from a server.
     pub(crate) async fn read_packets(&mut self, n: usize) -> Result<Vec<PooledBuf>> {
-        let mut packets = Vec::with_capacity(n);
+        // VibeLens patch: `n` can come from the server; do not pre-allocate on its word.
+        let mut packets = Vec::with_capacity(n.min(MAX_COLUMNS));
         for _ in 0..n {
             packets.push(self.read_packet().await?);
         }
