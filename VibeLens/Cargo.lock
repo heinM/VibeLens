@@ -10264,7 +10264,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vibelens"
-version = "0.2.0-1"
+version = "0.2.0-2"
 dependencies = [
  "dirs",
  "secrecy",
@@ -10284,7 +10284,7 @@ dependencies = [
 
 [[package]]
 name = "vibelens-core"
-version = "0.2.0-1"
+version = "0.2.0-2"
 dependencies = [
  "apple-native-keyring-store",
  "async-trait",

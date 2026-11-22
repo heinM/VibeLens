@@ -7,7 +7,7 @@ How to turn the repo into installers other people can run: what it costs, what t
 2. On `release`: bump the version in **one place** (§3) and run the manual test plan (kept outside this repository).
 3. Build the installers into a **draft** GitHub release: on a Mac with `VibeLens/scripts/release-local.sh` (macOS, optionally Linux), or on runners with `gh workflow run release.yml --ref vX.Y.Z` (macOS, Windows, Linux). Pushing a tag does not start a build.
 4. Open a pull request from `release` into `main`. This is the only thing that starts CI. Merge it when CI is green: `main` is what is in production.
-5. Runner builds publish release candidate tags as prereleases automatically once all platforms finish; stable tags, and anything built locally, stay drafts until you publish them (§9).
+5. Runner builds publish release candidate tags as prereleases automatically once all platforms finish (start the workflow with `-f publish_rc=false` to leave the candidate a draft); stable tags, and anything built locally, stay drafts until you publish them (§9).
 
 Builds are **unsigned until you add the signing secrets** (§5, §6). They work, but people get scary warnings.
 
