@@ -23,7 +23,7 @@ import { currentAgentTarget, pinStillValid, resolveAgentTarget } from "../../../
 import { useAgentStore } from "../../../store/useAgentStore";
 import { useUIStore } from "../../../store/useUIStore";
 import { useWorkspaceStore } from "../../../store/useWorkspaceStore";
-import { consumeAutoRun } from "../../editor/autoRun";
+import { consumeAutoRun, consumeAutoRunReadOnly } from "../../editor/autoRun";
 import { openAgentTab } from "../openInTab";
 import { sqlRunActions, toolIconName } from "../toolSummary";
 import { pinAfterScroll, REPIN_DISTANCE_PX } from "../useStickToBottom";
@@ -91,6 +91,10 @@ describe("run_sql card actions", () => {
     expect(sqlRunActions({ tool: "run_sql", sqlRun: null })).toEqual({ open: false, run: false });
     expect(sqlRunActions({ tool: "get_schema", sqlRun: ran(true) })).toEqual({ open: false, run: false });
   });
+  it("does not offer Run for a call that failed", () => {
+    expect(sqlRunActions({ tool: "run_sql", sqlRun: ran(true), status: "error" })).toEqual({ open: true, run: false });
+    expect(sqlRunActions({ tool: "run_sql", sqlRun: ran(true), status: "ok" })).toEqual({ open: true, run: true });
+  });
   it("shows list_databases with the list icon", () => {
     expect(toolIconName("list_databases")).toBe("list");
   });
@@ -106,6 +110,9 @@ describe("openAgentTab", () => {
 
     const runId = openAgentTab({ kind: "sql", profileId: "p1", database: null, contents: "select 2", run: true });
     expect(consumeAutoRun(runId)).toBe(true);
+    // The re-run stays read-only, and the flag is used once.
+    expect(consumeAutoRunReadOnly(runId)).toBe(true);
+    expect(consumeAutoRunReadOnly(runId)).toBe(false);
   });
   it("never binds a Valkey tab to a database or runs it", () => {
     const id = openAgentTab({ kind: "valkey", profileId: "v1", database: "x", contents: "GET k", run: true });

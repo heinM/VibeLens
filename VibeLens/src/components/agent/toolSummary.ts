@@ -160,7 +160,8 @@ export function formatTokens(n: number): string {
  * What a run_sql card offers once it ran: reopening the SQL (always) and re-running it in a tab
  * (only when Rust ran it read-only). Both use the connection and database Rust reported.
  */
-export function sqlRunActions(item: { tool: string; sqlRun: SqlRun | null }): { open: boolean; run: boolean } {
+export function sqlRunActions(item: { tool: string; sqlRun: SqlRun | null; status?: string }): { open: boolean; run: boolean } {
   const r = item.tool === "run_sql" ? item.sqlRun : null;
-  return { open: !!r, run: !!r && r.readOnly };
+  // A call that failed is not offered for a one-click re-run.
+  return { open: !!r, run: !!r && r.readOnly && (item.status === undefined || item.status === "ok") };
 }

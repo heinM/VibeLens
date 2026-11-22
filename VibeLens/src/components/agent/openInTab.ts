@@ -24,6 +24,7 @@ export function openAgentTab({ kind, profileId, database, contents, run = false 
     title: sql ? "agent.sql" : "agent.valkey",
     dirty: true,
   });
-  if (run && sql) requestAutoRun(id);
+  // Read-only, as Rust ran it: a statement that only looked read-only must not write here.
+  if (run && sql) requestAutoRun(id, { readOnly: true });
   return id;
 }

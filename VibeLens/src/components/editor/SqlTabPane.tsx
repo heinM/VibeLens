@@ -16,7 +16,7 @@ import { cn } from "../../lib/cn";
 import { ResultsPanel } from "../grid/ResultsPanel";
 import { MOD } from "../ui/platform";
 import { layoutStorage, panelStyle } from "../layout/storage";
-import { consumeAutoRun } from "./autoRun";
+import { consumeAutoRun, consumeAutoRunReadOnly } from "./autoRun";
 import { redactDbError } from "../../lib/sqlIntel/redact";
 import { dialectOf, isIcebergDialect } from "../../lib/sqlIntel/dialect";
 import { ICEBERG_NO_ANALYZE, MYSQL_NO_EXPLAIN, REDSHIFT_NO_EXPLAIN, planExplain, startsWithExplain } from "./explainGuard";
@@ -207,7 +207,7 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
 
   // Open-table double-click: run once when the pane first has a connection to run against.
   useEffect(() => {
-    if (profile && consumeAutoRun(tab.id)) void execute(tab.contents);
+    if (profile && consumeAutoRun(tab.id)) void execute(tab.contents, { readOnly: consumeAutoRunReadOnly(tab.id) || undefined });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profile]);
 

@@ -193,6 +193,17 @@ describe("partitioned tables", () => {
     expect(rows.slice(i + 1, i + 4).map((r) => `${r.depth}:${r.kind}:${r.label}`)).toEqual(["5:column:id", "5:partitionSummary:LIST (region) · 1 partition", "5:object:events_2024_q1"]);
   });
 
+  it("does not recurse forever on a listing that names its own parent", () => {
+    const self = part("events", { isPartitioned: true });
+    const key = describeKey("app", "public", "events");
+    const toggled = open(objectId("app", events));
+    const rows = buildPgRows(base({ objects, toggled, partitions: new Map([[key, ok(listing([self]))]]) }));
+    expect(rows.filter((r) => r.label === "events" && r.kind === "object")).toHaveLength(1);
+    const out = { listings: [] as RelationRef[], describes: [] as RelationRef[] };
+    collectPartitionRelations("app", events, toggled, () => listing([self]), out);
+    expect(out.listings.length).toBeLessThan(20);
+  });
+
   it("collects only what the expanded nodes need, level by level", () => {
     const sub = part("events_2024", { schema: "archive", isPartitioned: true });
     const subObj = partitionObject(sub, events);

@@ -379,10 +379,19 @@ fn natural_cmp(a: &str, b: &str) -> Ordering {
 async fn partman_config(c: &Client, schema: &str, table: &str) -> Option<PartmanConfig> {
     // The extension need not live in a schema called `partman`. `quote_ident` makes the name
     // from the catalog safe to splice into the statement below.
+    //
+    // `part_config` is the one relation the navigator reads outside pg_catalog, so it is read
+    // only when it is the extension's own plain table without row-level security: a view or a
+    // policy put in its place would run its owner's functions with the browsing user's rights.
     let rows = query(
         c,
         "SELECT quote_ident(n.nspname) FROM pg_extension e \
-         JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'pg_partman'",
+         JOIN pg_namespace n ON n.oid = e.extnamespace \
+         JOIN pg_class t ON t.relnamespace = n.oid AND t.relname = 'part_config' \
+              AND t.relkind = 'r' AND NOT t.relrowsecurity \
+         JOIN pg_depend d ON d.classid = 'pg_class'::regclass AND d.objid = t.oid \
+              AND d.refclassid = 'pg_extension'::regclass AND d.refobjid = e.oid AND d.deptype = 'e' \
+         WHERE e.extname = 'pg_partman'",
         &[],
     )
     .await

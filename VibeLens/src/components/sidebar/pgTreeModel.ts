@@ -173,6 +173,9 @@ export interface RelationRef {
   table: string;
 }
 
+/** Sub-partitioning deeper than this is not followed (real schemas use two or three levels). */
+const MAX_PARTITION_DEPTH = 8;
+
 /**
  * What an expanded partitioned table needs fetched, beyond its own columns: its partition listing,
  * and (as listings arrive) those of expanded sub-partitioned partitions and the columns of expanded
@@ -184,19 +187,22 @@ export function collectPartitionRelations(
   toggled: ReadonlyMap<string, boolean>,
   getListing: (ref: RelationRef) => PartitionListing | undefined,
   out: { listings: RelationRef[]; describes: RelationRef[] },
+  depth = 0,
 ): void {
+  // A listing is server data: a partition naming itself or an ancestor must not recurse forever.
+  if (depth > MAX_PARTITION_DEPTH) return;
   const ref = { db, schema: parent.schema, table: parent.name };
   out.listings.push(ref);
   for (const p of getListing(ref)?.partitions ?? []) {
     const o = partitionObject(p, parent);
     if (!isExpanded(toggled, objectId(db, o))) continue;
     out.describes.push({ db, schema: p.schema, table: p.name });
-    if (p.isPartitioned) collectPartitionRelations(db, o, toggled, getListing, out);
+    if (p.isPartitioned) collectPartitionRelations(db, o, toggled, getListing, out, depth + 1);
   }
 }
 
 /** One table-like node: its row and, when expanded, columns, then (partitioned) summary and partitions. */
-function pushRelation(rows: PgRow[], input: PgModelInput, db: string, o: SchemaObject, depth: number, partition?: PartitionInfo): void {
+function pushRelation(rows: PgRow[], input: PgModelInput, db: string, o: SchemaObject, depth: number, partition?: PartitionInfo, level = 0): void {
   const oid = objectId(db, o);
   const relation = isRelation(o.kind);
   const expanded = relation && isExpanded(input.toggled, oid);
@@ -214,7 +220,7 @@ function pushRelation(rows: PgRow[], input: PgModelInput, db: string, o: SchemaO
     }
   }
 
-  if (o.kind !== "partitionedTable") return;
+  if (o.kind !== "partitionedTable" || level > MAX_PARTITION_DEPTH) return;
   const pid = `${oid}${SEP}partitions`;
   const lq = input.partitions.get(key) ?? { status: "pending" as const };
   if (lq.status !== "success" || !lq.data) {
@@ -229,7 +235,12 @@ function pushRelation(rows: PgRow[], input: PgModelInput, db: string, o: SchemaO
     rows.push({ id: `${pid}${SEP}empty`, depth: depth + 1, kind: "status", label: "No partitions", expandable: false, expanded: false, statusKind: "empty" });
     return;
   }
-  for (const p of listing.partitions) pushRelation(rows, input, db, partitionObject(p, o), depth + 1, p);
+  for (const p of listing.partitions) {
+    const child = partitionObject(p, o);
+    // Same id as its parent would also read as expanded: skip a partition that names its parent.
+    if (objectId(db, child) === oid) continue;
+    pushRelation(rows, input, db, child, depth + 1, p, level + 1);
+  }
 }
 
 export function buildPgRows(input: PgModelInput): PgRow[] {
