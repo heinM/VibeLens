@@ -9,6 +9,11 @@ name: Release
 # release built on a Mac with scripts/release-local.sh is not built a second time by runners.
 on:
   workflow_dispatch:
+    inputs:
+      publish_rc:
+        description: "Release candidate tags only: publish as a prerelease when every platform has finished. Untick to leave a draft."
+        type: boolean
+        default: true
 
 permissions:
   contents: write # create the draft release and upload assets
@@ -156,7 +161,7 @@ jobs:
   publish-rc:
     name: Publish release candidate
     needs: [build, checksums]
-    if: github.ref_type == 'tag' && contains(github.ref_name, '-')
+    if: github.ref_type == 'tag' && contains(github.ref_name, '-') && inputs.publish_rc
     runs-on: ubuntu-24.04
     permissions:
       contents: write

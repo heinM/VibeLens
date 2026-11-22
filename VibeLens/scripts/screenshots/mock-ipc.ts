@@ -51,7 +51,7 @@ export const mockState = {
   /** Profiles whose last connect failed: their status is `error` with this detail. */
   failed: new Map<string, string>(),
   /** Which scripted agent turn `agent_start_turn` plays (picked by the prompt when null). */
-  appVersion: "0.2.0-1",
+  appVersion: "0.2.0-2",
 };
 
 // ---------------------------------------------------------------------------------------------
