@@ -188,6 +188,20 @@ impl MysqlHandle {
             / 1000
     }
 
+    /// An operation is running on this pool.
+    pub fn in_use(&self) -> bool {
+        self.active.load(Ordering::SeqCst) > 0
+    }
+
+    /// Milliseconds since the pool was last used (0 while in use).
+    pub fn idle_ms(&self) -> u64 {
+        if self.in_use() {
+            return 0;
+        }
+        self.elapsed_ms()
+            .saturating_sub(self.last_used_ms.load(Ordering::SeqCst))
+    }
+
     /// Closes the server sessions sitting idle in the pool and returns how many. The handle
     /// stays usable: the next operation opens a fresh session.
     pub fn release_idle_connections(&self) -> usize {

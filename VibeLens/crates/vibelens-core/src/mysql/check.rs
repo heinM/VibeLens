@@ -834,6 +834,10 @@ pub fn check_read_only(stmt: &str) -> Result<(), String> {
             ));
         }
         if is_show {
+            // `SHOW CHARACTER SET`.
+            if w == "SET" && prev.as_deref() == Some("CHARACTER") {
+                continue;
+            }
             // A subquery inside SHOW … WHERE is not needed to read the catalog, and would get
             // only the SHOW-specific checks: refused.
             if matches!(
@@ -908,6 +912,13 @@ fn sets_server_variable(stmt: &str) -> bool {
     if !toks.first().is_some_and(|t| is_word(stmt, t, "SET")) {
         return false;
     }
+    mentions_server_variable(stmt, &toks)
+}
+
+/// A `GLOBAL`/`PERSIST`/`PERSIST_ONLY` keyword or a `@@global.…`/`@@persist.…` variable anywhere
+/// in `toks`. `@@global` without the dot counts too: the server accepts `@@global . x` and
+/// `@@global/**/.x`, which the lexer reads as `@@global`, then `.`, then `x`.
+fn mentions_server_variable(stmt: &str, toks: &[Tok]) -> bool {
     toks.iter().any(|t| match t.kind {
         Kind::Word => matches!(
             upper(stmt, t).as_str(),
@@ -915,9 +926,9 @@ fn sets_server_variable(stmt: &str) -> bool {
         ),
         Kind::Variable => {
             let v = text(stmt, t).to_ascii_lowercase();
-            v.starts_with("@@global.")
-                || v.starts_with("@@persist.")
-                || v.starts_with("@@persist_only.")
+            ["@@global", "@@persist", "@@persist_only"]
+                .iter()
+                .any(|p| v == *p || v.starts_with(&format!("{p}.")))
         }
         _ => false,
     })
@@ -925,8 +936,16 @@ fn sets_server_variable(stmt: &str) -> bool {
 
 /// The class and a short label of one statement.
 fn classify_statement(stmt: &str) -> (StatementClass, String) {
-    if lex(stmt, true).is_err() {
+    let Ok(toks) = lex(stmt, true) else {
         return (StatementClass::Unknown, "unreadable statement".into());
+    };
+    // What an executable comment holds runs but is not part of the words below
+    // (`SET /*!PASSWORD = 'x'*/`): nothing is known about such a statement.
+    if toks.iter().any(|t| t.kind == Kind::ExecComment) {
+        return (
+            StatementClass::Unknown,
+            "statement with an executable comment".into(),
+        );
     }
     let w = leading_words(stmt, 4);
     let first = w.first().cloned().unwrap_or_default();
@@ -962,6 +981,10 @@ fn classify_statement(stmt: &str) -> (StatementClass, String) {
         "TRUNCATE" | "RENAME" | "GRANT" | "REVOKE" | "ANALYZE" | "OPTIMIZE" | "REPAIR"
         | "CHECK" | "CHECKSUM" | "FLUSH" | "INSTALL" | "UNINSTALL" | "PURGE" | "RESET"
         | "CHANGE" | "CACHE" => (StatementClass::Ddl, first),
+        // MariaDB `SET STATEMENT x=1 FOR <any statement>`.
+        "SET" if w.get(1).map(String::as_str) == Some("STATEMENT") => {
+            (StatementClass::Unknown, "SET STATEMENT … FOR".into())
+        }
         "SET" if sets_server_variable(stmt) => (
             StatementClass::Ddl,
             "SET GLOBAL (server configuration)".into(),
@@ -1070,11 +1093,15 @@ pub fn agent_refusal(sql: &str) -> Option<String> {
             .collect();
         let first = words.first().map(String::as_str).unwrap_or("");
         let has = |x: &str| words.iter().any(|w| w == x);
+        // A CREATE PROCEDURE/FUNCTION/TRIGGER/EVENT body is one statement here; what it would
+        // do when it runs later (CALL, a trigger firing, the event scheduler) is checked as if
+        // it ran now.
+        let routine = starts_routine(&words[..words.len().min(10)]);
         let reason = if has("OUTFILE") || has("DUMPFILE") {
             Some("SELECT … INTO OUTFILE/DUMPFILE writes a file on the database server")
         } else if first == "LOAD" {
             Some("LOAD DATA and LOAD XML read files on the database server or on this machine")
-        } else if matches!(first, "PREPARE" | "EXECUTE" | "DEALLOCATE") {
+        } else if has("PREPARE") || matches!(first, "EXECUTE" | "DEALLOCATE") {
             Some(
                 "PREPARE and EXECUTE run SQL built from a string or a variable, so the statement \
                  shown for approval is not the one that runs; send the statement itself",
@@ -1086,8 +1113,20 @@ pub fn agent_refusal(sql: &str) -> Option<String> {
                     .is_some_and(|n| n.kind == Kind::Punct && text(stmt, n) == "(")
         }) {
             Some("LOAD_FILE() reads a file on the database server")
-        } else if first == "SET" && sets_server_variable(stmt) {
+        } else if (first == "SET" || routine) && mentions_server_variable(stmt, &toks) {
             Some("SET GLOBAL and SET PERSIST change the server's configuration for everyone")
+        } else if routine
+            && words.iter().any(|w| {
+                matches!(
+                    w.as_str(),
+                    "KILL" | "SHUTDOWN" | "RESTART" | "CLONE" | "INSTALL" | "UNINSTALL"
+                )
+            })
+        {
+            Some(
+                "the routine's body does server administration (KILL, SHUTDOWN, RESTART, CLONE, \
+                 INSTALL, UNINSTALL), which is not available to the agent",
+            )
         } else if matches!(first, "KILL" | "SHUTDOWN" | "RESTART" | "CLONE") {
             Some(
                 "server administration (KILL, SHUTDOWN, RESTART, CLONE) is not available to the agent",
@@ -1188,6 +1227,7 @@ mod tests {
             "SHOW CREATE TABLE orders",
             "SHOW PROCEDURE STATUS WHERE Db = 'shop'",
             "SHOW TABLE STATUS LIKE 'o%'",
+            "SHOW CHARACTER SET LIKE 'utf8%'",
             "DESCRIBE orders",
             "DESC orders",
             "EXPLAIN SELECT * FROM orders",
@@ -1399,6 +1439,16 @@ mod tests {
                 StatementClass::Session,
             ),
             ("UNLOCK TABLES", StatementClass::Session),
+            // Re-audit item 4.
+            ("SET @@global . max_connections = 1", StatementClass::Ddl),
+            ("SET @@global/**/.max_connections = 1", StatementClass::Ddl),
+            ("SET @@PERSIST.x = 1", StatementClass::Ddl),
+            ("SET /*!PASSWORD = 'x'*/", StatementClass::Unknown),
+            (
+                "SET STATEMENT max_statement_time=1 FOR DELETE FROM t",
+                StatementClass::Unknown,
+            ),
+            ("SET @g = @@global.max_connections", StatementClass::Ddl),
         ] {
             assert_eq!(c(sql), class, "{sql}");
             if class != StatementClass::Session {
@@ -1441,6 +1491,32 @@ mod tests {
             ("USE other", "USE"),
             ("SELECT 1 /*!50000 , 2 */", "executable comment"),
             ("DELIMITER $$", "DELIMITER"),
+            // Re-audit item 2: inside a routine body.
+            (
+                "CREATE PROCEDURE p() BEGIN SET @q = 0x53454c454354; PREPARE s FROM @q; EXECUTE s; END; CALL p()",
+                "PREPARE",
+            ),
+            (
+                "CREATE PROCEDURE p() BEGIN SET GLOBAL general_log = 1; END",
+                "SET GLOBAL",
+            ),
+            (
+                "CREATE PROCEDURE p() BEGIN SET @@global.x = 1; END",
+                "SET GLOBAL",
+            ),
+            (
+                "CREATE EVENT e ON SCHEDULE EVERY 1 HOUR DO KILL 5",
+                "administration",
+            ),
+            (
+                "CREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW BEGIN SHUTDOWN; END",
+                "administration",
+            ),
+            (
+                "CREATE DEFINER=`root`@`%` PROCEDURE p() INSTALL PLUGIN x SONAME 'x.so'",
+                "INSTALL",
+            ),
+            ("SET @@global . max_connections = 1", "SET GLOBAL"),
             // Audit finding 5.
             ("SELECT `LOAD_FILE`('/etc/passwd')", "LOAD_FILE"),
             ("SELECT \"load_file\"('/etc/passwd')", "LOAD_FILE"),

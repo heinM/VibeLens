@@ -711,7 +711,7 @@ pub(super) const CATALOG_VALUE_BYTES: usize = 64 * 1024;
 pub(super) const CATALOG_BYTE_BUDGET: usize = 32 * 1024 * 1024;
 
 /// A catalog value as text, cut at [`CATALOG_VALUE_BYTES`] on a character boundary.
-pub(super) fn catalog_text(b: &[u8]) -> String {
+pub(crate) fn catalog_text(b: &[u8]) -> String {
     let cut = b.len() > CATALOG_VALUE_BYTES;
     let mut s = String::from_utf8_lossy(&b[..b.len().min(CATALOG_VALUE_BYTES)]).into_owned();
     if cut {

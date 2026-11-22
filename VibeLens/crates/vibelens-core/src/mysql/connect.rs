@@ -50,18 +50,50 @@ pub(super) struct MyConn {
 
 /// Identifies one server instance; reader endpoints and proxies may route two connections to
 /// the same host name onto different instances, where the same connection id is someone else.
-const SERVER_ID_SQL: &str = "SELECT @@server_uuid";
+const SERVER_UUID_SQL: &str = "SELECT @@server_uuid";
+/// Fallback where `@@server_uuid` does not exist (MariaDB, some proxies).
+const SERVER_HOST_SQL: &str = "SELECT @@hostname, @@port, @@server_id";
 
-async fn server_id(conn: &mut Conn) -> Option<String> {
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        conn.query_first::<Option<String>, _>(SERVER_ID_SQL),
-    )
-    .await
+/// The first row of `sql` as text, read without any typed conversion: the driver's typed row
+/// conversions panic on a row of the wrong shape, and a release build aborts on a panic. Every
+/// value is lossy UTF-8; NULL is `None`. `None` for an error, no row, or a timeout.
+pub(super) async fn first_row_text(conn: &mut Conn, sql: &str) -> Option<Vec<Option<String>>> {
+    let read = async {
+        let mut result = conn.query_iter(sql).await.ok()?;
+        let row = result.next().await.ok()??;
+        let values: Vec<Option<String>> = row
+            .unwrap_raw()
+            .into_iter()
+            .map(|v| match v {
+                Some(mysql_async::Value::Bytes(b)) => Some(super::exec::catalog_text(&b)),
+                Some(mysql_async::Value::NULL) | None => None,
+                Some(other) => Some(other.as_sql(false)),
+            })
+            .collect();
+        result.drop_result().await.ok()?;
+        Some(values)
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), read)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// This server's identity: `uuid:<@@server_uuid>`, else `host:<@@hostname>:<@@port>#<@@server_id>`,
+/// else `None` (then no `KILL QUERY` is ever sent for its sessions).
+pub(super) async fn server_id(conn: &mut Conn) -> Option<String> {
+    if let Some(v) = first_row_text(conn, SERVER_UUID_SQL)
+        .await
+        .and_then(|r| r.into_iter().next().flatten())
+        .filter(|v| !v.is_empty())
     {
-        Ok(Ok(Some(Some(v)))) if !v.is_empty() => Some(v),
-        _ => None,
+        return Some(format!("uuid:{v}"));
     }
+    let r = first_row_text(conn, SERVER_HOST_SQL).await?;
+    let host = r.first().cloned().flatten().filter(|h| !h.is_empty())?;
+    let port = r.get(1).cloned().flatten().unwrap_or_default();
+    let id = r.get(2).cloned().flatten().unwrap_or_default();
+    Some(format!("host:{host}:{port}#{id}"))
 }
 
 pub(super) struct MysqlManager {
@@ -237,9 +269,10 @@ impl Shared {
 
     /// Stops the statement running on connection `id` of server `server` from a separate
     /// connection (`KILL QUERY`), so it stops on the server rather than only on this side. The
-    /// kill is sent only when the new connection reports the same `@@server_uuid` (a load
-    /// balancer may route it to another instance, where `id` is another session); up to three
-    /// connections are tried. Without a known server nothing is killed. Best effort, bounded by
+    /// kill is sent only when the new connection reports the same identity ([`server_id`]: a
+    /// load balancer may route it to another instance, where `id` is another session); up to
+    /// three connections are tried. Without a known identity nothing is killed (the connection
+    /// is still closed). Best effort, bounded by
     /// [`KILL_TIMEOUT`]; returns whether the server accepted it.
     pub(super) async fn kill_query(&self, id: u32, server: Option<&str>) -> bool {
         let Some(server) = server else {

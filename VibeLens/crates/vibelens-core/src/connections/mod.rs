@@ -73,6 +73,9 @@ const AGENT_SCRIPT_DEADLINE: Duration = Duration::from_secs(150);
 const AGENT_REDSHIFT_TIMEOUT_MS: u64 = 120_000;
 /// Most MySQL database pools one profile may hold at once (one per database name).
 pub const MAX_MYSQL_POOLS_PER_PROFILE: usize = 8;
+/// Connect-lock name for counting and opening a profile's MySQL pools (database names cannot
+/// hold NUL, so it never equals one).
+const MYSQL_POOLS_LOCK: &str = "\u{0}mysql-pools";
 /// Safety valve for `valkey_scan`: stop after this many SCAN pages even if the cursor never ends.
 const MAX_SCAN_PAGES: usize = 2_000;
 
@@ -804,19 +807,42 @@ impl ConnectionManager {
         }
 
         // Each database name gets its own pool, and the name comes from the UI or the model;
-        // `shop`, `Shop` and `sHop` would each open one. A connection holds a bounded number.
-        let open = self
-            .lock()
-            .mysql
-            .keys()
-            .filter(|(id, _)| *id == profile.id)
-            .count();
-        if open >= MAX_MYSQL_POOLS_PER_PROFILE {
-            return Err(CoreError::Invalid(format!(
-                "connection \"{}\" already has {open} databases open, the most one connection \
-                 may hold; disconnect it to start over",
-                profile.name
-            )));
+        // `shop`, `Shop` and `sHop` would each open one. A connection holds a bounded number:
+        // count, dial and insert happen under one per-profile lock, and at the cap the least
+        // recently used idle pool is closed to make room.
+        let pools_lock = self.connect_lock((profile.id.clone(), Some(MYSQL_POOLS_LOCK.into())));
+        let _pools = pools_lock.lock().await;
+        if let Some(handle) = self.cached_mysql(&key, &signature).await {
+            return Ok(handle);
+        }
+        let evicted = {
+            let mut st = self.lock();
+            let open = st.mysql.keys().filter(|(id, _)| *id == profile.id).count();
+            if open < MAX_MYSQL_POOLS_PER_PROFILE {
+                None
+            } else {
+                let lru = st
+                    .mysql
+                    .iter()
+                    .filter(|((id, _), e)| *id == profile.id && !e.handle.in_use())
+                    .max_by_key(|(_, e)| e.handle.idle_ms())
+                    .map(|(k, _)| k.clone());
+                match lru {
+                    Some(k) => st.mysql.remove(&k),
+                    None => {
+                        return Err(CoreError::Invalid(format!(
+                            "connection \"{}\" has {MAX_MYSQL_POOLS_PER_PROFILE} databases open \
+                             and all of them are running queries; try again when one finishes",
+                            profile.name
+                        )));
+                    }
+                }
+            }
+        };
+        if let Some(old) = evicted {
+            tracing::info!(profile_id = %profile.id, "closing the least recently used MySQL database pool");
+            old.handle.close().await;
+            drop(old.tunnel);
         }
         let epoch = self.lock().epoch(&profile.id);
         let mut attempt = Attempt::begin(self, &profile);
@@ -860,6 +886,15 @@ impl ConnectionManager {
                 Ok(handle)
             }
         }
+    }
+
+    /// How many MySQL database pools `profile_id` holds now.
+    pub fn mysql_pool_count(&self, profile_id: &str) -> usize {
+        self.lock()
+            .mysql
+            .keys()
+            .filter(|(id, _)| id == profile_id)
+            .count()
     }
 
     async fn cached_mysql(

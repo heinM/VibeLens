@@ -76,9 +76,25 @@ enum Plan {
     HugeCatalog,
     /// Never answer `SELECT 'trigger'`. `moving_uuid`: every connection reports another
     /// `@@server_uuid`, as behind a reader endpoint that spreads connections over instances.
-    Hang { moving_uuid: bool },
+    Hang(Uuid),
+    /// Answer `SELECT 'trigger'` with three column definitions of 6 MiB each.
+    FatColumns,
     /// Log in and answer everything with OK (and `@@server_uuid`).
     Plain,
+}
+
+/// How the fake answers `SELECT @@server_uuid`.
+#[derive(Clone, Copy, PartialEq)]
+enum Uuid {
+    Same,
+    /// Another value on every connection (a reader endpoint spreading connections).
+    Moving,
+    /// Two columns instead of one: the driver's typed conversion panics on that.
+    TwoColumns,
+    /// One column of bytes that are not UTF-8: same.
+    BadUtf8,
+    /// An error (MariaDB has no `@@server_uuid`); `@@hostname, @@port, @@server_id` answers.
+    Missing,
 }
 
 /// What the server saw.
@@ -128,12 +144,23 @@ fn lenenc_str(out: &mut Vec<u8>, s: &[u8]) {
 
 /// A one-column (VARCHAR) result set with `rows`, starting at sequence id 1.
 async fn one_column(s: &mut TcpStream, rows: &[Vec<u8>]) {
-    write_packet(s, 1, &[1]).await;
-    write_packet(s, 2, &column("v", 253, 255, 0)).await;
-    let mut seq = 3u8;
+    let rows: Vec<Vec<Vec<u8>>> = rows.iter().map(|r| vec![r.clone()]).collect();
+    columns(s, 1, &rows).await;
+}
+
+/// An `n`-column (VARCHAR) result set with `rows`, starting at sequence id 1.
+async fn columns(s: &mut TcpStream, n: u8, rows: &[Vec<Vec<u8>>]) {
+    write_packet(s, 1, &[n]).await;
+    let mut seq = 2u8;
+    for i in 0..n {
+        write_packet(s, seq, &column(&format!("c{i}"), 253, 255, 0)).await;
+        seq = seq.wrapping_add(1);
+    }
     for r in rows {
         let mut row = Vec::new();
-        lenenc_str(&mut row, r);
+        for v in r {
+            lenenc_str(&mut row, v);
+        }
         write_packet(s, seq, &row).await;
         seq = seq.wrapping_add(1);
     }
@@ -246,12 +273,31 @@ async fn serve(mut s: TcpStream, plan: Plan, file: String, seen: Arc<Mutex<Seen>
         seen.lock().unwrap().packets.push(p.clone());
         match p.first() {
             Some(0x01) => return, // COM_QUIT
-            Some(0x03) if p[1..].starts_with(b"SELECT @@server_uuid") => {
-                let uuid = match plan {
-                    Plan::Hang { moving_uuid: true } => format!("uuid-{conn_no}"),
-                    _ => "uuid-same".to_string(),
-                };
-                one_column(&mut s, &[uuid.into_bytes()]).await;
+            Some(0x03) if p[1..].starts_with(b"SELECT @@server_uuid") => match plan {
+                Plan::Hang(Uuid::Moving) => {
+                    one_column(&mut s, &[format!("uuid-{conn_no}").into_bytes()]).await
+                }
+                Plan::Hang(Uuid::TwoColumns) => {
+                    columns(&mut s, 2, &[vec![b"uuid-a".to_vec(), b"extra".to_vec()]]).await
+                }
+                Plan::Hang(Uuid::BadUtf8) => {
+                    one_column(&mut s, &[vec![0xFF, 0xFE, 0x80, b'u']]).await
+                }
+                Plan::Hang(Uuid::Missing) => {
+                    let mut e = vec![0xFF];
+                    e.extend_from_slice(&1193u16.to_le_bytes());
+                    e.extend_from_slice(b"#HY000Unknown system variable 'server_uuid'");
+                    write_packet(&mut s, 1, &e).await;
+                }
+                _ => one_column(&mut s, &[b"uuid-same".to_vec()]).await,
+            },
+            Some(0x03) if p[1..].starts_with(b"SELECT @@hostname") => {
+                columns(
+                    &mut s,
+                    3,
+                    &[vec![b"db-a".to_vec(), b"3306".to_vec(), b"7".to_vec()]],
+                )
+                .await
             }
             Some(0x03) if plan == Plan::HugeCatalog && contains(&p, b"information_schema") => {
                 let rows: Vec<Vec<u8>> = (0..600).map(|_| vec![b'x'; 70_000]).collect();
@@ -288,7 +334,15 @@ async fn serve(mut s: TcpStream, plan: Plan, file: String, seen: Arc<Mutex<Seen>
                     write_packet(&mut s, 1, &h).await;
                 }
                 // No answer: the statement "runs" until it is killed or the socket closes.
-                Plan::Hang { .. } => {}
+                Plan::Hang(_) => {}
+                Plan::FatColumns => {
+                    write_packet(&mut s, 1, &[3]).await;
+                    for i in 0..3u8 {
+                        let fat = "n".repeat(6 * 1024 * 1024);
+                        write_packet(&mut s, 2 + i, &column(&fat, 253, 255, 0)).await;
+                    }
+                    write_packet(&mut s, 5, END).await;
+                }
                 Plan::UnknownType => {
                     write_packet(&mut s, 1, &[1]).await;
                     write_packet(&mut s, 2, &column("x", 0x77, 255, 0)).await;
@@ -607,14 +661,17 @@ async fn an_oversized_table_cap_does_not_overflow() {
 /// someone else's session.
 #[tokio::test]
 async fn kill_query_is_sent_only_to_the_same_server() {
-    for moving in [false, true] {
-        let f = fake(
-            Plan::Hang {
-                moving_uuid: moving,
-            },
-            "",
-        )
-        .await;
+    // Re-audit item 1: replies of the wrong shape must not abort the process; item 6: without
+    // `@@server_uuid` the identity falls back to `@@hostname, @@port, @@server_id`.
+    for uuid in [
+        Uuid::Same,
+        Uuid::Moving,
+        Uuid::TwoColumns,
+        Uuid::BadUtf8,
+        Uuid::Missing,
+    ] {
+        let moving = uuid == Uuid::Moving;
+        let f = fake(Plan::Hang(uuid), "").await;
         let h = MysqlHandle::connect(params(f.port, false), creds())
             .await
             .expect("login");
@@ -643,6 +700,12 @@ async fn kill_query_is_sent_only_to_the_same_server() {
         } else {
             assert_eq!(kills, 1, "the kill was not sent to the same instance");
         }
+        // Every new connection still works after the odd identity reply.
+        assert!(
+            MysqlHandle::connect(params(f.port, false), creds())
+                .await
+                .is_ok()
+        );
     }
 }
 
@@ -734,16 +797,63 @@ async fn database_pools_per_connection_are_capped() {
                 .collect()
         })
         .collect();
+    let mut handles = Vec::new();
     for n in &names {
-        mgr.mysql(&p.id, Some(n)).await.expect(n);
+        handles.push(mgr.mysql(&p.id, Some(n)).await.expect(n));
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    let e = mgr.mysql(&p.id, Some("SHOP")).await.err().expect("capped");
+    assert_eq!(mgr.mysql_pool_count(&p.id), MAX_MYSQL_POOLS_PER_PROFILE);
+    // Re-audit item 5: at the cap, the least recently used idle pool makes room. Use the
+    // first one so the second is the oldest.
+    handles[0]
+        .execute_collect("SELECT 1", ExecOptions::default(), CancellationToken::new())
+        .await
+        .unwrap();
+    let shop = mgr
+        .mysql(&p.id, Some("SHOP"))
+        .await
+        .expect("evicts, does not refuse");
+    assert_eq!(mgr.mysql_pool_count(&p.id), MAX_MYSQL_POOLS_PER_PROFILE);
+    let again0 = mgr.mysql(&p.id, Some(&names[0])).await.unwrap();
     assert!(
-        matches!(&e, CoreError::Invalid(m) if m.contains("databases open")),
-        "{e:?}"
+        Arc::ptr_eq(&again0, &handles[0]),
+        "the recently used pool was evicted"
     );
-    // An already open one is still served.
-    mgr.mysql(&p.id, Some(&names[0])).await.unwrap();
+    let again1 = mgr.mysql(&p.id, Some(&names[1])).await.unwrap();
+    assert!(
+        !Arc::ptr_eq(&again1, &handles[1]),
+        "the oldest pool was kept"
+    );
+    drop(shop);
+    // Count, dial and insert are one step: concurrent opens never exceed the cap.
     mgr.disconnect(&p.id).await.unwrap();
-    mgr.mysql(&p.id, Some("SHOP")).await.unwrap();
+    let mut tasks = Vec::new();
+    for i in 0..20 {
+        let (mgr, id) = (mgr.clone(), p.id.clone());
+        tasks.push(tokio::spawn(async move {
+            let _ = mgr.mysql(&id, Some(&format!("db{i}"))).await;
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    assert!(mgr.mysql_pool_count(&p.id) <= MAX_MYSQL_POOLS_PER_PROFILE);
+}
+
+/// Item answered with the re-audit: column definitions are bounded in total, not just per
+/// packet (4096 columns of up to 64 MiB each).
+#[tokio::test]
+async fn fat_column_definitions_are_refused() {
+    let f = fake(Plan::FatColumns, "").await;
+    let h = MysqlHandle::connect(params(f.port, false), creds())
+        .await
+        .expect("login");
+    let r = h
+        .execute_collect(
+            "SELECT 'trigger'",
+            ExecOptions::default(),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(r.is_err(), "18 MiB of column definitions were accepted");
 }
