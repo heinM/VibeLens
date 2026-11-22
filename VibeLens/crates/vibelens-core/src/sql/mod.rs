@@ -1400,6 +1400,11 @@ mod tests {
             Write
         );
         assert_eq!(one("select 1 union select * into x from t"), Write);
+        // An empty target list (valid PostgreSQL) does not hide the write.
+        assert_eq!(one("select into newt from t"), Write);
+        assert_eq!(one("select into newt"), Write);
+        assert_eq!(one("select from t for update"), Write);
+        assert_eq!(one("select for update"), Write);
     }
 
     #[test]
@@ -1816,7 +1821,8 @@ mod tests {
         for sql in [
             "select 1 from wibble wobble wubble ^^^ !!!",
             "explain select ^^^",
-            "select",
+            "select 1 +",
+            "select ,",
             "(",
             "values",
         ] {
@@ -1824,8 +1830,11 @@ mod tests {
             assert!(!c.parse_ok, "{sql}");
             assert_ne!(c.overall, ReadOnly, "{sql}");
         }
-        // Parsed forms that are read-only.
+        // Parsed forms that are read-only. PostgreSQL's target list is optional, so a bare
+        // `select` is a valid query (one row, no columns) and sqlparser 0.64 parses it as such.
         for sql in [
+            "select",
+            "select from t where x = 1",
             "select 1",
             "show all",
             "show search_path",
