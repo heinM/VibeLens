@@ -43,6 +43,13 @@ fn comment(v: Option<&Option<String>>) -> Option<String> {
     opt(v).filter(|c| !c.is_empty() && c != "VIEW")
 }
 
+/// Most tables one metadata call may ask for.
+pub(super) const MAX_METADATA_TABLES: usize = 20_000;
+
+pub(super) fn clamp_tables(n: usize) -> usize {
+    n.clamp(1, MAX_METADATA_TABLES)
+}
+
 impl MysqlHandle {
     /// Databases (schemas) the user can see, sorted by name.
     pub async fn list_databases(&self) -> Result<Vec<String>> {
@@ -146,7 +153,8 @@ impl MysqlHandle {
             Some(t) => format!(" AND TABLE_NAME = {}", literal(t)),
             None => String::new(),
         };
-        let max_tables = max_tables.max(1);
+        // From IPC: never 0, never so large that `+ 1` overflows.
+        let max_tables = clamp_tables(max_tables);
         let tables = self
             .catalog_rows(
                 &format!(
@@ -305,6 +313,14 @@ impl MysqlHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit finding 11.
+    #[test]
+    fn table_caps_are_clamped() {
+        assert_eq!(clamp_tables(usize::MAX), MAX_METADATA_TABLES);
+        assert_eq!(clamp_tables(0), 1);
+        assert_eq!(clamp_tables(50), 50);
+    }
 
     #[test]
     fn names_become_hex_literals() {

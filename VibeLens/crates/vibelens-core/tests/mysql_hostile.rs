@@ -66,11 +66,25 @@ enum Plan {
     HostileRows,
     /// Log in, then answer `SELECT 'trigger'` with a column of an unknown type.
     UnknownType,
+    /// Switch the client to this auth plugin (MariaDB `client_ed25519`, `parsec`, …).
+    SwitchTo(&'static str),
+    /// Switch to `mysql_native_password`, then send a second switch.
+    DoubleSwitch,
+    /// Answer `SELECT 'trigger'` with a result header announcing 2^40 columns.
+    HugeColumnCount,
+    /// Answer catalog queries with 600 rows of 70 KB each (42 MB).
+    HugeCatalog,
+    /// Never answer `SELECT 'trigger'`. `moving_uuid`: every connection reports another
+    /// `@@server_uuid`, as behind a reader endpoint that spreads connections over instances.
+    Hang { moving_uuid: bool },
+    /// Log in and answer everything with OK (and `@@server_uuid`).
+    Plain,
 }
 
 /// What the server saw.
 #[derive(Default)]
 struct Seen {
+    connections: usize,
     client_caps: Vec<u32>,
     /// Every packet payload received after the handshake response, in order.
     packets: Vec<Vec<u8>>,
@@ -102,9 +116,28 @@ async fn write_packet(s: &mut TcpStream, seq: u8, payload: &[u8]) {
 }
 
 fn lenenc_str(out: &mut Vec<u8>, s: &[u8]) {
-    assert!(s.len() < 251);
-    out.push(s.len() as u8);
+    if s.len() < 251 {
+        out.push(s.len() as u8);
+    } else {
+        assert!(s.len() < 1 << 24);
+        out.push(0xFD);
+        out.extend_from_slice(&(s.len() as u32).to_le_bytes()[..3]);
+    }
     out.extend_from_slice(s);
+}
+
+/// A one-column (VARCHAR) result set with `rows`, starting at sequence id 1.
+async fn one_column(s: &mut TcpStream, rows: &[Vec<u8>]) {
+    write_packet(s, 1, &[1]).await;
+    write_packet(s, 2, &column("v", 253, 255, 0)).await;
+    let mut seq = 3u8;
+    for r in rows {
+        let mut row = Vec::new();
+        lenenc_str(&mut row, r);
+        write_packet(s, seq, &row).await;
+        seq = seq.wrapping_add(1);
+    }
+    write_packet(s, seq, END).await;
 }
 
 const OK: &[u8] = &[0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00];
@@ -155,8 +188,39 @@ async fn serve(mut s: TcpStream, plan: Plan, file: String, seen: Arc<Mutex<Seen>
         return;
     };
     let caps = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
-    seen.lock().unwrap().client_caps.push(caps);
+    let conn_no = {
+        let mut g = seen.lock().unwrap();
+        g.client_caps.push(caps);
+        g.connections += 1;
+        g.connections
+    };
     match plan {
+        Plan::SwitchTo(plugin) => {
+            let mut sw = vec![0xFE];
+            sw.extend_from_slice(plugin.as_bytes());
+            sw.push(0);
+            sw.extend_from_slice(b"0123456789abcdefghij\0");
+            write_packet(&mut s, 2, &sw).await;
+            while let Some((_, p)) = read_packet(&mut s).await {
+                seen.lock().unwrap().packets.push(p);
+            }
+            return;
+        }
+        Plan::DoubleSwitch => {
+            let mut sw = vec![0xFE];
+            sw.extend_from_slice(b"mysql_native_password\0abcdefghijklmnopqrst\0");
+            write_packet(&mut s, 2, &sw).await;
+            if read_packet(&mut s).await.is_none() {
+                return;
+            }
+            let mut sw2 = vec![0xFE];
+            sw2.extend_from_slice(b"parsec\0");
+            write_packet(&mut s, 4, &sw2).await;
+            while let Some((_, p)) = read_packet(&mut s).await {
+                seen.lock().unwrap().packets.push(p);
+            }
+            return;
+        }
         Plan::DemandFullAuth => {
             // "fast authentication failed, send the password" (0x01 0x04).
             write_packet(&mut s, 2, &[0x01, 0x04]).await;
@@ -182,6 +246,17 @@ async fn serve(mut s: TcpStream, plan: Plan, file: String, seen: Arc<Mutex<Seen>
         seen.lock().unwrap().packets.push(p.clone());
         match p.first() {
             Some(0x01) => return, // COM_QUIT
+            Some(0x03) if p[1..].starts_with(b"SELECT @@server_uuid") => {
+                let uuid = match plan {
+                    Plan::Hang { moving_uuid: true } => format!("uuid-{conn_no}"),
+                    _ => "uuid-same".to_string(),
+                };
+                one_column(&mut s, &[uuid.into_bytes()]).await;
+            }
+            Some(0x03) if plan == Plan::HugeCatalog && contains(&p, b"information_schema") => {
+                let rows: Vec<Vec<u8>> = (0..600).map(|_| vec![b'x'; 70_000]).collect();
+                one_column(&mut s, &rows).await;
+            }
             Some(0x03) if p[1..].starts_with(b"SELECT 'trigger'") => match plan {
                 Plan::AskForFile => {
                     let mut req = vec![0xFB];
@@ -207,6 +282,13 @@ async fn serve(mut s: TcpStream, plan: Plan, file: String, seen: Arc<Mutex<Seen>
                     write_packet(&mut s, 7, &[200, b'a', b'b', b'c']).await;
                     write_packet(&mut s, 8, END).await;
                 }
+                Plan::HugeColumnCount => {
+                    let mut h = vec![0xFE];
+                    h.extend_from_slice(&(1u64 << 40).to_le_bytes());
+                    write_packet(&mut s, 1, &h).await;
+                }
+                // No answer: the statement "runs" until it is killed or the socket closes.
+                Plan::Hang { .. } => {}
                 Plan::UnknownType => {
                     write_packet(&mut s, 1, &[1]).await;
                     write_packet(&mut s, 2, &column("x", 0x77, 255, 0)).await;
@@ -440,4 +522,228 @@ async fn an_unknown_column_type_is_an_error_not_a_panic() {
     if let Ok(q) = r {
         assert_eq!(q.rows.len(), 1);
     }
+}
+
+// ---- audit findings ------------------------------------------------------------------------
+
+/// Audit finding 3a/3b: MariaDB's ed25519 and parsec plugins reached a panic (an abort in a
+/// release build). They are refused like any unknown plugin, and nothing is sent.
+#[tokio::test]
+async fn ed25519_and_parsec_switches_are_refused_not_panics() {
+    for plugin in ["client_ed25519", "parsec"] {
+        let f = fake(Plan::SwitchTo(plugin), "").await;
+        let e = MysqlHandle::connect(params(f.port, false), creds())
+            .await
+            .err()
+            .expect("refused");
+        assert!(
+            matches!(&e, CoreError::Auth(m) if m.contains(plugin)),
+            "{plugin}: {e:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!contains(
+            &f.seen.lock().unwrap().all_bytes(),
+            PASSWORD.as_bytes()
+        ));
+    }
+}
+
+/// Audit finding 3b: a second auth switch is an error.
+#[tokio::test]
+async fn a_second_auth_switch_is_an_error() {
+    let f = fake(Plan::DoubleSwitch, "").await;
+    let r = MysqlHandle::connect(params(f.port, false), creds()).await;
+    assert!(r.is_err());
+}
+
+/// Audit finding 3c: a result header announcing 2^40 columns used to size an allocation.
+#[tokio::test]
+async fn a_huge_column_count_is_refused_before_allocating() {
+    let f = fake(Plan::HugeColumnCount, "").await;
+    let h = MysqlHandle::connect(params(f.port, false), creds())
+        .await
+        .expect("login");
+    let r = h
+        .execute_collect(
+            "SELECT 'trigger'",
+            ExecOptions::default(),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(r.is_err(), "{r:?}");
+}
+
+/// Audit finding 7: catalog values are cut and a catalog listing stops at its byte budget.
+#[tokio::test]
+async fn catalog_listings_are_bounded_per_value_and_in_total() {
+    let f = fake(Plan::HugeCatalog, "").await;
+    let h = MysqlHandle::connect(params(f.port, false), creds())
+        .await
+        .expect("login");
+    let dbs = h.list_databases().await.unwrap();
+    assert!(!dbs.is_empty());
+    assert!(
+        dbs.iter().all(|d| d.len() <= 64 * 1024 + 16),
+        "a value was kept whole"
+    );
+    let total: usize = dbs.iter().map(String::len).sum();
+    assert!(total <= 33 * 1024 * 1024, "{total}");
+    assert!(dbs.len() < 600, "the byte budget did not stop the listing");
+}
+
+/// Audit finding 11: an oversized table cap from IPC does not overflow.
+#[tokio::test]
+async fn an_oversized_table_cap_does_not_overflow() {
+    let f = fake(Plan::Plain, "").await;
+    let h = MysqlHandle::connect(params(f.port, false), creds())
+        .await
+        .expect("login");
+    let meta = h.schema_metadata(None, usize::MAX).await.unwrap();
+    assert!(meta.tables.is_empty());
+}
+
+/// Audit finding 8: a `KILL QUERY` goes only to the server the statement runs on. Behind a
+/// reader endpoint the kill connection may land on another instance, where the same id is
+/// someone else's session.
+#[tokio::test]
+async fn kill_query_is_sent_only_to_the_same_server() {
+    for moving in [false, true] {
+        let f = fake(
+            Plan::Hang {
+                moving_uuid: moving,
+            },
+            "",
+        )
+        .await;
+        let h = MysqlHandle::connect(params(f.port, false), creds())
+            .await
+            .expect("login");
+        let cancel = CancellationToken::new();
+        let run = tokio::spawn({
+            let (h, c) = (h.clone(), cancel.clone());
+            async move {
+                h.execute_collect("SELECT 'trigger'", ExecOptions::default(), c)
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        cancel.cancel();
+        assert!(matches!(run.await.unwrap(), Err(CoreError::Cancelled)));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let kills = f
+            .seen
+            .lock()
+            .unwrap()
+            .packets
+            .iter()
+            .filter(|p| p.len() > 1 && p[1..].starts_with(b"KILL QUERY"))
+            .count();
+        if moving {
+            assert_eq!(kills, 0, "a kill was sent to another instance");
+        } else {
+            assert_eq!(kills, 1, "the kill was not sent to the same instance");
+        }
+    }
+}
+
+/// Audit finding 10: each database name opens its own pool; a connection holds a bounded
+/// number, so `shop`, `Shop`, `sHop` … cannot open pools without end.
+#[tokio::test]
+async fn database_pools_per_connection_are_capped() {
+    use async_trait::async_trait;
+    use vibelens_core::connections::{ConnectionManager, MAX_MYSQL_POOLS_PER_PROFILE};
+    use vibelens_core::ports::{CredentialSource, ProfileStore, TunnelHandle, TunnelProvider};
+    use vibelens_core::profiles::JsonProfileStore;
+
+    struct C;
+    #[async_trait]
+    impl CredentialSource for C {
+        async fn resolve(
+            &self,
+            _: &ConnectionProfile,
+        ) -> vibelens_core::Result<ResolvedCredentials> {
+            Ok(ResolvedCredentials {
+                username: Some("app".into()),
+                password: Some(SecretString::from(PASSWORD)),
+                ..ResolvedCredentials::anonymous()
+            })
+        }
+    }
+    struct T;
+    #[async_trait]
+    impl TunnelProvider for T {
+        async fn open(
+            &self,
+            _: &str,
+            _: &TunnelConfig,
+            _: &str,
+            _: u16,
+        ) -> vibelens_core::Result<TunnelHandle> {
+            Err(CoreError::Tunnel("none".into()))
+        }
+    }
+    let f = fake(Plan::Plain, "").await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(JsonProfileStore::new(dir.path().to_path_buf()).unwrap());
+    let mgr = ConnectionManager::new(store.clone(), Arc::new(C), Arc::new(T));
+    let p = store
+        .upsert(ConnectionProfile {
+            id: String::new(),
+            name: "fake".into(),
+            engine: EngineKind::Mysql,
+            host: "127.0.0.1".into(),
+            port: f.port,
+            database: Some("shop".into()),
+            auth: AuthMethod::Password {
+                username: "app".into(),
+            },
+            tls: TlsConfig {
+                mode: TlsMode::Disable,
+                ..Default::default()
+            },
+            tunnel: None,
+            environment: Environment::Dev,
+            ai_data_access: AiDataAccess::Results,
+            color: None,
+            pg: Default::default(),
+            valkey: Default::default(),
+            created_at: None,
+            updated_at: None,
+            iceberg: None,
+            redshift: None,
+            mysql: MysqlOptions {
+                connect_timeout_secs: 5,
+                max_pool_size: 1,
+                ..Default::default()
+            },
+        })
+        .unwrap();
+    let names: Vec<String> = (0..MAX_MYSQL_POOLS_PER_PROFILE)
+        .map(|i| {
+            // shop, Shop, sHop, …: case variants of one name.
+            "shop"
+                .chars()
+                .enumerate()
+                .map(|(j, c)| {
+                    if (i >> j) & 1 == 1 {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    for n in &names {
+        mgr.mysql(&p.id, Some(n)).await.expect(n);
+    }
+    let e = mgr.mysql(&p.id, Some("SHOP")).await.err().expect("capped");
+    assert!(
+        matches!(&e, CoreError::Invalid(m) if m.contains("databases open")),
+        "{e:?}"
+    );
+    // An already open one is still served.
+    mgr.mysql(&p.id, Some(&names[0])).await.unwrap();
+    mgr.disconnect(&p.id).await.unwrap();
+    mgr.mysql(&p.id, Some("SHOP")).await.unwrap();
 }

@@ -1018,3 +1018,38 @@ mod manager {
         );
     }
 }
+
+/// Audit finding 2: under ANSI_QUOTES a double-quoted name before `(` is a function call on the
+/// server; the read-only check refuses it, and the mode does not outlive the run.
+#[tokio::test]
+async fn ansi_quotes_calls_are_refused_in_read_only_runs() {
+    let d = require_mysql!();
+    let mut p = params(&d, &d.dbname, require_tls());
+    p.options.max_pool_size = 1;
+    let h = MysqlHandle::connect(p, creds(&d.user, &d.password))
+        .await
+        .unwrap();
+    // The threat is real: the server runs SLEEP here.
+    let r = collect(
+        &h,
+        "SET SESSION sql_mode = 'ANSI_QUOTES'; SELECT \"SLEEP\"(0) AS r",
+        opts(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(int(&r.rows[0][0]), 0);
+    for sql in [
+        "SELECT \"SLEEP\"(5)",
+        "SELECT \"GET_LOCK\"('vg_ansi', 100)",
+        "SELECT \"LOAD_FILE\"('/etc/passwd')",
+        "SELECT \"shop\".\"order_count\"(1)",
+    ] {
+        let e = collect(&h, sql, ro()).await.unwrap_err();
+        assert!(matches!(&e, CoreError::PolicyDenied(_)), "{sql}: {e:?}");
+    }
+    // The next run on the same (single) session starts without ANSI_QUOTES.
+    assert_eq!(
+        int(&scalar(&h, "SELECT @@session.sql_mode LIKE '%ANSI_QUOTES%'").await),
+        0
+    );
+}

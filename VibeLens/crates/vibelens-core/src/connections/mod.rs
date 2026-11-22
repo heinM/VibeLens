@@ -71,6 +71,8 @@ const AGENT_SCRIPT_DEADLINE: Duration = Duration::from_secs(150);
 /// Redshift statements are queued and run server-side too (and a Serverless workgroup may have
 /// to resume first), so they get the same budget as Athena.
 const AGENT_REDSHIFT_TIMEOUT_MS: u64 = 120_000;
+/// Most MySQL database pools one profile may hold at once (one per database name).
+pub const MAX_MYSQL_POOLS_PER_PROFILE: usize = 8;
 /// Safety valve for `valkey_scan`: stop after this many SCAN pages even if the cursor never ends.
 const MAX_SCAN_PAGES: usize = 2_000;
 
@@ -801,6 +803,21 @@ impl ConnectionManager {
             return Ok(handle);
         }
 
+        // Each database name gets its own pool, and the name comes from the UI or the model;
+        // `shop`, `Shop` and `sHop` would each open one. A connection holds a bounded number.
+        let open = self
+            .lock()
+            .mysql
+            .keys()
+            .filter(|(id, _)| *id == profile.id)
+            .count();
+        if open >= MAX_MYSQL_POOLS_PER_PROFILE {
+            return Err(CoreError::Invalid(format!(
+                "connection \"{}\" already has {open} databases open, the most one connection \
+                 may hold; disconnect it to start over",
+                profile.name
+            )));
+        }
         let epoch = self.lock().epoch(&profile.id);
         let mut attempt = Attempt::begin(self, &profile);
         let dialed = self

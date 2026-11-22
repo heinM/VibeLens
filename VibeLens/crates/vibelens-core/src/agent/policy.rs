@@ -2274,6 +2274,27 @@ mod tests {
         assert!(r.reason.unwrap().contains("SET SESSION"));
     }
 
+    /// Audit finding 4: statements that change the server or other sessions are not shown as
+    /// "session settings".
+    #[test]
+    fn mysql_server_changing_statements_are_not_session_settings() {
+        for s in [
+            "SET PASSWORD FOR 'app'@'%' = 'x'; SELECT 1",
+            "SET DEFAULT ROLE ALL TO 'app'@'%'",
+            "SET RESOURCE GROUP rg FOR 42",
+            "START REPLICA",
+            "XA ROLLBACK 'xid'",
+            "LOCK TABLES orders WRITE; SELECT 1",
+            "LOCK INSTANCE FOR BACKUP",
+        ] {
+            let r = assess(&sql(s), Some(&my(Results, Environment::Prod)), false);
+            assert_eq!(r.risk, NeedsApproval, "{s}");
+            let reason = r.reason.unwrap();
+            assert!(!reason.contains("Session settings"), "{s}: {reason}");
+            assert!(reason.starts_with("PRODUCTION"), "{s}: {reason}");
+        }
+    }
+
     #[test]
     fn mysql_approval_names_host_user_and_database() {
         let f = my(ResultsWithApproval, Environment::Dev);

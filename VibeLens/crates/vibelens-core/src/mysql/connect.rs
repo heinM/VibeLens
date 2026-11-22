@@ -43,6 +43,25 @@ pub(super) type Object = managed::Object<MysqlManager>;
 pub(super) struct MyConn {
     pub conn: Conn,
     pub reset_done: bool,
+    /// Which server this session is on (`@@server_uuid`), read when it was opened. A
+    /// `KILL QUERY` for it is sent only over a connection that lands on the same server.
+    pub server: Option<String>,
+}
+
+/// Identifies one server instance; reader endpoints and proxies may route two connections to
+/// the same host name onto different instances, where the same connection id is someone else.
+const SERVER_ID_SQL: &str = "SELECT @@server_uuid";
+
+async fn server_id(conn: &mut Conn) -> Option<String> {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        conn.query_first::<Option<String>, _>(SERVER_ID_SQL),
+    )
+    .await
+    {
+        Ok(Ok(Some(Some(v)))) if !v.is_empty() => Some(v),
+        _ => None,
+    }
 }
 
 pub(super) struct MysqlManager {
@@ -56,9 +75,12 @@ impl managed::Manager for MysqlManager {
     fn create(&self) -> impl Future<Output = Result<MyConn>> + Send {
         let shared = Arc::clone(&self.shared);
         async move {
+            let mut conn = shared.connect_new().await?;
+            let server = server_id(&mut conn).await;
             Ok(MyConn {
-                conn: shared.connect_new().await?,
+                conn,
                 reset_done: false,
+                server,
             })
         }
     }
@@ -199,9 +221,9 @@ impl Shared {
         let reset = async {
             let supported = conn.reset().await.map_err(|e| map_error(&e).to_string())?;
             if !supported {
-                conn.query_drop("ROLLBACK")
-                    .await
-                    .map_err(|e| map_error(&e).to_string())?;
+                // Without COM_RESET_CONNECTION, session state (sql_mode such as ANSI_QUOTES,
+                // variables, locks) would carry over to the next run: close instead.
+                return Err("the server cannot reset sessions (COM_RESET_CONNECTION)".to_string());
             }
             conn.query_drop(format!("USE {db}"))
                 .await
@@ -213,18 +235,34 @@ impl Shared {
         }
     }
 
-    /// Stops the statement running on connection `id` from a separate connection
-    /// (`KILL QUERY`), so it stops on the server rather than only on this side. Best effort,
-    /// bounded by [`KILL_TIMEOUT`]; returns whether the server accepted it.
-    pub(super) async fn kill_query(&self, id: u32) -> bool {
+    /// Stops the statement running on connection `id` of server `server` from a separate
+    /// connection (`KILL QUERY`), so it stops on the server rather than only on this side. The
+    /// kill is sent only when the new connection reports the same `@@server_uuid` (a load
+    /// balancer may route it to another instance, where `id` is another session); up to three
+    /// connections are tried. Without a known server nothing is killed. Best effort, bounded by
+    /// [`KILL_TIMEOUT`]; returns whether the server accepted it.
+    pub(super) async fn kill_query(&self, id: u32, server: Option<&str>) -> bool {
+        let Some(server) = server else {
+            tracing::warn!("MySQL KILL QUERY skipped: the server's identity is unknown");
+            return false;
+        };
         let fut = async {
-            let mut c = self.connect_new().await?;
-            let r = c
-                .query_drop(format!("KILL QUERY {id}"))
-                .await
-                .map_err(|e| map_error(&e));
-            let _ = c.disconnect().await;
-            r
+            for _ in 0..3 {
+                let mut c = self.connect_new().await?;
+                if server_id(&mut c).await.as_deref() != Some(server) {
+                    let _ = c.disconnect().await;
+                    continue;
+                }
+                let r = c
+                    .query_drop(format!("KILL QUERY {id}"))
+                    .await
+                    .map_err(|e| map_error(&e));
+                let _ = c.disconnect().await;
+                return r;
+            }
+            Err(CoreError::Database(
+                "no connection reached the server the statement runs on".into(),
+            ))
         };
         match tokio::time::timeout(KILL_TIMEOUT, fut).await {
             Ok(Ok(())) => true,

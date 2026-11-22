@@ -122,6 +122,9 @@ pub(crate) fn lex(sql: &str, backslash: bool) -> Result<Vec<Tok>, LexError> {
         } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
             kind = match b.get(i + 2) {
                 Some(b'!') => Kind::ExecComment,
+                // MariaDB (`/*M! … */`) and TiDB (`/*T! … */`) executable comments: MySQL reads
+                // them as plain comments, but a compatible server or proxy runs what is inside.
+                Some(b'M' | b'T') if b.get(i + 3) == Some(&b'!') => Kind::ExecComment,
                 Some(b'+') => Kind::Hint,
                 _ => Kind::BlockComment,
             };
@@ -273,6 +276,13 @@ mod tests {
             kinds("SELECT /*+ SET_VAR(x=1) */ 1", true)[1],
             (Kind::Hint, "/*+ SET_VAR(x=1) */")
         );
+        // Audit finding 9.
+        assert_eq!(
+            kinds("/*M!100100 DROP */", true),
+            vec![(Kind::ExecComment, "/*M!100100 DROP */")]
+        );
+        assert_eq!(kinds("/*T! x */", true)[0].0, Kind::ExecComment);
+        assert_eq!(kinds("/*Mx */", true)[0].0, Kind::BlockComment);
         assert_eq!(
             kinds("/*/ x */", true),
             vec![(Kind::BlockComment, "/*/ x */")]

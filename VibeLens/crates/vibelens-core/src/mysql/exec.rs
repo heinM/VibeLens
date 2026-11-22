@@ -342,15 +342,18 @@ struct PooledConn {
     obj: Option<Object>,
     shared: Arc<Shared>,
     id: u32,
+    server: Option<String>,
 }
 
 impl PooledConn {
     fn new(obj: Object, shared: Arc<Shared>) -> Self {
         let id = obj.conn.id();
+        let server = obj.server.clone();
         Self {
             obj: Some(obj),
             shared,
             id,
+            server,
         }
     }
 
@@ -393,7 +396,9 @@ impl PooledConn {
     async fn kill_and_discard(mut self) {
         if let Some(obj) = self.obj.take() {
             let c = Object::take(obj);
-            self.shared.kill_query(self.id).await;
+            self.shared
+                .kill_query(self.id, self.server.as_deref())
+                .await;
             close_hard(c.conn).await;
         }
     }
@@ -405,12 +410,13 @@ impl Drop for PooledConn {
         let c = Object::take(obj);
         let shared = Arc::clone(&self.shared);
         let id = self.id;
+        let server = self.server.take();
         match tokio::runtime::Handle::try_current() {
             Ok(rt) => {
                 // Keep the connection until the kill has been delivered, so the server stops the
                 // statement rather than finishing it for nobody.
                 rt.spawn(async move {
-                    shared.kill_query(id).await;
+                    shared.kill_query(id, server.as_deref()).await;
                     close_hard(c.conn).await;
                 });
             }
@@ -650,25 +656,29 @@ impl MysqlHandle {
     ) -> Result<Vec<Vec<Option<String>>>> {
         let (mut obj, _g) = self.conn().await?;
         let id = obj.conn.id();
+        let server = obj.server.clone();
         let fut = async {
             let mut out = Vec::new();
+            let mut bytes = 0usize;
             let mut result = obj.conn.query_iter(sql).await.map_err(|e| map_error(&e))?;
             while let Some(row) = result.next().await.map_err(|e| map_error(&e))? {
-                if out.len() >= max_rows {
+                if out.len() >= max_rows || bytes >= CATALOG_BYTE_BUDGET {
                     return Ok::<_, CoreError>((out, true));
                 }
-                out.push(
-                    row.unwrap_raw()
-                        .into_iter()
-                        .map(|v| match v {
-                            Some(mysql_async::Value::Bytes(b)) => {
-                                Some(String::from_utf8_lossy(&b).into_owned())
-                            }
-                            Some(mysql_async::Value::NULL) | None => None,
-                            Some(other) => Some(other.as_sql(false)),
-                        })
-                        .collect(),
-                );
+                let cells: Vec<Option<String>> = row
+                    .unwrap_raw()
+                    .into_iter()
+                    .map(|v| match v {
+                        Some(mysql_async::Value::Bytes(b)) => Some(catalog_text(&b)),
+                        Some(mysql_async::Value::NULL) | None => None,
+                        Some(other) => Some(other.as_sql(false)),
+                    })
+                    .collect();
+                bytes += cells
+                    .iter()
+                    .map(|c| 8 + c.as_ref().map_or(0, String::len))
+                    .sum::<usize>();
+                out.push(cells);
             }
             result.drop_result().await.map_err(|e| map_error(&e))?;
             Ok((out, false))
@@ -678,14 +688,14 @@ impl MysqlHandle {
             Ok(Ok((rows, true))) => {
                 // Cut: the rest is still arriving; the connection does not go back.
                 let c = Object::take(obj);
-                self.shared.kill_query(id).await;
+                self.shared.kill_query(id, server.as_deref()).await;
                 close_hard(c.conn).await;
                 Ok(rows)
             }
             Ok(Err(e)) => Err(e),
             Err(_) => {
                 let c = Object::take(obj);
-                self.shared.kill_query(id).await;
+                self.shared.kill_query(id, server.as_deref()).await;
                 close_hard(c.conn).await;
                 Err(CoreError::Timeout(
                     "reading the MySQL catalog took longer than 60 seconds".into(),
@@ -693,6 +703,25 @@ impl MysqlHandle {
             }
         }
     }
+}
+
+/// Longest catalog value kept (a comment, a default); longer ones are cut with a marker.
+pub(super) const CATALOG_VALUE_BYTES: usize = 64 * 1024;
+/// Total text one catalog query may return; reading stops there, as at the row cap.
+pub(super) const CATALOG_BYTE_BUDGET: usize = 32 * 1024 * 1024;
+
+/// A catalog value as text, cut at [`CATALOG_VALUE_BYTES`] on a character boundary.
+pub(super) fn catalog_text(b: &[u8]) -> String {
+    let cut = b.len() > CATALOG_VALUE_BYTES;
+    let mut s = String::from_utf8_lossy(&b[..b.len().min(CATALOG_VALUE_BYTES)]).into_owned();
+    if cut {
+        // A cut can split a character; drop the replacement character it leaves.
+        if s.ends_with('\u{FFFD}') {
+            s.pop();
+        }
+        s.push_str("… (cut)");
+    }
+    s
 }
 
 /// The error for the statements a read-only script did not reach because statement
@@ -766,6 +795,18 @@ mod tests {
     use secrecy::SecretString;
 
     use crate::mysql::MysqlConnectParams;
+
+    /// Audit finding 7: a hostile catalog value is cut, not kept whole.
+    #[test]
+    fn catalog_values_are_cut() {
+        let big = vec![b'x'; CATALOG_VALUE_BYTES + 10];
+        let t = catalog_text(&big);
+        assert!(t.len() <= CATALOG_VALUE_BYTES + 16 && t.ends_with("(cut)"));
+        let mut multi = vec![b'a'; CATALOG_VALUE_BYTES - 1];
+        multi.extend_from_slice("é".as_bytes());
+        assert!(!catalog_text(&multi).contains('\u{FFFD}'));
+        assert_eq!(catalog_text(b"short"), "short");
+    }
 
     #[test]
     fn collector_prefers_the_last_row_returning_statement() {

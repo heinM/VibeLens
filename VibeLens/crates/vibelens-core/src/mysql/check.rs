@@ -634,6 +634,19 @@ const READ_ONLY_FUNCTIONS: &[&str] = &[
     "VALUES",
 ];
 
+/// The name a word, a backtick-quoted identifier or a double-quoted one (ANSI_QUOTES) spells.
+fn name_of(sql: &str, t: &Tok) -> Option<String> {
+    let raw = text(sql, t);
+    match t.kind {
+        Kind::Word => Some(raw.to_string()),
+        Kind::Backtick if raw.len() >= 2 => Some(raw[1..raw.len() - 1].replace("``", "`")),
+        Kind::Str if raw.starts_with('"') && raw.len() >= 2 => {
+            Some(raw[1..raw.len() - 1].replace("\"\"", "\""))
+        }
+        _ => None,
+    }
+}
+
 fn is_word(sql: &str, t: &Tok, w: &str) -> bool {
     t.kind == Kind::Word && text(sql, t).eq_ignore_ascii_case(w)
 }
@@ -667,7 +680,10 @@ fn matching_paren(sql: &str, toks: &[Tok], open: usize) -> Option<usize> {
 fn first_unknown_call(sql: &str, toks: &[Tok]) -> Option<String> {
     for i in 0..toks.len() {
         let t = &toks[i];
-        if !matches!(t.kind, Kind::Word | Kind::Backtick) {
+        // Under ANSI_QUOTES `"name"` is an identifier, so `"SLEEP"(1)` is a call; in any other
+        // mode it is a syntax error. Either way a double-quoted name before `(` is a call here.
+        let dquoted = t.kind == Kind::Str && text(sql, t).starts_with('"');
+        if !(matches!(t.kind, Kind::Word | Kind::Backtick) || dquoted) {
             continue;
         }
         let Some(next) = toks.get(i + 1) else {
@@ -695,7 +711,7 @@ fn first_unknown_call(sql: &str, toks: &[Tok]) -> Option<String> {
         if prev.is_some_and(|p| p.kind == Kind::Punct && text(sql, p) == ".") {
             return Some(format!("a stored function ({name})"));
         }
-        if t.kind == Kind::Backtick {
+        if t.kind != Kind::Word {
             return Some(format!("a stored or loadable function ({name})"));
         }
         let up = name.to_ascii_uppercase();
@@ -804,12 +820,7 @@ pub fn check_read_only(stmt: &str) -> Result<(), String> {
         let next_is_paren = next.is_some_and(|n| n.kind == Kind::Punct && text(stmt, n) == "(");
         // SHOW statements name objects with words such as CREATE (SHOW CREATE TABLE) and
         // PROCEDURE (SHOW PROCEDURE STATUS); only what can do something is refused there.
-        if is_show {
-            if matches!(w.as_str(), "INTO" | "OUTFILE" | "DUMPFILE" | "SET") {
-                return Err(format!("{w} is not part of a read"));
-            }
-            continue;
-        }
+        // Before the SHOW branch: a locking read is refused wherever it appears.
         if w == "FOR"
             && matches!(
                 next_word.as_deref(),
@@ -821,6 +832,17 @@ pub fn check_read_only(stmt: &str) -> Result<(), String> {
                 next_word.unwrap_or_default(),
                 "locks rows or reads another session"
             ));
+        }
+        if is_show {
+            // A subquery inside SHOW … WHERE is not needed to read the catalog, and would get
+            // only the SHOW-specific checks: refused.
+            if matches!(
+                w.as_str(),
+                "INTO" | "OUTFILE" | "DUMPFILE" | "SET" | "LOCK" | "SELECT" | "WITH"
+            ) {
+                return Err(format!("{w} is not part of a SHOW read"));
+            }
+            continue;
         }
         if !DENY_WORDS.contains(&w.as_str()) {
             continue;
@@ -944,8 +966,24 @@ fn classify_statement(stmt: &str) -> (StatementClass, String) {
             StatementClass::Ddl,
             "SET GLOBAL (server configuration)".into(),
         ),
+        // Accounts, roles and resource groups are server state, not session state.
+        "SET"
+            if matches!(
+                w.get(1).map(String::as_str),
+                Some("PASSWORD" | "DEFAULT" | "ROLE" | "RESOURCE")
+            ) =>
+        {
+            (StatementClass::Ddl, label(3))
+        }
+        // START REPLICA, START SLAVE, START GROUP_REPLICATION: server administration.
+        "START" if w.get(1).map(String::as_str) != Some("TRANSACTION") => {
+            (StatementClass::Ddl, label(2))
+        }
+        // LOCK TABLES … WRITE blocks other sessions; LOCK INSTANCE FOR BACKUP blocks DDL
+        // server-wide; XA COMMIT/ROLLBACK 'xid' ends a transaction prepared by another session.
+        "LOCK" | "XA" => (StatementClass::Write, label(2)),
         "SET" | "USE" | "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE"
-        | "LOCK" | "UNLOCK" | "XA" => (StatementClass::Session, label(2)),
+        | "UNLOCK" => (StatementClass::Session, label(2)),
         "" => (StatementClass::Unknown, "statement".into()),
         // CALL, DO, HANDLER, KILL, PREPARE/EXECUTE, SHUTDOWN, HELP, … : could do anything.
         _ => (StatementClass::Unknown, first),
@@ -1006,8 +1044,16 @@ pub fn agent_refusal(sql: &str) -> Option<String> {
         return Some(e);
     }
     for stmt in &statements {
-        let Ok(toks) = lex(stmt, true) else {
-            continue;
+        // What cannot be read one way only (unterminated, or a backslash that moves a string's
+        // end under NO_BACKSLASH_ESCAPES) cannot be checked, so it is not run.
+        let toks = match lex_unambiguous(stmt) {
+            Ok(t) => t,
+            Err(e) => {
+                return Some(format!(
+                    "the statement cannot be read one way only ({e}), so what it does cannot be \
+                     checked"
+                ));
+            }
         };
         if toks.iter().any(|t| t.kind == Kind::ExecComment) {
             return Some(
@@ -1028,8 +1074,13 @@ pub fn agent_refusal(sql: &str) -> Option<String> {
             Some("SELECT … INTO OUTFILE/DUMPFILE writes a file on the database server")
         } else if first == "LOAD" {
             Some("LOAD DATA and LOAD XML read files on the database server or on this machine")
+        } else if matches!(first, "PREPARE" | "EXECUTE" | "DEALLOCATE") {
+            Some(
+                "PREPARE and EXECUTE run SQL built from a string or a variable, so the statement \
+                 shown for approval is not the one that runs; send the statement itself",
+            )
         } else if toks.iter().enumerate().any(|(i, t)| {
-            is_word(stmt, t, "LOAD_FILE")
+            name_of(stmt, t).is_some_and(|n| n.eq_ignore_ascii_case("LOAD_FILE"))
                 && toks
                     .get(i + 1)
                     .is_some_and(|n| n.kind == Kind::Punct && text(stmt, n) == "(")
@@ -1136,6 +1187,7 @@ mod tests {
             "SHOW FULL COLUMNS FROM orders",
             "SHOW CREATE TABLE orders",
             "SHOW PROCEDURE STATUS WHERE Db = 'shop'",
+            "SHOW TABLE STATUS LIKE 'o%'",
             "DESCRIBE orders",
             "DESC orders",
             "EXPLAIN SELECT * FROM orders",
@@ -1189,6 +1241,12 @@ mod tests {
             "SELECT sys_exec('id')",
             "SELECT shop.do_things()",
             "SELECT `sleep`(5)",
+            // Audit finding 2: under ANSI_QUOTES these are calls.
+            "SELECT \"SLEEP\"(1000)",
+            "SELECT \"LOAD_FILE\"('/etc/passwd')",
+            "SELECT \"GET_LOCK\"('x', 100)",
+            "SELECT \"shop\".\"fn\"()",
+            "SELECT \"shop\" . \"fn\" ()",
             "SELECT my_udf(a) FROM t",
             // statements that are not reads
             "SET GLOBAL max_connections = 1",
@@ -1216,6 +1274,11 @@ mod tests {
             "EXPLAIN FOR CONNECTION 12",
             "SHOW CREATE USER root",
             "SHOW TABLES WHERE SLEEP(5)",
+            // Audit finding 6.
+            "SHOW TABLES WHERE EXISTS (SELECT 1 FROM orders FOR SHARE)",
+            "SHOW TABLES WHERE EXISTS (SELECT 1 FROM orders LOCK IN SHARE MODE)",
+            "SHOW TABLES WHERE EXISTS (SELECT 1 FROM orders)",
+            "SHOW COLUMNS FROM t FOR UPDATE",
             "SELECT * FROM t PROCEDURE ANALYSE()",
             // lexing tricks
             "SELECT 1 /*!50000 ; DROP TABLE t */",
@@ -1316,6 +1379,35 @@ mod tests {
         assert_eq!(c("SET @x = 1"), StatementClass::Session);
         assert_eq!(c("USE shop"), StatementClass::Session);
         assert_eq!(c("BEGIN"), StatementClass::Session);
+        // Audit finding 4: these change the server or other sessions.
+        for (sql, class) in [
+            ("SET PASSWORD FOR 'app'@'%' = 'x'", StatementClass::Ddl),
+            ("SET PASSWORD = 'x'", StatementClass::Ddl),
+            ("SET DEFAULT ROLE ALL TO 'app'@'%'", StatementClass::Ddl),
+            ("SET ROLE admin", StatementClass::Ddl),
+            ("SET RESOURCE GROUP rg FOR 42", StatementClass::Ddl),
+            ("START REPLICA", StatementClass::Ddl),
+            ("START GROUP_REPLICATION", StatementClass::Ddl),
+            ("XA COMMIT 'xid'", StatementClass::Write),
+            ("XA ROLLBACK 'xid'", StatementClass::Write),
+            ("LOCK TABLES t WRITE", StatementClass::Write),
+            ("LOCK INSTANCE FOR BACKUP", StatementClass::Write),
+            ("START TRANSACTION", StatementClass::Session),
+            ("SET NAMES utf8mb4", StatementClass::Session),
+            (
+                "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+                StatementClass::Session,
+            ),
+            ("UNLOCK TABLES", StatementClass::Session),
+        ] {
+            assert_eq!(c(sql), class, "{sql}");
+            if class != StatementClass::Session {
+                assert!(
+                    prod_guard_reason(sql, false).is_some(),
+                    "{sql} skips the prod guard"
+                );
+            }
+        }
         assert_eq!(c("SELECT SLEEP(1)"), StatementClass::Unknown);
         assert_eq!(c("SELECT 1 INTO OUTFILE '/tmp/x'"), StatementClass::Unknown);
         assert_eq!(c("CALL p()"), StatementClass::Unknown);
@@ -1349,6 +1441,21 @@ mod tests {
             ("USE other", "USE"),
             ("SELECT 1 /*!50000 , 2 */", "executable comment"),
             ("DELIMITER $$", "DELIMITER"),
+            // Audit finding 5.
+            ("SELECT `LOAD_FILE`('/etc/passwd')", "LOAD_FILE"),
+            ("SELECT \"load_file\"('/etc/passwd')", "LOAD_FILE"),
+            (
+                "SET @q = 0x53454c454354; PREPARE s FROM @q; EXECUTE s",
+                "PREPARE",
+            ),
+            (
+                "PREPARE s FROM 'SELECT 1 INTO OUTFILE ''/tmp/x'''",
+                "PREPARE",
+            ),
+            ("EXECUTE s", "PREPARE"),
+            ("DEALLOCATE PREPARE s", "PREPARE"),
+            ("SELECT 'a\\' INTO OUTFILE '/tmp/x'", "one way only"),
+            ("SELECT 'open", "one way only"),
         ] {
             let r = agent_refusal(sql).unwrap_or_else(|| panic!("{sql} was not refused"));
             assert!(r.contains(needle), "{sql}: {r}");
