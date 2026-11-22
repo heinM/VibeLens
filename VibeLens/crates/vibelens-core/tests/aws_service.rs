@@ -252,6 +252,22 @@ async fn app_credential_source_binds_a_mysql_password_to_its_endpoint() {
         matches!(&err, CoreError::Auth(m) if m.contains("different host") && !m.contains("s3cret")),
         "{err:?}"
     );
+    // Audit finding 1: editing the engine (or a test_connection with another engine and the
+    // same id) does not reach the bound password, through password or access-token auth.
+    for engine in [EngineKind::Postgres, EngineKind::Valkey] {
+        let mut other = profile.clone();
+        other.engine = engine;
+        assert!(
+            matches!(src.resolve(&other).await, Err(CoreError::Auth(_))),
+            "{engine:?}"
+        );
+        other.auth = AuthMethod::AccessToken {
+            username: "alice".into(),
+            command: None,
+        };
+        let err = src.resolve(&other).await.unwrap_err();
+        assert!(!err.to_string().contains("s3cret"));
+    }
     // A password written without its binding (e.g. by an older version) is not used either.
     vault
         .set(&vault_keys::password("p1"), &SecretString::from("other"))

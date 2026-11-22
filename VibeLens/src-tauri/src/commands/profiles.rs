@@ -88,16 +88,22 @@ pub async fn save_profile(
         vibelens_core::mysql::secret::save_password(state.vault.as_ref(), &saved, password)
             .await
             .map_err(err)?;
-    } else if let Some(pw) = password {
-        let key = vault_keys::password(&saved.id);
-        if pw.is_empty() {
-            state.vault.delete(&key).await.map_err(err)?;
-        } else if saved.auth.uses_stored_password() {
-            state
-                .vault
-                .set(&key, &SecretString::from(pw))
-                .await
-                .map_err(err)?;
+    } else {
+        // A password bound to a MySQL endpoint does not survive a switch to another engine.
+        vibelens_core::mysql::secret::unbind_if_not_mysql(state.vault.as_ref(), &saved)
+            .await
+            .map_err(err)?;
+        if let Some(pw) = password {
+            let key = vault_keys::password(&saved.id);
+            if pw.is_empty() {
+                state.vault.delete(&key).await.map_err(err)?;
+            } else if saved.auth.uses_stored_password() {
+                state
+                    .vault
+                    .set(&key, &SecretString::from(pw))
+                    .await
+                    .map_err(err)?;
+            }
         }
     }
     if let (Some(secret), Some(TunnelConfig::Ssh { auth, .. })) =

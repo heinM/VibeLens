@@ -52,8 +52,14 @@ pub fn password_origin(p: &ConnectionProfile) -> Result<String> {
         ),
         None => String::new(),
     };
+    // The engine is part of the origin: a profile switched to another engine (by hand or over
+    // IPC) no longer matches, so the password is not handed to that engine's driver.
+    let engine = serde_json::to_value(p.engine)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
     Ok(format!(
-        "mysql|{}|{}|{user}|{tls}|ca={ca}|rds={}|tunnel={tunnel}",
+        "engine={engine}|{}|{}|{user}|{tls}|ca={ca}|rds={}|tunnel={tunnel}",
         p.host.trim().to_ascii_lowercase(),
         p.port,
         p.tls.use_rds_bundle
@@ -93,6 +99,52 @@ pub async fn save_password(
             Ok(())
         }
     }
+}
+
+/// The password (or pasted access token) under `profile:{id}:password` for any engine. Once a
+/// MySQL password has been bound there (a `password-origin` entry exists), it is released only
+/// through [`load_password`]: to a MySQL profile whose origin still matches. So editing the
+/// profile's engine, or calling `test_connection` with the same id and another engine, cannot
+/// read it. Without a binding this is the plain vault read the other engines always had.
+pub async fn load_any_password(
+    vault: &dyn SecretVault,
+    p: &ConnectionProfile,
+) -> Result<Option<SecretString>> {
+    let bound = vault
+        .get(&vault_keys::password_origin(&p.id))
+        .await?
+        .is_some();
+    if bound || p.engine == crate::model::EngineKind::Mysql {
+        if p.engine != crate::model::EngineKind::Mysql {
+            return Err(CoreError::Auth(format!(
+                "the password saved for \"{}\" was saved for a MySQL connection; enter it again \
+                 in the connection settings",
+                p.name
+            )));
+        }
+        return load_password(vault, p).await;
+    }
+    vault.get(&vault_keys::password(&p.id)).await
+}
+
+/// Called when a profile that is not a MySQL password profile is saved: a password still bound
+/// to a MySQL endpoint is deleted together with its binding, so it can never be read by the
+/// other engine. Never deletes an unbound password (other engines' own).
+pub async fn unbind_if_not_mysql(vault: &dyn SecretVault, p: &ConnectionProfile) -> Result<()> {
+    let mysql_password =
+        p.engine == crate::model::EngineKind::Mysql && p.auth.uses_stored_password();
+    if mysql_password {
+        return Ok(());
+    }
+    if vault
+        .get(&vault_keys::password_origin(&p.id))
+        .await?
+        .is_some()
+    {
+        vault.delete(&vault_keys::password(&p.id)).await?;
+        vault.delete(&vault_keys::password_origin(&p.id)).await?;
+    }
+    Ok(())
 }
 
 /// The stored password of `p`, if it was saved for `p`'s current origin. `Ok(None)` when none
@@ -179,6 +231,64 @@ mod tests {
             .await
             .unwrap();
         assert!(load_password(&vault, &good).await.unwrap().is_none());
+    }
+
+    /// Audit finding 1: the same vault key must not be readable by switching the engine.
+    #[tokio::test]
+    async fn switching_the_engine_does_not_release_a_bound_password() {
+        let vault = MemoryVault::new();
+        let good = profile("db.example");
+        save_password(&vault, &good, Some("pw".into()))
+            .await
+            .unwrap();
+        for engine in [EngineKind::Postgres, EngineKind::Valkey] {
+            let mut evil = good.clone();
+            evil.engine = engine;
+            assert!(matches!(
+                load_any_password(&vault, &evil).await,
+                Err(CoreError::Auth(_))
+            ));
+            // An access-token profile reads the same key.
+            evil.auth = AuthMethod::AccessToken {
+                username: "u".into(),
+                command: None,
+            };
+            assert!(load_any_password(&vault, &evil).await.is_err());
+        }
+        assert_eq!(
+            load_any_password(&vault, &good)
+                .await
+                .unwrap()
+                .unwrap()
+                .expose_secret(),
+            "pw"
+        );
+        // Saving the profile as another engine deletes password and binding.
+        let mut pg = good.clone();
+        pg.engine = EngineKind::Postgres;
+        unbind_if_not_mysql(&vault, &pg).await.unwrap();
+        assert!(vault.get("profile:p:password").await.unwrap().is_none());
+        assert!(
+            vault
+                .get("profile:p:password-origin")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // An unbound Postgres password is left alone and read as before.
+        vault
+            .set("profile:p:password", &SecretString::from("pg".to_string()))
+            .await
+            .unwrap();
+        unbind_if_not_mysql(&vault, &pg).await.unwrap();
+        assert_eq!(
+            load_any_password(&vault, &pg)
+                .await
+                .unwrap()
+                .unwrap()
+                .expose_secret(),
+            "pg"
+        );
     }
 
     #[tokio::test]

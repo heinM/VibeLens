@@ -445,11 +445,10 @@ impl CredentialSource for AppCredentialSource {
             AuthMethod::None => Ok(ResolvedCredentials::anonymous()),
             AuthMethod::Password { username } => {
                 // A MySQL password is used only for the endpoint it was saved for.
-                let stored = if profile.engine == EngineKind::Mysql {
-                    crate::mysql::secret::load_password(self.vault.as_ref(), profile).await?
-                } else {
-                    self.vault.get(&vault_keys::password(&profile.id)).await?
-                };
+                // A password bound to a MySQL endpoint is released only to that endpoint, whatever
+                // engine the profile now names.
+                let stored =
+                    crate::mysql::secret::load_any_password(self.vault.as_ref(), profile).await?;
                 let password = stored
                     .filter(|p| !p.expose_secret().is_empty())
                     .ok_or_else(|| CoreError::Auth(format!("no password saved for connection \"{}\"; edit the connection to add one", profile.name)))?;
@@ -464,11 +463,12 @@ impl CredentialSource for AppCredentialSource {
                 let (token, expires_at) = match command {
                     Some(cmd) => self.tokens.get_or_run(&profile.id, cmd).await?,
                     None => {
-                        let token = self
-                            .vault
-                            .get(&vault_keys::password(&profile.id))
-                            .await?
-                            .filter(|p| !p.expose_secret().trim().is_empty())
+                        let token = crate::mysql::secret::load_any_password(
+                            self.vault.as_ref(),
+                            profile,
+                        )
+                        .await?
+                        .filter(|p| !p.expose_secret().trim().is_empty())
                             .ok_or_else(|| CoreError::Auth(format!("no access token saved for connection \"{}\"; edit the connection to paste one or set a token command", profile.name)))?;
                         let exp = crate::token::jwt_expiry(token.expose_secret());
                         if let Some(exp) = exp
