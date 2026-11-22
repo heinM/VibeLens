@@ -1,6 +1,8 @@
 use secrecy::SecretString;
 use tauri::State;
-use vibelens_core::model::{ConnectionProfile, SshAuth, TestResult, TunnelConfig, vault_keys};
+use vibelens_core::model::{
+    ConnectionProfile, EngineKind, SshAuth, TestResult, TunnelConfig, vault_keys,
+};
 
 use super::{CmdResult, err};
 use crate::state::AppState;
@@ -80,7 +82,13 @@ pub async fn save_profile(
             }
         }
     }
-    if let Some(pw) = password {
+    if saved.engine == EngineKind::Mysql {
+        // Bound to the endpoint it is saved for; deleted when the profile now points elsewhere
+        // without a new one (`mysql::secret`).
+        vibelens_core::mysql::secret::save_password(state.vault.as_ref(), &saved, password)
+            .await
+            .map_err(err)?;
+    } else if let Some(pw) = password {
         let key = vault_keys::password(&saved.id);
         if pw.is_empty() {
             state.vault.delete(&key).await.map_err(err)?;
@@ -127,6 +135,7 @@ pub async fn delete_profile(state: State<'_, AppState>, id: String) -> CmdResult
     let _ = state.connections.disconnect(&id).await;
     for key in [
         vault_keys::password(&id),
+        vault_keys::password_origin(&id),
         vault_keys::ssh_password(&id),
         vault_keys::ssh_passphrase(&id),
         vault_keys::iceberg_secret(&id),
