@@ -378,7 +378,7 @@ may work but is not a goal. Code: `crates/vibelens-core/src/mysql/`, `src-tauri/
 `vendor/mysql_async/` (patched driver), UI under `src/` (`mysqlForm.ts`, `MysqlTree.tsx`, the
 `mysql` dialect in `lib/sqlIntel`).
 
-### 6.1 Driver: `mysql_async`, vendored with a four-point patch
+### 6.1 Driver: `mysql_async`, vendored and patched
 
 Both candidates were read at their current versions (`mysql_async` 0.37.1 with `mysql_common`
 0.37.3; `sqlx-mysql` 0.8.6, the version already in `Cargo.lock`) against the requirements:
@@ -405,6 +405,11 @@ upstream copy is its own commit; the patch is the next one and is listed in
    fails (`InsecureFullAuth`) instead of asking the server for an RSA key. A Unix socket no longer
    counts as secure (VibeLens never uses one: `prefer_socket(false)`).
 4. An auth switch to `mysql_clear_password` is answered only when enabled *and* over TLS.
+5. (Audit 2026-11-22) A server cannot abort the process (release builds use `panic = "abort"`):
+   an auth switch to MariaDB's `client_ed25519` or `parsec` is refused as an unknown plugin
+   (both reached a `panic`/`unwrap`), a second switch is an error instead of `unreachable!`,
+   and a result header announcing more than 4096 columns is refused before anything is
+   allocated for it.
 
 ### 6.2 Design
 
@@ -413,7 +418,8 @@ upstream copy is its own commit; the patch is the next one and is listed in
   `ConnectionProfile.mysql: MysqlOptions` holds `connectTimeoutSecs` (1–600), `statementTimeoutMs`,
   `idleDisconnectSecs` and `maxPoolSize` (1–32). Rules in `mysql/validate.rs`, run on save and on
   every connect and test (`cleartext::check_profile`).
-- **Connect.** One `deadpool` pool per (profile, database); `create()` resolves credentials per
+- **Connect.** One `deadpool` pool per (profile, database), at most 8 databases per connection
+  at once (a name differing only in case opens another pool, so the number is capped); `create()` resolves credentials per
   physical connection (a fresh RDS IAM token each time, signed for the real host and port).
   The SSH tunnel and its pinned host key are the Postgres ones; the driver dials the tunnel's
   local port and verifies TLS against the profile's host. Driver options: `prefer_socket(false)`
@@ -422,18 +428,21 @@ upstream copy is its own commit; the patch is the next one and is listed in
   taken from the server), `secure_auth`, statement cache off.
 - **Pool hygiene.** A run that ends cleanly returns its connection after `COM_RESET_CONNECTION`
   (rolls back, drops temporary tables, releases table locks and `GET_LOCK`s, resets session and
-  user variables) and `USE` of the pool's database, which the reset does not restore. Every other
-  ending closes the connection.
+  user variables, `sql_mode`) and `USE` of the pool's database, which the reset does not restore.
+  A server without `COM_RESET_CONNECTION` gets its connections closed instead of reused. Every
+  other ending closes the connection.
 - **Execution.** Scripts are split on the client (`mysql/check.rs`, a lexer that follows
   `sql_lex.cc`: `#` and `-- ` comments ending at `\n` only, `--` without a following space is not a
-  comment, block comments do not nest, `/*! */` and `/*+ */` are recognised, backslash escapes,
+  comment, block comments do not nest, `/*! */`, `/*M! */` (MariaDB), `/*T! */` (TiDB) and
+  `/*+ */` are recognised, backslash escapes,
   backticks, `BEGIN … END` bodies of `CREATE PROCEDURE/FUNCTION/TRIGGER/EVENT` kept whole).
   `DELIMITER` is refused with advice. Each statement is one `COM_QUERY` (text protocol); rows
   stream into `QueryEvent::Rows` pages. A script that leaves a transaction open is rolled back
   with a message.
 - **Catalog.** `information_schema` only; names are sent as `CONVERT(X'…' USING utf8mb4)` hex
   literals, which no `sql_mode` reads differently, so a database or table name cannot change the
-  query. Listings are bounded (10 000 databases, 20 000 objects, 200 000 detail rows, 60 s).
+  query. Listings are bounded (10 000 databases, 20 000 objects, 200 000 detail rows, each value
+  cut at 64 KiB, 32 MiB of text per query, 60 s); a table cap from IPC is clamped to 1–20 000.
 - **Values.** BIGINT and DECIMAL → strings; other integers and finite floats → numbers; BIT →
   binary digits; JSON → parsed (text when it does not parse or nests deeper than 128); dates as
   sent (`0000-00-00` included); binary strings, BLOB, GEOMETRY, VECTOR and text that is not
@@ -446,11 +455,14 @@ upstream copy is its own commit; the patch is the next one and is listed in
 
 - **R1 (vault only, bound to its endpoint).** The password is in the vault (`profile:{id}:password`)
   and, for MySQL, stored with its origin (`profile:{id}:password-origin`: host, port, user, TLS
-  mode, CA path and SHA-256 of its contents, RDS bundle switch, SSH tunnel endpoint) in the order
-  unbind, write, bind. The credential source hands it out only while the profile's origin is the
-  same (`mysql::secret::load_password`), so a hand-edited `profiles.json` or a direct
-  `test_connection` cannot send it elsewhere; saving a profile that points elsewhere without a
-  new password deletes it. RDS IAM tokens are minted per connection and never stored. Errors
+  mode, CA path and SHA-256 of its contents, RDS bundle switch, SSH tunnel endpoint, and the
+  engine) in the order unbind, write, bind. Once a binding exists, the credential source releases
+  that vault entry only through `mysql::secret::load_password`, for every engine and both the
+  password and access-token branches (`load_any_password`): a profile whose engine was edited to
+  Postgres or Valkey, or a `test_connection` with the same id and another engine, gets an
+  authentication error. A hand-edited `profiles.json` or a direct `test_connection` cannot send it
+  elsewhere; saving a profile that points elsewhere without a new password deletes it, and saving
+  it as another engine deletes password and binding together. RDS IAM tokens are minted per connection and never stored. Errors
   carry no password (`map_error` never formats options).
 - **R2 (no secret in cleartext to another machine).** Stricter than Postgres: a password to any
   host other than `localhost`, `127.0.0.0/8` or `::1`, or through any SSH tunnel, needs
@@ -472,27 +484,38 @@ upstream copy is its own commit; the patch is the next one and is listed in
   `OUTFILE`, `DUMPFILE`, `FOR UPDATE/SHARE/CONNECTION`, `LOCK`, `SET` (except `CHARACTER SET`),
   `HANDLER`, `DO`, `CALL`, `LOAD`, `KILL`, `USE` (except index hints) or any other write,
   session or administration keyword as a bare word; `SHOW CREATE USER` refused (password
-  hashes); and every function call must be a MySQL built-in on the read-only allow-list
-  (schema-qualified or backtick-quoted calls are stored or loadable functions and are refused).
+  hashes); a `SHOW … WHERE` may hold no subquery (`SELECT`, `WITH`) and no locking clause; and
+  every function call must be a MySQL built-in on the read-only allow-list. Schema-qualified
+  calls and calls through a quoted name (backticks, or double quotes, which `ANSI_QUOTES` makes
+  identifiers: `"SLEEP"(1)` is a call there) are stored or loadable functions and are refused.
   Then the run is inside `START TRANSACTION READ ONLY`; after every statement the server's status
   flags must still say "in a read-only transaction", otherwise the run stops and the session is
   closed.
 - **R6 (bounded).** `max_rows` with `truncated` (a cut read-only result kills the statement and
   closes the connection; the rest of the script is not run), `MAX_CELL_BYTES`,
-  `PAGE_BYTE_BUDGET`, one packet (row) at most 64 MiB, server error text at 4 KiB, catalog
-  listings capped.
+  `PAGE_BYTE_BUDGET`, one packet (row) at most 64 MiB, at most 4096 columns, server error text at
+  4 KiB, catalog listings capped by rows, value size and total bytes.
 - **R7 (agent sees what `AiDataAccess` allows; card shows the target).** The Postgres matrix
   with MySQL's classifier. The database is resolved once with `effective_database` and pinned
   for execution; the card's detail line is `MySQL · host:port · as user [· via SSH host:port]`
   from the profile. Refused at every access level, even with approval
   (`mysql::agent_refusal`): `INTO OUTFILE/DUMPFILE`, `LOAD DATA/XML`, `LOAD_FILE()`,
   `SET GLOBAL/PERSIST`, `KILL`, `SHUTDOWN`, `RESTART`, `CLONE`, `INSTALL/UNINSTALL`, anything
-  with `SONAME`, `USE`, `DELIMITER`, and executable comments (the card would not read as what
-  runs). Database errors under a withholding policy collapse to `SQLSTATE` + a fixed sentence
+  with `SONAME`, `USE`, `DELIMITER`, `PREPARE`/`EXECUTE`/`DEALLOCATE` (dynamic SQL), executable
+  comments (the card would not read as what runs), `LOAD_FILE` however its name is quoted, and
+  any statement that does not lex, or lexes differently with and without backslash escapes.
+  Statements that change the server or other sessions are never "session-only": `SET PASSWORD`,
+  `SET DEFAULT ROLE`, `SET ROLE`, `SET RESOURCE GROUP` and every `START` other than
+  `START TRANSACTION` are DDL; `LOCK` and `XA` are writes; so the production guard and the card
+  treat them as changes. Database errors under a withholding policy collapse to `SQLSTATE` + a fixed sentence
   (the message carries `SQLSTATE xxxxx`).
 - **R8 (cancel and timeout stop the server).** Cancel, a timeout, a dropped run (agent tool
   timeout, aborted task) and a closed result channel send `KILL QUERY <id>` from a separate,
-  freshly authenticated connection, then close the connection. The per-statement timeout is
+  freshly authenticated connection, then close the connection. The kill is sent only when that
+  connection reports the same `@@server_uuid` as the session it targets (recorded when the
+  session opened; up to three tries), so behind a reader endpoint or proxy it cannot reach
+  another instance's session with the same id; when the server cannot be identified no kill is
+  sent and the connection is only closed. The per-statement timeout is
   enforced on the client for every statement and by `max_execution_time` on the server for
   `SELECT`s. Agent SQL keeps the 30 s statement and 150 s script budgets.
 - **R9 (validation in Rust; enums refused, not defaulted).** All rules above are in Rust;
@@ -510,6 +533,12 @@ upstream copy is its own commit; the patch is the next one and is listed in
 | A stopped agent turn leaves a query running | `KILL QUERY` on cancel, timeout, drop | `mysql_engine::cancel_stops_the_statement_on_the_server`, `::a_timeout_stops_any_statement_on_the_server` (SELECT and DO), `::a_dropped_run_kills_its_statement`, `::manager::the_agent_backend_runs_pinned_reads_and_stops_on_cancel` (all check `PROCESSLIST`) |
 | Unbounded results | Row cap while streaming, cell and page caps, 64 MiB packets | `mysql_engine::rows_are_capped_while_streaming`, `::odd_values_map_without_loss_or_panic` (1.1 MB cell) |
 | Hostile or odd values | `mysql/cells.rs` (no panics, no lossy text) | `mysql::cells` tests (zero dates, invalid UTF-8, BIT, huge DECIMAL, deep JSON, binary), `mysql_hostile::hostile_rows_are_mapped_or_refused_without_panicking` (invalid UTF-8, 9-byte BIT, row lying about its length), `::an_unknown_column_type_is_an_error_not_a_panic`, `mysql_engine::odd_values_map_without_loss_or_panic` |
+
+| A server aborts the client (ed25519 / parsec switch, repeated switch, huge column count) | Patch 5 | `mysql_hostile::ed25519_and_parsec_switches_are_refused_not_panics`, `::a_second_auth_switch_is_an_error`, `::a_huge_column_count_is_refused_before_allocating` |
+| A bound password read through another engine | Origin includes the engine; `load_any_password`; `unbind_if_not_mysql` | `mysql::secret::tests::switching_the_engine_does_not_release_a_bound_password`, `aws_service::app_credential_source_binds_a_mysql_password_to_its_endpoint` |
+| `ANSI_QUOTES` calls (`"SLEEP"(1)`) | Double-quoted name before `(` is a call; sessions are reset or closed | `check::tests::hostile_reads_are_refused`, live `mysql_engine::ansi_quotes_calls_are_refused_in_read_only_runs` |
+| A kill reaching another instance | `@@server_uuid` match | `mysql_hostile::kill_query_is_sent_only_to_the_same_server` |
+| Unbounded catalog text, oversized table cap, many pools | Value and byte caps, clamp, 8 pools | `mysql_hostile::catalog_listings_are_bounded_per_value_and_in_total`, `::an_oversized_table_cap_does_not_overflow`, `::database_pools_per_connection_are_capped` |
 
 Removing patch 1, 3 or 4 makes the corresponding `mysql_hostile` tests fail (checked by reverting
 them locally).
