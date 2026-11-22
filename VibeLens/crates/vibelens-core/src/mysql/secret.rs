@@ -83,13 +83,21 @@ pub async fn save_password(
         }
         Some(s) => {
             let origin = password_origin(p)?;
-            // Unbind, write, bind: a failure half-way leaves nothing bound to the wrong place.
+            // Remove the old password, unbind, write, bind. A failure at any step leaves no
+            // password without its binding: a password without an origin would be readable by
+            // every other engine (`load_any_password` treats it as theirs).
+            vault.delete(&key).await?;
             vault.delete(&origin_key).await?;
             vault.set(&key, &SecretString::from(s)).await?;
-            vault.set(&origin_key, &SecretString::from(origin)).await
+            if let Err(e) = vault.set(&origin_key, &SecretString::from(origin)).await {
+                let _ = vault.delete(&key).await;
+                return Err(e);
+            }
+            Ok(())
         }
         None => {
-            let current = password_origin(p).ok();
+            // A CA file that cannot be read is an error, not a reason to delete the password.
+            let current = Some(password_origin(p)?);
             let stored = vault.get(&origin_key).await?;
             let same = matches!((&stored, &current), (Some(s), Some(c)) if s.expose_secret() == c);
             if !same {
@@ -99,6 +107,13 @@ pub async fn save_password(
             Ok(())
         }
     }
+}
+
+/// Deletes a profile's password and then its binding, stopping at the first failure, so the
+/// binding is never removed while the password stays (`delete_profile`).
+pub async fn delete_password(vault: &dyn SecretVault, profile_id: &str) -> Result<()> {
+    vault.delete(&vault_keys::password(profile_id)).await?;
+    vault.delete(&vault_keys::password_origin(profile_id)).await
 }
 
 /// The password (or pasted access token) under `profile:{id}:password` for any engine. Once a
@@ -289,6 +304,86 @@ mod tests {
                 .expose_secret(),
             "pg"
         );
+    }
+
+    /// A vault whose writes of one key fail.
+    struct FailingVault {
+        inner: MemoryVault,
+        fail_set: String,
+        fail_delete: String,
+    }
+
+    #[async_trait::async_trait]
+    impl SecretVault for FailingVault {
+        async fn get(&self, key: &str) -> Result<Option<SecretString>> {
+            self.inner.get(key).await
+        }
+        async fn set(&self, key: &str, value: &SecretString) -> Result<()> {
+            if key == self.fail_set {
+                return Err(CoreError::Vault("write failed".into()));
+            }
+            self.inner.set(key, value).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            if key == self.fail_delete {
+                return Err(CoreError::Vault("delete failed".into()));
+            }
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Re-audit item 3: a failed origin write must not leave an unbound password, which any
+    /// other engine could then read.
+    #[tokio::test]
+    async fn a_failed_binding_leaves_no_unbound_password() {
+        let p = profile("db.example");
+        let vault = FailingVault {
+            inner: MemoryVault::new(),
+            fail_set: "profile:p:password-origin".into(),
+            fail_delete: String::new(),
+        };
+        assert!(save_password(&vault, &p, Some("pw".into())).await.is_err());
+        assert!(vault.get("profile:p:password").await.unwrap().is_none());
+        let mut pg = p.clone();
+        pg.engine = EngineKind::Postgres;
+        assert!(load_any_password(&vault, &pg).await.unwrap().is_none());
+
+        // delete_profile: a password that cannot be deleted keeps its binding.
+        let vault = FailingVault {
+            inner: MemoryVault::new(),
+            fail_set: String::new(),
+            fail_delete: "profile:p:password".into(),
+        };
+        save_password(&vault.inner, &p, Some("pw".into()))
+            .await
+            .unwrap();
+        assert!(delete_password(&vault, "p").await.is_err());
+        assert!(
+            vault
+                .get("profile:p:password-origin")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(load_any_password(&vault, &pg).await.is_err());
+    }
+
+    /// Re-audit item 7: an unreadable CA file is an error, not a reason to drop the password.
+    #[tokio::test]
+    async fn an_unreadable_ca_file_does_not_delete_the_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, "A").unwrap();
+        let mut p = profile("db.example");
+        p.tls.ca_cert_path = Some(ca.display().to_string());
+        let vault = MemoryVault::new();
+        save_password(&vault, &p, Some("pw".into())).await.unwrap();
+        std::fs::remove_file(&ca).unwrap();
+        assert!(matches!(
+            save_password(&vault, &p, None).await,
+            Err(CoreError::Invalid(_))
+        ));
+        assert!(vault.get("profile:p:password").await.unwrap().is_some());
     }
 
     #[tokio::test]

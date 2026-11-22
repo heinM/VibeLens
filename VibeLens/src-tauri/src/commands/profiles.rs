@@ -139,9 +139,12 @@ pub async fn save_profile(
 #[tauri::command]
 pub async fn delete_profile(state: State<'_, AppState>, id: String) -> CmdResult<()> {
     let _ = state.connections.disconnect(&id).await;
+    // The password goes first and a failure stops here: its binding (password-origin) must not
+    // be removed while the password stays, or any engine could read it.
+    vibelens_core::mysql::secret::delete_password(state.vault.as_ref(), &id)
+        .await
+        .map_err(err)?;
     for key in [
-        vault_keys::password(&id),
-        vault_keys::password_origin(&id),
         vault_keys::ssh_password(&id),
         vault_keys::ssh_passphrase(&id),
         vault_keys::iceberg_secret(&id),
