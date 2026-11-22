@@ -576,6 +576,7 @@ fn profile_with(auth: AuthMethod) -> ConnectionProfile {
         updated_at: None,
         iceberg: None,
         redshift: None,
+        mysql: Default::default(),
     }
 }
 

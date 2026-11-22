@@ -374,6 +374,7 @@ fn profile(
         updated_at: None,
         iceberg: None,
         redshift: None,
+        mysql: Default::default(),
     }
 }
 

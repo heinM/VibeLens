@@ -103,6 +103,7 @@ pub fn base_profile(id: &str, options: IcebergOptions) -> ConnectionProfile {
         updated_at: None,
         iceberg: Some(options),
         redshift: None,
+        mysql: Default::default(),
     }
 }
 

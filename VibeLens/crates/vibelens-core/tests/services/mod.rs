@@ -59,6 +59,14 @@ pub const SERVICES: &[(&str, &str)] = &[
         "non-root",
         "a user that file permissions apply to (not root)",
     ),
+    (
+        "mysql",
+        "a MySQL 8 server, VG_TEST_MYSQL=\"host=… port=… user=… password=… dbname=…\"",
+    ),
+    (
+        "mysql-tls",
+        "a MySQL server whose certificate is valid for 127.0.0.1, signed by the CA in VG_TEST_MYSQL_CA",
+    ),
 ];
 
 /// Whether a test may skip for lack of `service` when `VG_TEST_REQUIRE` holds `require`.

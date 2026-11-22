@@ -11,6 +11,8 @@
 //!   the connection does not vanish from the UI after five quiet minutes. Valkey and Iceberg
 //!   handles are still closed outright. `0` means "never".
 //! - `AppToolBackend` implements `ports::ToolBackend` over this + `WorkspaceFs`.
+//! - MySQL: one `MysqlHandle` per (profile, database), like Postgres (tunnel, TLS name, IAM
+//!   tokens per physical connection, idle sessions released by the reaper).
 //! - Redshift: one `RedshiftEngine` per profile. It holds only a Data API client (no socket,
 //!   no session, no tunnel), so the idle reaper leaves it alone; AWS identity comes from the
 //!   same `AwsService` as Iceberg's.
@@ -38,6 +40,7 @@ use secrecy::SecretString;
 use crate::error::{CoreError, Result};
 use crate::iceberg::{IcebergDeps, IcebergHandle};
 use crate::model::*;
+use crate::mysql::{MysqlConnectParams, MysqlHandle};
 use crate::pg::{PgConnectParams, PgHandle};
 use crate::ports::{
     CredentialFn, CredentialSource, FileVersion, ProfileStore, SecretVault, ToolBackend,
@@ -77,6 +80,13 @@ struct PgEntry {
     connected_at: DateTime<Utc>,
     signature: String,
     server_version: Option<String>,
+}
+
+struct MysqlEntry {
+    handle: Arc<MysqlHandle>,
+    tunnel: Option<TunnelHandle>,
+    connected_at: DateTime<Utc>,
+    signature: String,
 }
 
 struct ValkeyEntry {
@@ -124,6 +134,7 @@ type ConnectLockKey = (ProfileId, Option<String>);
 #[derive(Default)]
 struct State {
     pg: HashMap<(ProfileId, String), PgEntry>,
+    mysql: HashMap<(ProfileId, String), MysqlEntry>,
     valkey: HashMap<ProfileId, ValkeyEntry>,
     iceberg: HashMap<ProfileId, IcebergEntry>,
     redshift: HashMap<ProfileId, RedshiftEntry>,
@@ -138,6 +149,7 @@ impl State {
             || self.iceberg.contains_key(profile_id)
             || self.redshift.contains_key(profile_id)
             || self.pg.keys().any(|(id, _)| id == profile_id)
+            || self.mysql.keys().any(|(id, _)| id == profile_id)
     }
     fn epoch(&self, profile_id: &str) -> u64 {
         self.epochs.get(profile_id).copied().unwrap_or(0)
@@ -230,8 +242,48 @@ impl ConnectionManager {
             .iter()
             .map(|(k, e)| (k.clone(), e.handle.clone()))
             .collect();
+        let mysql: Vec<_> = self
+            .lock()
+            .mysql
+            .iter()
+            .map(|(k, e)| (k.clone(), e.handle.clone()))
+            .collect();
 
         let mut closed = 0;
+        for (key, handle) in mysql {
+            let gone = match self.profiles.get(&key.0) {
+                Ok(p) => {
+                    if idle_exceeded(handle.idle_secs(), p.mysql.idle_disconnect_secs) {
+                        let released = handle.release_idle_connections();
+                        if released > 0 {
+                            tracing::debug!(profile_id = %key.0, database = %key.1, released, "released idle MySQL sessions");
+                            closed += released;
+                        }
+                    }
+                    false
+                }
+                Err(CoreError::NotFound(_)) => true,
+                Err(e) => {
+                    tracing::warn!(error = %e, "idle reaper could not read profile; leaving connection open");
+                    false
+                }
+            };
+            if gone {
+                let removed = {
+                    let mut st = self.lock();
+                    match st.mysql.get(&key) {
+                        Some(e) if Arc::ptr_eq(&e.handle, &handle) => st.mysql.remove(&key),
+                        _ => None,
+                    }
+                };
+                if let Some(entry) = removed {
+                    entry.handle.close().await;
+                    drop(entry.tunnel);
+                    closed += 1;
+                    self.forget_if_idle(&key.0);
+                }
+            }
+        }
         for (key, handle) in pg {
             let verdict = match self.profiles.get(&key.0) {
                 Ok(p) => {
@@ -374,6 +426,10 @@ impl ConnectionManager {
                 // `redshift()` verified the target answers and recorded the status.
                 self.redshift(profile_id).await?;
             }
+            EngineKind::Mysql => {
+                // The version comes from the handshake of the first connection.
+                self.mysql(profile_id, None).await?;
+            }
         }
         let st = self.lock();
         status_of(&st, &profile.id).ok_or_else(|| {
@@ -384,7 +440,7 @@ impl ConnectionManager {
     /// Closes every handle and tunnel of the profile. Idempotent, and works for profiles that
     /// no longer exist in the store (the delete-profile flow calls it first).
     pub async fn disconnect(&self, profile_id: &str) -> Result<()> {
-        let (pg, valkey, iceberg, redshift) = {
+        let (pg, mysql, valkey, iceberg, redshift) = {
             let mut st = self.lock();
             *st.epochs.entry(profile_id.to_string()).or_insert(0) += 1;
             st.transient.remove(profile_id);
@@ -396,8 +452,16 @@ impl ConnectionManager {
                 .cloned()
                 .collect();
             let pg: Vec<PgEntry> = keys.iter().filter_map(|k| st.pg.remove(k)).collect();
+            let mkeys: Vec<_> = st
+                .mysql
+                .keys()
+                .filter(|(id, _)| id == profile_id)
+                .cloned()
+                .collect();
+            let mysql: Vec<MysqlEntry> = mkeys.iter().filter_map(|k| st.mysql.remove(k)).collect();
             (
                 pg,
+                mysql,
                 st.valkey.remove(profile_id),
                 st.iceberg.remove(profile_id),
                 st.redshift.remove(profile_id),
@@ -406,6 +470,10 @@ impl ConnectionManager {
         // A Redshift engine holds no connection; dropping it is all there is to close.
         drop(redshift);
         for entry in pg {
+            entry.handle.close().await;
+            drop(entry.tunnel);
+        }
+        for entry in mysql {
             entry.handle.close().await;
             drop(entry.tunnel);
         }
@@ -554,6 +622,14 @@ impl ConnectionManager {
                 drop(tunnel);
                 Ok(info?.version)
             }
+            EngineKind::Mysql => {
+                let db = profile.effective_database(None);
+                let (handle, tunnel) = self.dial_mysql(profile, &db, creds).await?;
+                let version = handle.server_version();
+                handle.close().await;
+                drop(tunnel);
+                Ok(version.map(|v| format!("MySQL {v}")))
+            }
             // Handled above (it needs no credential closure).
             EngineKind::Iceberg => Err(CoreError::Other(
                 "Iceberg connections are tested by test_iceberg".into(),
@@ -626,6 +702,7 @@ impl ConnectionManager {
             .chain(st.iceberg.keys())
             .chain(st.redshift.keys())
             .chain(st.pg.keys().map(|(id, _)| id))
+            .chain(st.mysql.keys().map(|(id, _)| id))
             .chain(st.transient.keys())
             .collect();
         ids.sort();
@@ -698,6 +775,97 @@ impl ConnectionManager {
                 Ok(handle)
             }
         }
+    }
+
+    /// Pool for `(profile, database)` of a MySQL connection, connecting lazily. `database`
+    /// defaults to the profile's (required) database; the rule is the one the agent's approval
+    /// card uses ([`ConnectionProfile::effective_database`]).
+    pub async fn mysql(
+        &self,
+        profile_id: &str,
+        database: Option<&str>,
+    ) -> Result<Arc<MysqlHandle>> {
+        let profile = self.profiles.get(profile_id)?;
+        require_engine(&profile, EngineKind::Mysql)?;
+        let db = profile.effective_database(database);
+        crate::mysql::check_database_name(&db)?;
+        let key = (profile.id.clone(), db.clone());
+        let signature = connection_signature(&profile);
+
+        if let Some(handle) = self.cached_mysql(&key, &signature).await {
+            return Ok(handle);
+        }
+        let lock = self.connect_lock((profile.id.clone(), Some(db.clone())));
+        let _single_flight = lock.lock().await;
+        if let Some(handle) = self.cached_mysql(&key, &signature).await {
+            return Ok(handle);
+        }
+
+        let epoch = self.lock().epoch(&profile.id);
+        let mut attempt = Attempt::begin(self, &profile);
+        let dialed = self
+            .dial_mysql(&profile, &db, self.credential_fn(&profile, None))
+            .await;
+        let (handle, tunnel) = match dialed {
+            Ok(x) => x,
+            Err(e) => {
+                attempt.fail(&e);
+                return Err(e);
+            }
+        };
+        let entry = MysqlEntry {
+            handle: handle.clone(),
+            tunnel,
+            connected_at: Utc::now(),
+            signature,
+        };
+        let inserted = {
+            let mut st = self.lock();
+            if st.epoch(&profile.id) != epoch {
+                Err(entry)
+            } else {
+                st.transient.remove(&profile.id);
+                Ok(st.mysql.insert(key, entry))
+            }
+        };
+        match inserted {
+            Err(discarded) => {
+                handle.close().await;
+                drop(discarded.tunnel);
+                attempt.abandon();
+                Err(CoreError::Cancelled)
+            }
+            Ok(replaced) => {
+                attempt.succeeded();
+                if let Some(old) = replaced {
+                    old.handle.close().await;
+                }
+                Ok(handle)
+            }
+        }
+    }
+
+    async fn cached_mysql(
+        &self,
+        key: &(ProfileId, String),
+        signature: &str,
+    ) -> Option<Arc<MysqlHandle>> {
+        let stale = {
+            let mut st = self.lock();
+            match st.mysql.get(key) {
+                None => return None,
+                Some(e) if e.signature == signature && !tunnel_dead(&e.tunnel) => {
+                    return Some(e.handle.clone());
+                }
+                Some(_) => st.mysql.remove(key),
+            }
+        };
+        if let Some(entry) = stale {
+            tracing::info!(profile_id = %key.0, database = %key.1, "discarding stale MySQL connection");
+            entry.handle.close().await;
+            drop(entry.tunnel);
+        }
+        None
     }
 
     /// Services Iceberg connections need (AWS identity and the keychain for REST/S3 secrets).
@@ -1128,6 +1296,31 @@ impl ConnectionManager {
         let handle = ValkeyHandle::connect(params, creds).await?;
         Ok((handle, tunnel))
     }
+
+    async fn dial_mysql(
+        &self,
+        profile: &ConnectionProfile,
+        database: &str,
+        creds: CredentialFn,
+    ) -> Result<(Arc<MysqlHandle>, Option<TunnelHandle>)> {
+        // Before the tunnel and before any credential is fetched (R2, R9).
+        crate::cleartext::check_profile(profile)?;
+        let tunnel = self.open_tunnel(profile).await?;
+        let (host, port) = dial_target(profile, &tunnel);
+        let params = MysqlConnectParams {
+            host,
+            port,
+            tls_server_name: profile.host.trim().to_string(),
+            database: database.to_string(),
+            tls: profile.tls.clone(),
+            options: profile.mysql.clone(),
+            // The validator has required verified TLS for RDS IAM.
+            cleartext_plugin: matches!(profile.auth, AuthMethod::RdsIam { .. })
+                && profile.tls.mode == TlsMode::VerifyFull,
+        };
+        let handle = MysqlHandle::connect(params, creds).await?;
+        Ok((handle, tunnel))
+    }
 }
 
 /// Where the driver actually dials: the tunnel's local end when tunnelled, else the profile.
@@ -1197,12 +1390,14 @@ fn require_engine(profile: &ConnectionProfile, wanted: EngineKind) -> Result<()>
         EngineKind::Valkey => "a Valkey",
         EngineKind::Iceberg => "an Iceberg",
         EngineKind::Redshift => "a Redshift",
+        EngineKind::Mysql => "a MySQL",
     };
     let wants = match wanted {
         EngineKind::Postgres => "Postgres",
         EngineKind::Valkey => "Valkey",
         EngineKind::Iceberg => "Iceberg",
         EngineKind::Redshift => "Redshift",
+        EngineKind::Mysql => "MySQL",
     };
     Err(CoreError::Invalid(format!(
         "connection \"{}\" is {is} connection, not {wants}",
@@ -1224,6 +1419,7 @@ fn connection_signature(profile: &ConnectionProfile) -> String {
     p.ai_data_access = AiDataAccess::default();
     p.pg.idle_disconnect_secs = 0;
     p.valkey.idle_disconnect_secs = 0;
+    p.mysql.idle_disconnect_secs = 0;
     // Everything under `iceberg` (catalog, storage, query engine, default namespace) changes how
     // we connect, so it stays in the signature. Secrets live in the vault and are not part of it.
     if let Some(TunnelConfig::Ssh {
@@ -1247,8 +1443,21 @@ fn status_of(st: &State, profile_id: &str) -> Option<ConnectionStatus> {
     let valkey = st.valkey.get(profile_id);
     let iceberg = st.iceberg.get(profile_id);
     let redshift = st.redshift.get(profile_id);
-    if !pg.is_empty() || valkey.is_some() || iceberg.is_some() || redshift.is_some() {
-        let engine = if valkey.is_some() {
+    let mysql: Vec<&MysqlEntry> = st
+        .mysql
+        .iter()
+        .filter(|((id, _), _)| id == profile_id)
+        .map(|(_, e)| e)
+        .collect();
+    if !pg.is_empty()
+        || !mysql.is_empty()
+        || valkey.is_some()
+        || iceberg.is_some()
+        || redshift.is_some()
+    {
+        let engine = if !mysql.is_empty() {
+            EngineKind::Mysql
+        } else if valkey.is_some() {
             EngineKind::Valkey
         } else if iceberg.is_some() {
             EngineKind::Iceberg
@@ -1263,6 +1472,7 @@ fn status_of(st: &State, profile_id: &str) -> Option<ConnectionStatus> {
             .chain(valkey.map(|e| e.connected_at))
             .chain(iceberg.map(|e| e.connected_at))
             .chain(redshift.map(|e| e.connected_at))
+            .chain(mysql.iter().map(|e| e.connected_at))
             .min();
         let server_version = pg
             .iter()
@@ -1270,13 +1480,23 @@ fn status_of(st: &State, profile_id: &str) -> Option<ConnectionStatus> {
             .chain(valkey.and_then(|e| e.server_version.clone()))
             .chain(iceberg.map(|e| e.target.clone()).filter(|t| !t.is_empty()))
             .chain(redshift.map(|e| e.target.clone()))
+            .chain(
+                mysql
+                    .iter()
+                    .filter_map(|e| e.handle.server_version().map(|v| format!("MySQL {v}"))),
+            )
             .next();
-        let tunneled =
-            pg.iter().any(|e| e.tunnel.is_some()) || valkey.is_some_and(|e| e.tunnel.is_some());
+        let tunneled = pg.iter().any(|e| e.tunnel.is_some())
+            || mysql.iter().any(|e| e.tunnel.is_some())
+            || valkey.is_some_and(|e| e.tunnel.is_some());
         // Postgres handles whose sessions the reaper released are still connected, just asleep.
-        let detail = (engine == EngineKind::Postgres
-            && pg.iter().all(|e| e.handle.open_sessions() == 0))
-        .then(|| "idle: no open server sessions; the next query reconnects".to_string());
+        let asleep = match engine {
+            EngineKind::Postgres => pg.iter().all(|e| e.handle.open_sessions() == 0),
+            EngineKind::Mysql => mysql.iter().all(|e| e.handle.open_sessions() == 0),
+            _ => false,
+        };
+        let detail =
+            asleep.then(|| "idle: no open server sessions; the next query reconnects".to_string());
         return Some(ConnectionStatus {
             profile_id: profile_id.to_string(),
             engine,
@@ -1462,6 +1682,10 @@ impl AppToolBackend {
                 .execute_collect(sql, database, opts, cancel.clone())
                 .await;
         }
+        if profile.engine == EngineKind::Mysql {
+            let h = self.connections.mysql(profile_id, database).await?;
+            return h.execute_collect(sql, opts, cancel.clone()).await;
+        }
         // Everything else goes through the Postgres path, which rejects other engines with
         // a clear `Invalid`.
         let pg = self.connections.pg(profile_id, database).await?;
@@ -1533,6 +1757,15 @@ impl ToolBackend for AppToolBackend {
             return engine
                 .schema_metadata(database, schema_filter, max_tables)
                 .await;
+        }
+        if profile.engine == EngineKind::Mysql {
+            // On MySQL a schema is a database: `schema` (when given) names the one to describe.
+            let db = schema_filter
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or(database);
+            let h = self.connections.mysql(profile_id, database).await?;
+            return h.schema_metadata(db, max_tables).await;
         }
         let pg = self.connections.pg(profile_id, database).await?;
         pg.schema_metadata(schema_filter, max_tables).await
@@ -1613,8 +1846,12 @@ impl ToolBackend for AppToolBackend {
                     .map(|d| d.name)
                     .collect())
             }
+            EngineKind::Mysql => {
+                let h = self.connections.mysql(profile_id, None).await?;
+                h.list_databases().await
+            }
             EngineKind::Iceberg | EngineKind::Valkey => Err(CoreError::Invalid(
-                "list_databases works on Postgres and Redshift connections only".into(),
+                "list_databases works on Postgres, MySQL and Redshift connections only".into(),
             )),
         }
     }
@@ -1724,6 +1961,7 @@ mod tests {
             updated_at: None,
             iceberg: None,
             redshift: None,
+            mysql: Default::default(),
         }
     }
 

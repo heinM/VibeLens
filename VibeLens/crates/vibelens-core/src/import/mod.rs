@@ -369,6 +369,7 @@ impl Draft {
             updated_at: None,
             iceberg: None,
             redshift: None,
+            mysql: Default::default(),
         };
         ImportCandidate {
             source,

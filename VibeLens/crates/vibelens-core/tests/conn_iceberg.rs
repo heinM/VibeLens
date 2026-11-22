@@ -157,6 +157,7 @@ fn base(name: &str, options: Option<IcebergOptions>) -> ConnectionProfile {
         updated_at: None,
         iceberg: options,
         redshift: None,
+        mysql: Default::default(),
     }
 }
 

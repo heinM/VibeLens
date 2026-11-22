@@ -14,6 +14,9 @@ pub enum EngineKind {
     /// Amazon Redshift (provisioned or Serverless) through the Redshift Data API, authenticated
     /// with IAM. Options in `redshift`.
     Redshift,
+    /// MySQL 8.x, Aurora MySQL, RDS MySQL. Uses `host`, `port`, `database` (required), `auth`
+    /// (`password` or `rdsIam`), `tls` and `tunnel`; its own settings are in `mysql`.
+    Mysql,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -327,6 +330,9 @@ pub struct ConnectionProfile {
     /// `tunnel` are unused for Redshift. Holds no secret, so it has no vault entry.
     #[serde(default)]
     pub redshift: Option<super::redshift::RedshiftOptions>,
+    /// MySQL settings; ignored for other engines.
+    #[serde(default)]
+    pub mysql: super::mysql::MysqlOptions,
 }
 
 /// The Postgres database a call runs against: the requested one, else the profile's configured
@@ -377,6 +383,10 @@ impl ConnectionProfile {
         let mut unused = Vec::new();
         if !self.auth.uses_stored_password() {
             unused.push(vault_keys::password(id));
+        }
+        // A MySQL password is bound to the endpoint it was saved for (`mysql::secret`).
+        if !(self.engine == EngineKind::Mysql && self.auth.uses_stored_password()) {
+            unused.push(vault_keys::password_origin(id));
         }
         if !matches!(ssh, Some(SshAuth::Password)) {
             unused.push(vault_keys::ssh_password(id));
@@ -465,6 +475,11 @@ pub mod vault_keys {
     pub const BUNDLE: &str = "vault-bundle";
     pub fn password(profile_id: &str) -> String {
         format!("profile:{profile_id}:password")
+    }
+    /// The endpoint a MySQL [`password`] was saved for (`mysql::secret::password_origin`). Not
+    /// secret, but kept next to it so a hand-edited profile cannot send the password elsewhere.
+    pub fn password_origin(profile_id: &str) -> String {
+        format!("profile:{profile_id}:password-origin")
     }
     pub fn ssh_password(profile_id: &str) -> String {
         format!("profile:{profile_id}:ssh-password")

@@ -167,6 +167,7 @@ fn profile(id: &str, options: RedshiftOptions) -> ConnectionProfile {
             },
             ..options
         }),
+        mysql: Default::default(),
     }
 }
 

@@ -319,6 +319,7 @@ fn iceberg_profile(
             default_namespace: default_namespace.map(String::from),
         }),
         redshift: None,
+        mysql: Default::default(),
     }
 }
 

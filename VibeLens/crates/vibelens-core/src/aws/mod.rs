@@ -444,10 +444,13 @@ impl CredentialSource for AppCredentialSource {
         match &profile.auth {
             AuthMethod::None => Ok(ResolvedCredentials::anonymous()),
             AuthMethod::Password { username } => {
-                let password = self
-                    .vault
-                    .get(&vault_keys::password(&profile.id))
-                    .await?
+                // A MySQL password is used only for the endpoint it was saved for.
+                let stored = if profile.engine == EngineKind::Mysql {
+                    crate::mysql::secret::load_password(self.vault.as_ref(), profile).await?
+                } else {
+                    self.vault.get(&vault_keys::password(&profile.id)).await?
+                };
+                let password = stored
                     .filter(|p| !p.expose_secret().is_empty())
                     .ok_or_else(|| CoreError::Auth(format!("no password saved for connection \"{}\"; edit the connection to add one", profile.name)))?;
                 Ok(ResolvedCredentials {

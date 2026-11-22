@@ -365,12 +365,12 @@ fn spec(name: &str, description: &str, properties: Value, required: &[&str]) -> 
 /// when to use each tool, what comes back, and what the user will be asked to approve.
 pub(super) fn tool_specs() -> Vec<ToolSpec> {
     let profile_id = json!({ "type": "string", "description": "Connection id from list_connections. Defaults to the user's active connection when omitted." });
-    let database = json!({ "type": "string", "description": "Postgres or Amazon Redshift database name (list_databases lists them). Defaults to the connection's default database. Ignored for Apache Iceberg connections." });
+    let database = json!({ "type": "string", "description": "Postgres, MySQL or Amazon Redshift database name (list_databases lists them). Defaults to the connection's default database. Ignored for Apache Iceberg connections." });
     let db = json!({ "type": "integer", "minimum": 0, "maximum": 255, "description": "Valkey logical database number. Default 0. Cluster-mode connections only have 0." });
     vec![
         spec(
             "list_connections",
-            "List the user's saved database connections: id, name, engine (postgres, valkey, iceberg or redshift), environment (dev/test/staging/prod) and ai_data_access (none, schemaOnly, resultsWithApproval, results). \
+            "List the user's saved database connections: id, name, engine (postgres, mysql, valkey, iceberg or redshift), environment (dev/test/staging/prod) and ai_data_access (none, schemaOnly, resultsWithApproval, results). \
              Call this first when you do not know which connection to use. It never returns hosts or credentials. ai_data_access tells you what you may see: 'none' means do not touch the connection; \
              'schemaOnly' means table/column structure only, no row data; the 'results' levels allow query results (the second one asks the user before each query).",
             json!({}),
@@ -378,7 +378,7 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "list_databases",
-            "List the names of the databases on a Postgres server or an Amazon Redshift cluster or workgroup (Postgres: templates and databases that refuse connections are left out). \
+            "List the names of the databases on a Postgres or MySQL server or an Amazon Redshift cluster or workgroup (Postgres: templates and databases that refuse connections are left out). \
              Use it when the user mentions another database, or when the table you need is not in the active one; then pass that name as `database` to get_schema, describe_table and run_sql. \
              Names only: no sizes, owners or contents. Works at every ai_data_access level except 'none'. Not for Apache Iceberg (use get_schema for its namespaces) or Valkey connections.",
             json!({ "profile_id": profile_id.clone() }),
@@ -386,27 +386,28 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "get_schema",
-            "Return the structure of a SQL connection (Postgres or Apache Iceberg) in compact text: schemas, tables, views, columns with types, and for Postgres primary and foreign keys. \
+            "Return the structure of a SQL connection (Postgres, MySQL or Apache Iceberg) in compact text: schemas, tables, views, columns with types, and for Postgres and MySQL primary and foreign keys. \
+             On MySQL a schema is a database: the listing is of one database (`database`, or `schema` naming one). \
              On Iceberg the 'schema' of a table is its namespace (nested namespaces are joined with '.', e.g. 'analytics.daily') and column types are Iceberg types (long, decimal(12, 2), timestamptz, struct<...>, list<...>). \
              Capped at 200 tables; if truncated, pass `schema` to narrow it. \
              Use this before writing SQL so you use real table and column names instead of guessing. Works at every ai_data_access level except 'none'. Not for Valkey connections.",
-            json!({ "profile_id": profile_id.clone(), "database": database.clone(), "schema": { "type": "string", "description": "Only this schema (Postgres, e.g. 'public') or Iceberg namespace (e.g. 'shop' or 'analytics.daily')." } }),
+            json!({ "profile_id": profile_id.clone(), "database": database.clone(), "schema": { "type": "string", "description": "Only this schema (Postgres, e.g. 'public'; on MySQL a database name) or Iceberg namespace (e.g. 'shop' or 'analytics.daily')." } }),
             &["profile_id"],
         ),
         spec(
             "describe_table",
             "Return full detail for one table or view: every column (type, nullability, default, comments) and, on Postgres, primary key, indexes with definitions, foreign keys, and the planner's row estimate. \
-             Use it when you need index or constraint detail for a specific table, for example before suggesting an index or a join. Works on Postgres and Apache Iceberg connections (on Iceberg, name the namespace in `schema`, or rely on the connection's default namespace).",
+             Use it when you need index or constraint detail for a specific table, for example before suggesting an index or a join. Works on Postgres, MySQL and Apache Iceberg connections (on Iceberg, name the namespace in `schema`, or rely on the connection's default namespace; on MySQL `schema` is the database and defaults to `database`).",
             json!({
                 "profile_id": profile_id.clone(), "database": database.clone(),
-                "schema": { "type": "string", "description": "Postgres schema (default 'public') or Iceberg namespace (default: the connection's default namespace; nested namespaces joined with '.')." },
+                "schema": { "type": "string", "description": "Postgres schema (default 'public'), MySQL database (default: `database`) or Iceberg namespace (default: the connection's default namespace; nested namespaces joined with '.')." },
                 "table": { "type": "string", "description": "Table or view name." }
             }),
             &["profile_id", "table"],
         ),
         spec(
             "run_sql",
-            "Run SQL on a Postgres or Apache Iceberg connection. Read-only statements (SELECT, WITH ... SELECT, EXPLAIN of a SELECT, SHOW, VALUES) execute inside a READ ONLY transaction (Iceberg: checked to be plain queries and refused otherwise); depending on the connection's ai_data_access \
+            "Run SQL on a Postgres, MySQL or Apache Iceberg connection. Read-only statements (SELECT, WITH ... SELECT, EXPLAIN of a SELECT, SHOW, VALUES) execute inside a READ ONLY transaction (Iceberg: checked to be plain queries and refused otherwise); depending on the connection's ai_data_access \
              they run immediately, need the user's approval, or are refused (schemaOnly). Anything else (INSERT, UPDATE, DELETE, DDL, SET, CALL, DO, EXPLAIN of a write, SELECT ... FOR UPDATE, or a SELECT that calls a function with side effects such as dblink, pg_read_file, lo_import, pg_advisory_lock, nextval or pg_sleep) \
              is shown to the user as an approval request and only runs if they approve; on production connections the user is warned prominently. A script may contain several statements. \
              The result is JSON: columns, rows (at most about 200, long values shortened), rowCount, truncated, commandTag. Always add LIMIT to exploratory queries. \
@@ -414,11 +415,12 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
              Iceberg writes (INSERT, CREATE TABLE AS, and on Athena, Trino or Spark also UPDATE, DELETE, MERGE and DDL) need approval and create a new table snapshot. The local (embedded) engine can only append with INSERT; UPDATE, DELETE and MERGE need a server-side engine (Athena, Trino or Spark). \
              Athena bills per TB scanned: select only the columns you need, filter on partition columns and always add LIMIT. \
              On Amazon Redshift connections the dialect is Redshift SQL; each statement commits on its own (no transactions: BEGIN, COMMIT and ROLLBACK are refused), and read-only statements are checked to be plain queries rather than run in a READ ONLY transaction. \
+             On MySQL connections the dialect is MySQL 8; read-only statements run inside START TRANSACTION READ ONLY and are checked first (built-in read-only functions only; no INTO, FOR UPDATE, :=, /*! */ or /*+ */), and INTO OUTFILE, LOAD DATA, LOAD_FILE, SET GLOBAL, KILL, USE and DELIMITER are refused in every mode. \
              On a Trino or Spark engine (remote clusters, not billed per TB) the dialect is Trino SQL or Spark SQL, writes include UPDATE, DELETE and MERGE, and session statements (USE, SET) are refused; on Spark also temporary objects, ADD, DECLARE, EXECUTE IMMEDIATE, CACHE and ${…} are refused in every mode, and read-only runs refuse reflect/java_method, direct file paths and comments. \
              For anything beyond a quick query, or any change to data or schema, prefer write_file to save the SQL as a .sql file for the user to review and run themselves. `purpose` is shown to the user next to the SQL, so state plainly why you are running it.",
             json!({
                 "profile_id": profile_id.clone(), "database": database.clone(),
-                "sql": { "type": "string", "description": "The SQL to run. One or more statements in the connection's dialect (PostgreSQL; DataFusion, Athena, Trino or Spark SQL for Iceberg, depending on its engine)." },
+                "sql": { "type": "string", "description": "The SQL to run. One or more statements in the connection's dialect (PostgreSQL; MySQL; DataFusion, Athena, Trino or Spark SQL for Iceberg, depending on its engine)." },
                 "purpose": { "type": "string", "description": "One sentence for the user: why you are running this." }
             }),
             &["profile_id", "sql", "purpose"],
@@ -917,6 +919,15 @@ pub(super) async fn run(
             let profile = backend.profile(profile_id)?;
             let (schema, table) = if profile.engine == EngineKind::Iceberg {
                 resolve_iceberg_table(&profile, schema.as_deref(), table)?
+            } else if profile.engine == EngineKind::Mysql {
+                // A MySQL schema is a database: the one named, else the call's database.
+                (
+                    schema
+                        .clone()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| profile.effective_database(database.as_deref())),
+                    table.clone(),
+                )
             } else {
                 (
                     schema.clone().unwrap_or_else(|| "public".to_string()),

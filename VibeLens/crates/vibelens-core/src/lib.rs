@@ -7,7 +7,7 @@
 //! Layout (ports & adapters):
 //! - [`model`]  — serializable domain types, mirrored in `src/ipc/types.ts`
 //! - [`ports`]  — traits between modules
-//! - adapters   — [`pg`], [`valkey`], [`aws`], [`vault`], [`profiles`], [`tunnel`], [`workspace`]
+//! - adapters   — [`pg`], [`mysql`], [`valkey`], [`aws`], [`vault`], [`profiles`], [`tunnel`], [`workspace`]
 //! - services   — [`connections::ConnectionManager`], [`agent::AgentService`]
 //! - [`sql`]    — statement classification used by the agent policy and the prod write-guard
 
@@ -21,6 +21,7 @@ pub mod error;
 pub mod iceberg;
 pub mod import;
 pub mod model;
+pub mod mysql;
 pub mod pg;
 pub mod ports;
 pub mod profiles;

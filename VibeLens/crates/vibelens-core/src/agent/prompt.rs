@@ -89,6 +89,29 @@ fn redshift_notes(p: &ConnectionProfile) -> String {
     s
 }
 
+/// What the model needs to know on a MySQL connection: the dialect, what a read-only call
+/// accepts, and how databases work. Names the default database; never the host or user.
+fn mysql_notes(p: &ConnectionProfile) -> String {
+    let mut s = String::from("\nMySQL notes (this connection)\n");
+    s.push_str(
+        "- The SQL dialect is MySQL 8's: quote identifiers with backticks, use LIMIT n (not FETCH FIRST), and remember that in MySQL a schema is a database (db.table). There is no RETURNING, no FULL OUTER JOIN and no ILIKE.\n\
+         - Read-only calls run inside START TRANSACTION READ ONLY and are checked first: only SELECT, WITH, TABLE, VALUES, SHOW, DESCRIBE and EXPLAIN pass, with no INTO, FOR UPDATE/SHARE, LOCK, user-variable assignment (:=), executable comments (/*! */), optimizer hints (/*+ */) or backslashes that change where a string ends; every function called must be a MySQL built-in that only reads (SLEEP, BENCHMARK, GET_LOCK, LOAD_FILE, LAST_INSERT_ID and stored or loadable functions are not). Anything else is not run read-only; it needs the user's approval like a write.\n\
+         - Never available: SELECT … INTO OUTFILE/DUMPFILE, LOAD DATA, LOAD_FILE(), SET GLOBAL/PERSIST, KILL, SHUTDOWN, INSTALL/UNINSTALL, USE (pass `database` instead) and DELIMITER (end each statement with ';'; a CREATE PROCEDURE body in BEGIN … END stays whole).\n\
+         - Statements of one run_sql call run on one session, one statement at a time, in order.\n",
+    );
+    if let Some(db) = p
+        .database
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
+        s.push_str(&format!(
+            "- Default database: {db}. list_databases names the others; the `database` argument of run_sql, get_schema and describe_table chooses one.\n"
+        ));
+    }
+    s
+}
+
 /// The query-engine line for Trino and Spark. Says the engine is remote and its dialect; never
 /// its address.
 fn remote_engine_note(engine: &IcebergQueryEngine) -> Option<&'static str> {
@@ -143,6 +166,7 @@ pub(super) fn build_system_prompt(
                 EngineKind::Valkey => "Valkey/Redis",
                 EngineKind::Iceberg => "Apache Iceberg",
                 EngineKind::Redshift => "Amazon Redshift",
+                EngineKind::Mysql => "MySQL",
             };
             s.push_str(&format!(
                 "- Active connection: \"{}\" (id {}), {engine}, environment {}, AI data access {}.\n",
@@ -160,6 +184,9 @@ pub(super) fn build_system_prompt(
             if p.engine == EngineKind::Redshift {
                 s.push_str(&redshift_notes(p));
             }
+            if p.engine == EngineKind::Mysql {
+                s.push_str(&mysql_notes(p));
+            }
         }
         None => match &ctx.profile_id {
             Some(id) => s.push_str(&format!("- The user's active connection (id {id}) could not be found; call list_connections.\n")),
@@ -169,7 +196,12 @@ pub(super) fn build_system_prompt(
     if let Some(db) = ctx.database.as_deref().filter(|d| !d.is_empty()) {
         s.push_str(&format!("- Active database: {db}\n"));
     }
-    if profile.is_some_and(|p| matches!(p.engine, EngineKind::Postgres | EngineKind::Redshift)) {
+    if profile.is_some_and(|p| {
+        matches!(
+            p.engine,
+            EngineKind::Postgres | EngineKind::Redshift | EngineKind::Mysql
+        )
+    }) {
         s.push_str(
             "- This connection may hold other databases: list_databases names them, and get_schema, describe_table and run_sql take a `database` argument to work in one of them. Without it they work in the active database above (on another connection, in that connection's default database).\n",
         );
@@ -222,6 +254,7 @@ mod tests {
             updated_at: None,
             iceberg: None,
             redshift: None,
+            mysql: Default::default(),
         }
     }
 

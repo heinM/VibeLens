@@ -4,6 +4,7 @@
 pub mod agent;
 pub mod aws;
 pub mod iceberg;
+pub mod mysql;
 pub mod profile;
 pub mod query;
 pub mod redshift;
@@ -14,6 +15,7 @@ pub mod workspace;
 pub use agent::*;
 pub use aws::*;
 pub use iceberg::*;
+pub use mysql::*;
 pub use profile::*;
 pub use query::*;
 pub use redshift::*;

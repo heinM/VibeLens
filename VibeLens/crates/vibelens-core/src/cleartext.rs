@@ -204,6 +204,9 @@ pub fn check_profile(profile: &ConnectionProfile) -> Result<()> {
             Some(o) => crate::redshift::validate_options(o),
             None => invalid("Redshift connection options are required".into()),
         },
+        // Stricter than Postgres: a password to another machine needs verified TLS too, and an
+        // RDS IAM token always does (`mysql::validate`).
+        EngineKind::Mysql => crate::mysql::check_profile(profile),
     }
 }
 
@@ -426,6 +429,7 @@ mod tests {
             updated_at: None,
             iceberg: None,
             redshift: None,
+            mysql: Default::default(),
         }
     }
 

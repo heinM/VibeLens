@@ -462,10 +462,12 @@ impl TurnRunner {
         // The model picks the database; on the active connection a call that names none works
         // in the active database. Resolve it once, here, with the rule execution uses: the
         // approval card shows this value and the backend is handed this value.
-        if let Some(f) = facts
-            .as_ref()
-            .filter(|f| matches!(f.engine, EngineKind::Postgres | EngineKind::Redshift))
-        {
+        if let Some(f) = facts.as_ref().filter(|f| {
+            matches!(
+                f.engine,
+                EngineKind::Postgres | EngineKind::Redshift | EngineKind::Mysql
+            )
+        }) {
             call.default_database(self.ctx.profile_id.as_deref(), self.ctx.database.as_deref());
             call.pin_database(f.database.as_deref());
         }
