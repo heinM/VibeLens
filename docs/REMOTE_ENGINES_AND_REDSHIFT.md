@@ -410,6 +410,12 @@ upstream copy is its own commit; the patch is the next one and is listed in
    (both reached a `panic`/`unwrap`), a second switch is an error instead of `unreachable!`,
    and a result header announcing more than 4096 columns, or column definitions totalling more
    than 16 MiB, is refused before anything is allocated for it.
+6. (Third review) The whole class was swept: a zero-length row packet no longer reaches
+   `packet[0]`, a handshake length that overflows in `mysql_common` is refused before the
+   parse, and every other `unwrap`/`expect`/index/`unreachable!` on the paths VibeLens uses is
+   listed in `PATCH.md` with why server bytes cannot reach it. A seeded fuzz test
+   (`mysql_hostile::fuzz`) corrupts the conversation at every stage and fails on any panic or
+   hang.
 
 ### 6.2 Design
 
@@ -420,8 +426,8 @@ upstream copy is its own commit; the patch is the next one and is listed in
   every connect and test (`cleartext::check_profile`).
 - **Connect.** One `deadpool` pool per (profile, database), at most 8 databases per connection
   at once (a name differing only in case opens another pool, so the number is capped; counting,
-  dialing and inserting happen under one per-profile lock, and at the cap the least recently
-  used idle pool is closed); `create()` resolves credentials per
+  a slot is reserved under the state lock and the dial runs outside any lock, so a slow server
+  holds up nobody; at the cap the least recently used pool that nobody holds is closed); `create()` resolves credentials per
   physical connection (a fresh RDS IAM token each time, signed for the real host and port).
   The SSH tunnel and its pinned host key are the Postgres ones; the driver dials the tunnel's
   local port and verifies TLS against the profile's host. Driver options: `prefer_socket(false)`
@@ -465,7 +471,8 @@ upstream copy is its own commit; the patch is the next one and is listed in
   authentication error. A hand-edited `profiles.json` or a direct `test_connection` cannot send it
   elsewhere; saving a profile that points elsewhere without a new password deletes it, and saving
   it as another engine deletes password and binding together. Writes go: delete password, delete
-  binding, write password, write binding (and delete the password again if that write fails);
+  binding, write binding, write password, so a failure leaves at most a lone binding, which
+  fails closed;
   deleting a profile removes the password before the binding and stops if it cannot. An
   unreadable CA file is an error on save, not a reason to drop the password. RDS IAM tokens are minted per connection and never stored. Errors
   carry no password (`map_error` never formats options).
@@ -512,12 +519,16 @@ upstream copy is its own commit; the patch is the next one and is listed in
   (checked as if the body ran now), executable
   comments (the card would not read as what runs), `LOAD_FILE` however its name is quoted, and
   any statement that does not lex, or lexes differently with and without backslash escapes.
+  MariaDB's `SET STATEMENT … FOR`, `EXECUTE IMMEDIATE` (refused wherever `IMMEDIATE` appears)
+  and any `EXECUTE` inside a routine body are refused too.
   Statements that change the server or other sessions are never "session-only": `SET PASSWORD`,
   `SET DEFAULT ROLE`, `SET ROLE`, `SET RESOURCE GROUP` and every `START` other than
   `START TRANSACTION` are DDL; `LOCK` and `XA` are writes; `@@global`/`@@persist` count with or
   without spacing before the dot (`SET @@global . x = 1` is accepted by MySQL 8.4); a statement
-  with an executable comment and MariaDB's `SET STATEMENT … FOR` are Unknown; so the production
-  guard and the card treat them as changes. Database errors under a withholding policy collapse to `SQLSTATE` + a fixed sentence
+  with an executable comment and MariaDB's `SET STATEMENT … FOR` are Unknown, as is a `SET`
+  with a function call or subquery (`SET @a = f()`) and any statement that lexes differently
+  with and without backslash escapes; so the production guard and the card treat them as
+  changes. Database errors under a withholding policy collapse to `SQLSTATE` + a fixed sentence
   (the message carries `SQLSTATE xxxxx`).
 - **R8 (cancel and timeout stop the server).** Cancel, a timeout, a dropped run (agent tool
   timeout, aborted task) and a closed result channel send `KILL QUERY <id>` from a separate,
@@ -528,7 +539,9 @@ upstream copy is its own commit; the patch is the next one and is listed in
   some proxies) `@@hostname`, `@@port` and `@@server_id`; both are read as raw text, never with
   a typed row conversion (those panic on a reply of the wrong shape). When neither is available
   no kill is sent: the connection is only closed, and the statement may run on until the server
-  notices the closed socket or `max_execution_time` stops it (SELECT only). The per-statement timeout is
+  notices the closed socket or `max_execution_time` stops it (SELECT only). An identity read that
+  times out or breaks makes the connection unusable: it is closed, never pooled, because the
+  late reply would be read as the answer to the next request. The per-statement timeout is
   enforced on the client for every statement and by `max_execution_time` on the server for
   `SELECT`s. Agent SQL keeps the 30 s statement and 150 s script budgets.
 - **R9 (validation in Rust; enums refused, not defaulted).** All rules above are in Rust;
@@ -553,6 +566,9 @@ upstream copy is its own commit; the patch is the next one and is listed in
 | A kill reaching another instance; identity replies of the wrong shape | Identity match (`@@server_uuid`, else host/port/server_id), raw-row reads | `mysql_hostile::kill_query_is_sent_only_to_the_same_server` (same, moving, two-column, non-UTF-8 and missing replies) |
 | Routine bodies hiding dynamic SQL or administration | `agent_refusal` scans the whole statement | `check::tests::agent_refusals` |
 | Oversized column definitions | Patch 5 (16 MiB total) | `mysql_hostile::fat_column_definitions_are_refused` |
+| Server bytes reaching any panic (the class) | Patches 5 and 6 | `mysql_hostile::fuzz::a_corrupting_server_never_panics_or_hangs_the_engine` (3000 iterations by default; `VG_FUZZ_SEED`, `VG_FUZZ_ITERS`) |
+| A reply arriving after a timeout (connection one reply behind) | A timed-out or broken identity read closes the connection; every timeout, cancel, truncation or dropped run closes it too | `mysql_hostile::a_timed_out_identity_query_closes_the_connection` |
+| Eviction of a pool a statement is about to use; one slow database blocking others | Only unheld, idle pools are evicted; a slot is reserved and the dial runs outside any lock | `mysql_hostile::database_pools_per_connection_are_capped`, `::one_slow_database_does_not_block_another` |
 | Unbounded catalog text, oversized table cap, many pools | Value and byte caps, clamp, 8 pools | `mysql_hostile::catalog_listings_are_bounded_per_value_and_in_total`, `::an_oversized_table_cap_does_not_overflow`, `::database_pools_per_connection_are_capped` |
 
 Removing patch 1, 3 or 4 makes the corresponding `mysql_hostile` tests fail (checked by reverting
