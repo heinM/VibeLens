@@ -20,10 +20,13 @@ export function SsoReauth({
   profile,
   error,
   onSignedIn,
+  center = false,
 }: {
   profile: ConnectionProfile;
   error: { message: string } | string | null | undefined;
   onSignedIn: () => void;
+  /** Centre the button (the connect screen); trees keep it left, under their error. */
+  center?: boolean;
 }) {
   const qc = useQueryClient();
   const expired = isSsoExpired(error);
@@ -78,11 +81,15 @@ export function SsoReauth({
     );
   }
   return (
-    <div className="w-full space-y-2 text-left">
+    <div className={center ? "flex w-full flex-col items-center gap-2" : "w-full space-y-2 text-left"}>
       <Button variant="primary" loading={login.phase === "starting"} onClick={() => void signIn()}>
         <LogIn className="size-4" /> Sign in again
       </Button>
-      {login.phase === "failed" && <ErrorBox error={login.error} />}
+      {login.phase === "failed" && (
+        <div className="w-full text-left">
+          <ErrorBox error={login.error} />
+        </div>
+      )}
     </div>
   );
 }

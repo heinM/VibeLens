@@ -82,7 +82,7 @@ export function Explorer() {
           </div>
         )}
         {connect.error && <ErrorBox error={asError(connect.error)} />}
-        <SsoReauth profile={profile} error={ssoError} onSignedIn={() => connect.mutate(profile.id)} />
+        <SsoReauth profile={profile} error={ssoError} center onSignedIn={() => connect.mutate(profile.id)} />
         <Button variant={ssoError ? "secondary" : "primary"} loading={connect.isPending} onClick={() => connect.mutate(profile.id)}>
           <Plug className="size-4" /> Connect
         </Button>
