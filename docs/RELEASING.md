@@ -3,12 +3,30 @@
 How to turn the repo into installers other people can run: what it costs, what to sign, how to automate it, and what will bite you.
 
 **Short version**
-1. Bump the version in **one place** (§3).
-2. Run the test plan (`docs/TEST_PLAN.md`).
-3. Push a tag `vX.Y.Z`. `.github/workflows/release.yml` builds macOS (universal), Windows and Linux installers into a **draft** GitHub release.
-4. Release candidate tags publish as prereleases automatically after all platform builds finish; stable tags remain drafts for manual review (§9).
+1. Work lands on `develop`, is tried on `test`, and is promoted to `release` (§0).
+2. On `release`: bump the version in **one place** (§3) and run the test plan (`docs/TEST_PLAN.md`).
+3. Build the installers into a **draft** GitHub release: on a Mac with `VibeLens/scripts/release-local.sh` (macOS, optionally Linux), or on runners with `gh workflow run release.yml --ref vX.Y.Z` (macOS, Windows, Linux). Pushing a tag does not start a build.
+4. Open a pull request from `release` into `main`. This is the only thing that starts CI. Merge it when CI is green: `main` is what is in production.
+5. Runner builds publish release candidate tags as prereleases automatically once all platforms finish; stable tags, and anything built locally, stay drafts until you publish them (§9).
 
 Builds are **unsigned until you add the signing secrets** (§5, §6). They work, but people get scary warnings.
+
+---
+
+## 0. Branches and what runs when
+
+| Branch | What it is | How code gets there | CI |
+|---|---|---|---|
+| `develop` | Day-to-day work: features and fixes. Dependabot opens its pull requests here. | Feature branches and pull requests | None automatically |
+| `test` | What is being tried by hand: a build from here is what testers run. | Fast-forward from `develop` when a set of changes is ready to try | None automatically |
+| `release` | The release candidate. The version is bumped and the tag `vX.Y.Z` or `vX.Y.Z-N` is cut here. | Fast-forward from `test` | None automatically |
+| `main` | The deployed production version. Nothing is committed to it directly. | Pull request from `release` | **`ci.yml` runs on the pull request** |
+
+- CI runs only on a pull request into `main`, to keep runner minutes down. Everywhere else, run the checks on your machine before promoting (README, "Development": `cargo fmt`, `cargo clippy`, `cargo test`, `npm run typecheck`, `npm test`), or start CI by hand for one branch: `gh workflow run ci.yml --ref develop`.
+- Promote with fast-forwards so the three working branches never diverge: `git push origin develop:test`, then `git push origin test:release`.
+- A fix found on `test` or `release` is made on `develop` and promoted again. An urgent production fix branches from `main`, goes back through a pull request into `main` (CI runs), and is then merged into `develop`.
+- The release workflow is started by hand on a tag (§9); it never runs on a push.
+- Branch protection needs GitHub Pro or a public repository. Until then, "no direct commits to `main`" is a convention, not an enforced rule.
 
 ---
 
@@ -64,7 +82,7 @@ perl -0pi -e "s/\"version\": \"[^\"]+\"/\"version\": \"$V\"/" src-tauri/tauri.co
 perl -0pi -e "s/^version = \"[^\"]+\"/version = \"$V\"/m" src-tauri/Cargo.toml Cargo.toml
 cargo update -w                       # refresh the workspace versions in Cargo.lock
 grep -n "\"version\"\|^version" src-tauri/tauri.conf.json package.json src-tauri/Cargo.toml Cargo.toml
-git commit -am "Release v$V" && git tag "v$V" && git push && git push --tags
+git commit -am "Release v$V" && git tag "v$V" && git push && git push --tags   # on the release branch (§0); builds are started separately (§9)
 ```
 
 - Use SemVer.
@@ -248,7 +266,7 @@ The updater signature is **separate from** Apple/Microsoft code signing. You nee
 
 ## 9. CI: `.github/workflows/release.yml`
 
-Already in the repo. On a `v*` tag (or manual run) it:
+Already in the repo. It is started by hand on a tag (`gh workflow run release.yml --ref vX.Y.Z`, or Actions → Release → Run workflow and pick the tag); pushing a tag does not start it. It:
 - builds macOS universal, Windows x64 and Linux x64 in parallel;
 - fetches the RDS CA bundle;
 - signs and notarises **only if the secrets exist**;

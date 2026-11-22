@@ -278,7 +278,7 @@ flowchart TB
   AWS --> VAULT
 ```
 
-The core is a **ports-and-adapters** crate. Every service depends on traits (`SecretVault`, `ProfileStore`, `CredentialSource`, `TunnelProvider`, `ToolBackend`), so the engines are tested headless against real Postgres and Valkey in CI (and MySQL when one is configured), Athena, Trino, Livy and the Redshift Data API against in-process mock servers, and the agent loop against a mock LLM server. Full rationale, including every deviation from the original spec, is in **[docs/DESIGN.md](docs/DESIGN.md)**.
+The core is a **ports-and-adapters** crate. Every service depends on traits (`SecretVault`, `ProfileStore`, `CredentialSource`, `TunnelProvider`, `ToolBackend`), so the engines are tested headless against real Postgres, Valkey and MySQL in CI, Athena, Trino, Livy and the Redshift Data API against in-process mock servers, and the agent loop against a mock LLM server. Full rationale, including every deviation from the original spec, is in **[docs/DESIGN.md](docs/DESIGN.md)**.
 
 ---
 
@@ -442,7 +442,7 @@ cargo test -p vibelens-core     # engines, AWS signing, agent loop vs mock LLM
 npm run typecheck && npm test   # frontend
 ```
 
-Tests that need a service which is not configured skip: they print `skipping (<service>): <why>` (shown with `-- --nocapture`) and pass. `VG_TEST_REQUIRE` lists the services that must be there, and a skip for one of them is a failure; CI sets it to `pg,valkey`. The service names are in `crates/vibelens-core/tests/services/mod.rs`.
+Tests that need a service which is not configured skip: they print `skipping (<service>): <why>` (shown with `-- --nocapture`) and pass. `VG_TEST_REQUIRE` lists the services that must be there, and a skip for one of them is a failure; CI sets it to `pg,valkey,mysql`. CI runs only on a pull request into `main`; the branch model is in [docs/RELEASING.md](docs/RELEASING.md) §0. The service names are in `crates/vibelens-core/tests/services/mod.rs`.
 
 README screenshots are rendered from the real UI with a demo stand-in for the backend: `node scripts/screenshots/capture.mjs` (see the comment at its top; `refresh-data.mjs` copies the rows from the seeded containers).
 

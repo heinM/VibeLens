@@ -1,9 +1,14 @@
 name: CI
 
+# Runs when a release is proposed for production: a pull request into `main` (normally from
+# `release`). It does not run on pushes or on pull requests into develop, test or release, to keep
+# runner minutes down: run the same checks locally there (README, "Development"), or start this
+# workflow by hand from the Actions tab or `gh workflow run ci.yml --ref <branch>`.
+# Branch model: docs/RELEASING.md §0.
 on:
-  push:
-    branches: [main]
   pull_request:
+    branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -49,12 +54,21 @@ jobs:
       valkey:
         image: valkey/valkey:8
         ports: ["6379:6379"]
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: vibelens
+          MYSQL_DATABASE: shop
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pvibelens --silent" --health-interval 3s --health-retries 40
     env:
       VG_TEST_PG: host=127.0.0.1 port=5432 user=postgres password=vibelens dbname=vibelens_test
       VG_TEST_VALKEY: redis://127.0.0.1:6379
-      # The two services above must really be there: a test that would skip for lack of one
+      VG_TEST_MYSQL: host=127.0.0.1 port=3306 user=root password=vibelens dbname=shop
+      # The three services above must really be there: a test that would skip for lack of one
       # fails instead (crates/vibelens-core/tests/services/mod.rs).
-      VG_TEST_REQUIRE: pg,valkey
+      VG_TEST_REQUIRE: pg,valkey,mysql
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 · Node 24
       - name: System deps (WebKitGTK for the Tauri shell)
