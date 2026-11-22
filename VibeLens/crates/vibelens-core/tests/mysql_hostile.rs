@@ -79,8 +79,12 @@ enum Plan {
     Hang(Uuid),
     /// Answer `SELECT 'trigger'` with three column definitions of 6 MiB each.
     FatColumns,
-    /// Log in and answer everything with OK (and `@@server_uuid`).
+    /// Log in and answer everything with OK (and `@@server_uuid`). A login to a database
+    /// whose name contains `slow` is answered after 3 seconds.
     Plain,
+    /// Answer `SELECT @@server_uuid` only after 6 seconds (past the client's 5 s limit), then
+    /// carry on as if nothing happened.
+    SlowUuid,
 }
 
 /// How the fake answers `SELECT @@server_uuid`.
@@ -113,8 +117,13 @@ impl Seen {
 }
 
 async fn read_packet(s: &mut TcpStream) -> Option<(u8, Vec<u8>)> {
+    read_packet_within(s, Duration::from_secs(5)).await
+}
+
+/// [`read_packet`] that gives up (as if the client had gone) after `limit`.
+async fn read_packet_within(s: &mut TcpStream, limit: Duration) -> Option<(u8, Vec<u8>)> {
     let mut h = [0u8; 4];
-    tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut h))
+    tokio::time::timeout(limit, s.read_exact(&mut h))
         .await
         .ok()?
         .ok()?;
@@ -266,13 +275,22 @@ async fn serve(mut s: TcpStream, plan: Plan, file: String, seen: Arc<Mutex<Seen>
             }
             return;
         }
-        _ => write_packet(&mut s, 2, OK).await,
+        _ => {
+            if plan == Plan::Plain && contains(&resp, b"slow") {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+            write_packet(&mut s, 2, OK).await
+        }
     }
     // Commands.
     while let Some((_, p)) = read_packet(&mut s).await {
         seen.lock().unwrap().packets.push(p.clone());
         match p.first() {
             Some(0x01) => return, // COM_QUIT
+            Some(0x03) if plan == Plan::SlowUuid && p[1..].starts_with(b"SELECT @@server_uuid") => {
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                one_column(&mut s, &[b"uuid-late".to_vec()]).await;
+            }
             Some(0x03) if p[1..].starts_with(b"SELECT @@server_uuid") => match plan {
                 Plan::Hang(Uuid::Moving) => {
                     one_column(&mut s, &[format!("uuid-{conn_no}").into_bytes()]).await
@@ -803,28 +821,45 @@ async fn database_pools_per_connection_are_capped() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert_eq!(mgr.mysql_pool_count(&p.id), MAX_MYSQL_POOLS_PER_PROFILE);
-    // Re-audit item 5: at the cap, the least recently used idle pool makes room. Use the
-    // first one so the second is the oldest.
-    handles[0]
+    // Third review, item D: a pool someone holds (a statement about to start) is never
+    // evicted; with every pool held, a new database is refused instead.
+    let e = mgr
+        .mysql(&p.id, Some("SHOP"))
+        .await
+        .err()
+        .expect("all held");
+    assert!(
+        matches!(&e, CoreError::Invalid(m) if m.contains("in use")),
+        "{e:?}"
+    );
+    for h in &handles {
+        assert!(
+            h.execute_collect("SELECT 1", ExecOptions::default(), CancellationToken::new())
+                .await
+                .is_ok()
+        );
+    }
+    let weak: Vec<std::sync::Weak<MysqlHandle>> = handles.iter().map(Arc::downgrade).collect();
+    // Re-audit item 5 / third review item D: keep only the first (also the most recently
+    // used); the least recently used of the unheld pools makes room.
+    let first = handles.remove(0);
+    handles.clear();
+    first
         .execute_collect("SELECT 1", ExecOptions::default(), CancellationToken::new())
         .await
         .unwrap();
     let shop = mgr
         .mysql(&p.id, Some("SHOP"))
         .await
-        .expect("evicts, does not refuse");
+        .expect("evicts an unheld pool");
     assert_eq!(mgr.mysql_pool_count(&p.id), MAX_MYSQL_POOLS_PER_PROFILE);
-    let again0 = mgr.mysql(&p.id, Some(&names[0])).await.unwrap();
-    assert!(
-        Arc::ptr_eq(&again0, &handles[0]),
-        "the recently used pool was evicted"
+    assert!(weak[0].upgrade().is_some(), "the held pool was evicted");
+    assert_eq!(
+        weak.iter().filter(|w| w.upgrade().is_none()).count(),
+        1,
+        "exactly one unheld pool was evicted"
     );
-    let again1 = mgr.mysql(&p.id, Some(&names[1])).await.unwrap();
-    assert!(
-        !Arc::ptr_eq(&again1, &handles[1]),
-        "the oldest pool was kept"
-    );
-    drop(shop);
+    drop((first, shop));
     // Count, dial and insert are one step: concurrent opens never exceed the cap.
     mgr.disconnect(&p.id).await.unwrap();
     let mut tasks = Vec::new();
@@ -856,4 +891,564 @@ async fn fat_column_definitions_are_refused() {
         )
         .await;
     assert!(r.is_err(), "18 MiB of column definitions were accepted");
+}
+
+// ---- fuzz: a server that corrupts the conversation at every stage ---------------------------
+
+/// A seeded, deterministic fake server that follows the protocol up to a randomly chosen
+/// packet and then corrupts it (and, sometimes, everything after it): empty or truncated
+/// packets, wrong sequence ids, oversized length-encoded values, random bytes, a valid prefix
+/// followed by garbage, a header that promises more than is sent, or a premature close. The
+/// conversation covers the handshake, authentication and auth switches, result-set headers,
+/// column definitions, rows and terminators, and every command the engine sends (identity
+/// queries, COM_RESET_CONNECTION, USE, session setup, the statement, KILL QUERY, COM_QUIT).
+///
+/// Each iteration runs a real connect, a statement and a catalog read through the engine's
+/// own entry points in a spawned task. The test fails when any task panics (seen through the
+/// `JoinError` and, for tasks the engine spawns itself, through a panic hook) or does not
+/// finish within the time limit. `VG_FUZZ_SEED` and `VG_FUZZ_ITERS` choose the run; a failure
+/// prints the seed and the iteration to replay it.
+mod fuzz {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    /// xorshift64*: small, deterministic, good enough to pick mutations.
+    #[derive(Clone)]
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+        }
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            if n == 0 { 0 } else { self.next() % n }
+        }
+        fn chance(&mut self, percent: u64) -> bool {
+            self.below(100) < percent
+        }
+        fn bytes(&mut self, max: usize) -> Vec<u8> {
+            let n = self.below(max as u64 + 1) as usize;
+            (0..n).map(|_| self.next() as u8).collect()
+        }
+    }
+
+    /// Writes packets, corrupting the `corrupt_at`-th one (and every later one in chaos mode).
+    struct Wire {
+        s: TcpStream,
+        rng: Rng,
+        sent: usize,
+        corrupt_at: usize,
+        chaos: bool,
+        closed: bool,
+    }
+
+    impl Wire {
+        async fn raw(&mut self, bytes: &[u8]) {
+            if !self.closed && self.s.write_all(bytes).await.is_err() {
+                self.closed = true;
+            }
+        }
+
+        async fn send(&mut self, seq: u8, payload: &[u8]) {
+            if self.closed {
+                return;
+            }
+            let n = self.sent;
+            self.sent += 1;
+            let corrupt = n == self.corrupt_at || (self.chaos && n > self.corrupt_at);
+            if !corrupt {
+                return self.frame(seq, payload).await;
+            }
+            let r = &mut self.rng;
+            match r.below(10) {
+                0 => self.frame(seq, &[]).await,
+                1 => {
+                    let k = r.below(payload.len() as u64) as usize;
+                    let p = payload[..k].to_vec();
+                    self.frame(seq, &p).await
+                }
+                2 => {
+                    let bad = seq.wrapping_add(1 + r.below(250) as u8);
+                    self.frame(bad, payload).await
+                }
+                3 => {
+                    let p = r.bytes(64);
+                    self.frame(seq, &p).await
+                }
+                4 => {
+                    // An oversized length-encoded integer where a value or count goes.
+                    let mut p = payload.first().map(|b| vec![*b]).unwrap_or_default();
+                    match r.below(3) {
+                        0 => {
+                            p.push(0xFE);
+                            p.extend_from_slice(&r.next().to_le_bytes());
+                        }
+                        1 => p.extend_from_slice(&[0xFD, 0xFF, 0xFF, 0xFF]),
+                        _ => p.extend_from_slice(&[0xFC, 0xFF, 0xFF]),
+                    }
+                    let tail = r.bytes(8);
+                    p.extend_from_slice(&tail);
+                    if r.chance(50) && !p.is_empty() {
+                        p.remove(0);
+                    }
+                    self.frame(seq, &p).await
+                }
+                5 => self.close().await,
+                6 => {
+                    let k = r.below(payload.len() as u64 + 1) as usize;
+                    let mut p = payload[..k].to_vec();
+                    let g = r.bytes(32);
+                    p.extend_from_slice(&g);
+                    self.frame(seq, &p).await
+                }
+                7 => {
+                    let mut p = payload.to_vec();
+                    for _ in 0..=r.below(4) {
+                        if !p.is_empty() {
+                            let i = r.below(p.len() as u64) as usize;
+                            p[i] = r.next() as u8;
+                        }
+                    }
+                    self.frame(seq, &p).await
+                }
+                8 => {
+                    // The header promises more than follows; then the socket closes.
+                    let len = (payload.len() + 1 + r.below(1 << 20) as usize).min(0xFF_FFFF);
+                    let h = [len as u8, (len >> 8) as u8, (len >> 16) as u8, seq];
+                    self.raw(&h).await;
+                    self.raw(payload).await;
+                    self.close().await
+                }
+                _ => {
+                    // A packet the client does not expect at this point.
+                    let p = match r.below(4) {
+                        0 => OK.to_vec(),
+                        1 => END.to_vec(),
+                        2 => vec![0xFF, 0x10, 0x04, b'#', b'H', b'Y', b'0', b'0', b'0', b'x'],
+                        _ => vec![0xFB, b'/', b'e', b't', b'c'],
+                    };
+                    self.frame(seq, &p).await
+                }
+            }
+        }
+
+        async fn frame(&mut self, seq: u8, payload: &[u8]) {
+            let len = payload.len().min(0xFF_FFFF);
+            let mut out = vec![len as u8, (len >> 8) as u8, (len >> 16) as u8, seq];
+            out.extend_from_slice(&payload[..len]);
+            self.raw(&out).await;
+        }
+
+        async fn close(&mut self) {
+            self.closed = true;
+            let _ = self.s.shutdown().await;
+        }
+    }
+
+    const PLUGINS: &[&str] = &[
+        "mysql_native_password",
+        "caching_sha2_password",
+        "mysql_clear_password",
+        "client_ed25519",
+        "parsec",
+        "sha256_password",
+        "mysql_old_password",
+        "",
+        "x\u{1}weird",
+    ];
+
+    /// Column types the fake declares, valid and not.
+    const TYPES: &[u8] = &[
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0f, 0x10,
+        0x11, 0x12, 0x13, 0xf2, 0xf5, 0xf6, 0xf7, 0xf8, 0xfc, 0xfd, 0xfe, 0xff, 0x77,
+    ];
+
+    fn rand_column(r: &mut Rng) -> Vec<u8> {
+        let ty = TYPES[r.below(TYPES.len() as u64) as usize];
+        let charset = [63u16, 255, 8, 33, 0][r.below(5) as usize];
+        column("c", ty, charset, r.next() as u16)
+    }
+
+    fn rand_value(r: &mut Rng, out: &mut Vec<u8>) {
+        match r.below(6) {
+            0 => out.push(0xFB),
+            1 => lenenc_str(out, b"0000-00-00 00:00:00"),
+            2 => lenenc_str(out, b"18446744073709551615"),
+            3 => lenenc_str(out, &[0xFF, 0xFE, 0x00, 0x80]),
+            4 => lenenc_str(out, b"[[[[{\"a\":1}]]]]"),
+            _ => {
+                let b = r.bytes(300);
+                lenenc_str(out, &b)
+            }
+        }
+    }
+
+    /// A result set: header, column definitions, rows, terminator.
+    async fn result_set(w: &mut Wire, r: &mut Rng) {
+        let n = 1 + r.below(4) as u8;
+        w.send(1, &[n]).await;
+        let mut seq = 2u8;
+        for _ in 0..n {
+            let c = rand_column(r);
+            w.send(seq, &c).await;
+            seq = seq.wrapping_add(1);
+        }
+        for _ in 0..r.below(4) {
+            let mut row = Vec::new();
+            for _ in 0..n {
+                rand_value(r, &mut row);
+            }
+            w.send(seq, &row).await;
+            seq = seq.wrapping_add(1);
+        }
+        w.send(seq, END).await;
+    }
+
+    async fn serve(s: TcpStream, mut r: Rng) {
+        let corrupt_at = r.below(14) as usize;
+        let chaos = r.chance(15);
+        let mut w = Wire {
+            s,
+            rng: Rng::new(r.next()),
+            sent: 0,
+            corrupt_at,
+            chaos,
+            closed: false,
+        };
+        let plugin = PLUGINS[r.below(PLUGINS.len() as u64) as usize];
+        let mut hs = handshake(plugin);
+        // Sometimes offer TLS: a client that asks for it then gets garbage instead of a TLS
+        // handshake (random bytes, a truncated record, or nothing).
+        let offer_tls = r.chance(30);
+        if offer_tls {
+            // CLIENT_SSL is bit 11, in the lower capability half at offset 1 + 12 + 4 + 8 + 1.
+            let at = 1 + "8.0.99-fake".len() + 1 + 4 + 8 + 1;
+            if let Some(b) = hs.get_mut(at + 1) {
+                *b |= 0x08;
+            }
+        }
+        if r.chance(3) {
+            // A handshake whose auth-data length has the high bit set.
+            let at = 1 + "8.0.99-fake".len() + 1 + 20;
+            if let Some(b) = hs.get_mut(at) {
+                *b = 0x80 | (r.next() as u8 & 0x07);
+            }
+        }
+        w.send(0, &hs).await;
+        let Some((_, first)) = read_packet_within(&mut w.s, WAIT).await else {
+            return;
+        };
+        if offer_tls && first.len() == 32 {
+            // An SSLRequest: answer it with something that is not TLS.
+            match r.below(3) {
+                0 => {
+                    let g = r.bytes(200);
+                    w.raw(&g).await;
+                }
+                1 => w.raw(&[0x16, 0x03, 0x03, 0xFF, 0xFF, 0x02]).await,
+                _ => {}
+            }
+            w.close().await;
+            return;
+        }
+        // Authentication: OK, fast-auth success, full auth demanded, a switch, or an error.
+        let mut seq = 2u8;
+        match r.below(6) {
+            0 | 1 => w.send(seq, OK).await,
+            2 => {
+                w.send(seq, &[0x01, 0x03]).await;
+                w.send(seq + 1, OK).await;
+            }
+            3 => w.send(seq, &[0x01, 0x04]).await,
+            4 => {
+                let mut sw = vec![0xFE];
+                sw.extend_from_slice(PLUGINS[r.below(PLUGINS.len() as u64) as usize].as_bytes());
+                sw.push(0);
+                let salt = r.bytes(40);
+                sw.extend_from_slice(&salt);
+                w.send(seq, &sw).await;
+                if read_packet_within(&mut w.s, WAIT).await.is_some() {
+                    seq += 2;
+                    if r.chance(50) {
+                        w.send(seq, &sw).await;
+                    } else {
+                        w.send(seq, OK).await;
+                    }
+                }
+            }
+            _ => {
+                let mut e = vec![0xFF, 0x15, 0x04, b'#'];
+                e.extend_from_slice(b"28000Access denied");
+                w.send(seq, &e).await;
+            }
+        }
+        // Commands, at most a dozen, then the socket closes.
+        for _ in 0..12 {
+            if w.closed {
+                return;
+            }
+            let Some((_, p)) = read_packet_within(&mut w.s, WAIT).await else {
+                return;
+            };
+            match p.first() {
+                Some(0x01) | None => break,
+                Some(0x03) if p.len() > 7 && p[1..].starts_with(b"SELECT") => {
+                    if r.chance(15) {
+                        w.send(1, OK).await;
+                    } else {
+                        result_set(&mut w, &mut r).await;
+                    }
+                }
+                _ => {
+                    if r.chance(10) {
+                        // A result set where an OK is expected.
+                        result_set(&mut w, &mut r).await;
+                    } else {
+                        w.send(1, OK).await;
+                    }
+                }
+            }
+        }
+        w.close().await;
+    }
+
+    /// How long the fake waits for the client before it hangs up: a client waiting for bytes
+    /// a corrupted packet promised is the server stalling, not the engine hanging.
+    const WAIT: Duration = Duration::from_millis(250);
+
+    static PANICS: AtomicUsize = AtomicUsize::new(0);
+    static PANIC_ITER: AtomicU64 = AtomicU64::new(u64::MAX);
+    static CURRENT_ITER: AtomicU64 = AtomicU64::new(0);
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_corrupting_server_never_panics_or_hangs_the_engine() {
+        let seed: u64 = std::env::var("VG_FUZZ_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0x5EED_2026);
+        let iters: u64 = std::env::var("VG_FUZZ_ITERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3000);
+        // Panics in tasks the engine spawns itself (kills, resets) are not joined here.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // Only this test's runtime workers run engine tasks; other tests in this binary
+            // run on their own threads, and their failures are theirs.
+            if std::thread::current().name() != Some("tokio-rt-worker") {
+                prev(info);
+                return;
+            }
+            PANICS.fetch_add(1, Ordering::SeqCst);
+            let _ = PANIC_ITER.compare_exchange(
+                u64::MAX,
+                CURRENT_ITER.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+            prev(info);
+        }));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let conns = Arc::new(AtomicU64::new(0));
+        tokio::spawn({
+            let conns = conns.clone();
+            async move {
+                while let Ok((s, _)) = listener.accept().await {
+                    let n = conns.fetch_add(1, Ordering::SeqCst);
+                    let r = Rng::new(seed ^ n.wrapping_mul(0xA24B_AED4_963E_E407));
+                    tokio::spawn(serve(s, r));
+                }
+            }
+        });
+
+        let started = std::time::Instant::now();
+        for i in 0..iters {
+            CURRENT_ITER.store(i, Ordering::SeqCst);
+            let mut rr = Rng::new(seed ^ i);
+            let cleartext = rr.chance(20);
+            let tls = rr.chance(25);
+            let task = tokio::spawn(async move {
+                let mut p = params(port, cleartext);
+                if tls {
+                    p.tls.mode = TlsMode::Require;
+                }
+                p.options.connect_timeout_secs = 3;
+                if let Ok(h) = MysqlHandle::connect(p, creds()).await {
+                    let opts = ExecOptions {
+                        timeout_ms: Some(1500),
+                        max_rows: 2,
+                        page_size: 1,
+                        read_only: i % 3 == 0,
+                    };
+                    let _ = h
+                        .execute_collect("SELECT 'trigger'", opts, CancellationToken::new())
+                        .await;
+                    let _ = h.list_databases().await;
+                    h.close().await;
+                }
+            });
+            let t0 = std::time::Instant::now();
+            let res = tokio::time::timeout(Duration::from_secs(20), task).await;
+            if std::env::var("VG_FUZZ_TRACE").is_ok() && t0.elapsed() > Duration::from_millis(500) {
+                eprintln!("fuzz: iteration {i} took {:?}", t0.elapsed());
+            }
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => panic!(
+                    "seed {seed}, iteration {i}: the engine task {}",
+                    if e.is_panic() {
+                        "panicked"
+                    } else {
+                        "was cancelled"
+                    }
+                ),
+                Err(_) => panic!("seed {seed}, iteration {i}: the engine hung"),
+            }
+            if PANICS.load(Ordering::SeqCst) > 0 {
+                panic!(
+                    "seed {seed}: a task spawned by the engine panicked during iteration {}",
+                    PANIC_ITER.load(Ordering::SeqCst)
+                );
+            }
+        }
+        // Let background kills and resets finish, then check once more.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            PANICS.load(Ordering::SeqCst),
+            0,
+            "seed {seed}: a background task panicked (iteration {})",
+            PANIC_ITER.load(Ordering::SeqCst)
+        );
+        eprintln!(
+            "fuzz: seed {seed}, {iters} iterations, {} server connections, {:?}",
+            conns.load(Ordering::SeqCst),
+            started.elapsed()
+        );
+    }
+}
+
+/// Third review, item B: an identity query that times out leaves the connection one reply
+/// behind; it must be closed, not handed out (its next statement would read the late reply).
+#[tokio::test]
+async fn a_timed_out_identity_query_closes_the_connection() {
+    let f = fake(Plan::SlowUuid, "").await;
+    let t0 = std::time::Instant::now();
+    let e = MysqlHandle::connect(params(f.port, false), creds())
+        .await
+        .err()
+        .expect("the connection is refused, not returned out of step");
+    assert!(e.to_string().contains("did not answer"), "{e}");
+    assert!(t0.elapsed() < Duration::from_secs(20));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // After the timeout nothing else was asked on that connection.
+    let seen = f.seen.lock().unwrap();
+    assert!(
+        !seen
+            .packets
+            .iter()
+            .any(|p| p.len() > 1 && p[1..].starts_with(b"SELECT @@hostname")),
+        "the next query was sent on a connection one reply behind"
+    );
+}
+
+/// Third review, item G: a database whose server answers slowly does not hold up opening
+/// another database on the same connection.
+#[tokio::test]
+async fn one_slow_database_does_not_block_another() {
+    use async_trait::async_trait;
+    use vibelens_core::connections::ConnectionManager;
+    use vibelens_core::ports::{CredentialSource, ProfileStore, TunnelHandle, TunnelProvider};
+    use vibelens_core::profiles::JsonProfileStore;
+
+    struct C;
+    #[async_trait]
+    impl CredentialSource for C {
+        async fn resolve(
+            &self,
+            _: &ConnectionProfile,
+        ) -> vibelens_core::Result<ResolvedCredentials> {
+            Ok(ResolvedCredentials {
+                username: Some("app".into()),
+                password: Some(SecretString::from(PASSWORD)),
+                ..ResolvedCredentials::anonymous()
+            })
+        }
+    }
+    struct T;
+    #[async_trait]
+    impl TunnelProvider for T {
+        async fn open(
+            &self,
+            _: &str,
+            _: &TunnelConfig,
+            _: &str,
+            _: u16,
+        ) -> vibelens_core::Result<TunnelHandle> {
+            Err(CoreError::Tunnel("none".into()))
+        }
+    }
+    let f = fake(Plan::Plain, "").await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(JsonProfileStore::new(dir.path().to_path_buf()).unwrap());
+    let mgr = ConnectionManager::new(store.clone(), Arc::new(C), Arc::new(T));
+    let p = store
+        .upsert(ConnectionProfile {
+            id: String::new(),
+            name: "fake".into(),
+            engine: EngineKind::Mysql,
+            host: "127.0.0.1".into(),
+            port: f.port,
+            database: Some("shop".into()),
+            auth: AuthMethod::Password {
+                username: "app".into(),
+            },
+            tls: TlsConfig {
+                mode: TlsMode::Disable,
+                ..Default::default()
+            },
+            tunnel: None,
+            environment: Environment::Dev,
+            ai_data_access: AiDataAccess::Results,
+            color: None,
+            pg: Default::default(),
+            valkey: Default::default(),
+            created_at: None,
+            updated_at: None,
+            iceberg: None,
+            redshift: None,
+            mysql: MysqlOptions {
+                connect_timeout_secs: 10,
+                max_pool_size: 1,
+                ..Default::default()
+            },
+        })
+        .unwrap();
+    let slow = tokio::spawn({
+        let (mgr, id) = (mgr.clone(), p.id.clone());
+        async move { mgr.mysql(&id, Some("slow_db")).await.map(|_| ()) }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let t0 = std::time::Instant::now();
+    mgr.mysql(&p.id, Some("fast_db")).await.expect("fast");
+    assert!(
+        t0.elapsed() < Duration::from_millis(1500),
+        "waited for the slow database: {:?}",
+        t0.elapsed()
+    );
+    assert!(
+        !slow.is_finished(),
+        "precondition: the slow one is still dialing"
+    );
+    slow.await.unwrap().expect("slow eventually connects");
+    assert_eq!(mgr.mysql_pool_count(&p.id), 2);
 }
