@@ -85,7 +85,13 @@ rm -rf "$out" && mkdir -p "$out"
 npm ci
 npm run typecheck
 npm test
-./scripts/fetch-rds-ca.sh # bundle.resources = resources/*: the build fails without it
+# bundle.resources = resources/*: the build fails without the RDS CA bundle. Refresh it; when the
+# download is not reachable from this network, the copy committed in the repository is used.
+if ! ./scripts/fetch-rds-ca.sh; then
+  grep -q "BEGIN CERTIFICATE" src-tauri/resources/rds-global-bundle.pem 2>/dev/null \
+    || die "could not download the RDS CA bundle and there is no committed copy"
+  echo "warning: could not refresh the RDS CA bundle; using the committed copy." >&2
+fi
 
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 if [[ -z "${APPLE_SIGNING_IDENTITY:-}" ]]; then
