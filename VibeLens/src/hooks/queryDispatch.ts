@@ -2,10 +2,13 @@
 // cached catalogs a DDL statement makes stale. Pure of React so it is unit-tested with a mocked api.
 //
 //  * Postgres  -> pgExecute (per database)
-//  * Iceberg   -> iceExecute (the connection's catalog; there is no database to choose)
+//  * Iceberg   -> iceExecute (the connection's catalog; there is no database to choose). Local,
+//                Athena, Trino and Spark all run through it: the profile says which engine.
+//  * Redshift  -> rsExecute (the Data API; `database` null = the profile's database)
+//  * MySQL     -> myExecute (per database; `database` null = the profile's default database)
 //  * Valkey    -> never runs SQL; it has its own console tab
 //
-// Both executors take the same channel events and share one running-queries map in the backend,
+// All executors take the same channel events and share one running-queries map in the backend,
 // so cancelling is always `pgCancel(queryId)`.
 import type { QueryClient } from "@tanstack/react-query";
 import { api } from "../ipc/commands";
@@ -14,7 +17,7 @@ import type { StatementStats } from "./useQueryRunner";
 
 export interface ExecArgs {
   profileId: string;
-  /** Postgres database; ignored for Iceberg. */
+  /** Postgres or Redshift database (null = the connection's own); ignored for Iceberg. */
   database: string | null;
   sql: string;
   options?: Partial<ExecOptions>;
@@ -27,15 +30,26 @@ export const runsSql = (engine: EngineKind | null | undefined): boolean => engin
 
 /** Starts a run. Resolves with the query id as soon as execution starts; rejects with an ErrorPayload. */
 export function executeOnEngine(engine: EngineKind | null | undefined, args: ExecArgs): Promise<string> {
-  switch (engine ?? "postgres") {
+  const e: EngineKind = engine ?? "postgres";
+  switch (e) {
     case "iceberg":
       return api.iceExecute({ profileId: args.profileId, sql: args.sql, options: args.options, confirmed: args.confirmed, onEvent: args.onEvent });
+    case "redshift":
+      return api.rsExecute({ profileId: args.profileId, database: args.database, sql: args.sql, options: args.options, confirmed: args.confirmed, onEvent: args.onEvent });
     case "valkey": {
       const err: ErrorPayload = { code: "unsupported", message: "SQL cannot run on a Valkey connection. Open a Valkey console instead." };
       return Promise.reject(err);
     }
-    default:
+    case "mysql":
+      return api.myExecute({ profileId: args.profileId, database: args.database, sql: args.sql, options: args.options, confirmed: args.confirmed, onEvent: args.onEvent });
+    case "postgres":
       return api.pgExecute({ profileId: args.profileId, database: args.database, sql: args.sql, options: args.options, confirmed: args.confirmed, onEvent: args.onEvent });
+    default: {
+      // A new EngineKind must be routed explicitly, never fall through to Postgres.
+      const never: never = e;
+      const err: ErrorPayload = { code: "unsupported", message: `SQL cannot run on this connection type (${String(never)}).` };
+      return Promise.reject(err);
+    }
   }
 }
 
@@ -49,13 +63,23 @@ export function statsFromEvent(ev: Extract<QueryEvent, { type: "stats" }>): Stat
   return { engine: ev.engine, bytesScanned: ev.bytesScanned, costUsdEstimate: ev.costUsdEstimate, engineQueryId: ev.engineQueryId };
 }
 
-export const DDL_TAG = /^(CREATE|ALTER|DROP|COMMENT|TRUNCATE|REFRESH)\b/i;
+export const DDL_TAG = /^(CREATE|ALTER|DROP|COMMENT|TRUNCATE|REFRESH|RENAME)\b/i;
 
 /** After DDL: refresh the catalogs completion and the navigator read, for this connection only. */
 export function invalidateAfterDdl(qc: QueryClient, engine: EngineKind | null | undefined, profileId: string): void {
   if (engine === "iceberg") {
     // Everything under ["ice", profile]: autocomplete catalog, navigator tree and open table tabs.
     void qc.invalidateQueries({ queryKey: ["ice", profileId] });
+    return;
+  }
+  if (engine === "redshift") {
+    // Autocomplete catalog and navigator tree (["rs", profile, db, ...]).
+    void qc.invalidateQueries({ queryKey: ["rs", profileId] });
+    return;
+  }
+  if (engine === "mysql") {
+    // Autocomplete catalog and navigator tree (["my", profile, db, ...]).
+    void qc.invalidateQueries({ queryKey: ["my", profileId] });
     return;
   }
   void qc.invalidateQueries({ predicate: (q) => q.queryKey[0] === "pg" && q.queryKey[1] === profileId && q.queryKey[3] === "schema-metadata" });

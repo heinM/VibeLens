@@ -3,6 +3,8 @@
 //! connections point at a closed local port so engine connects fail fast, which is exactly
 //! what lets us check status transitions, tunnel lifecycle and error mapping.
 
+mod services;
+
 mod conn_common;
 
 use std::collections::HashMap;
@@ -21,7 +23,7 @@ use vibelens_core::connections::{AppToolBackend, ConnectionManager};
 use vibelens_core::error::{CoreError, Result};
 use vibelens_core::model::*;
 use vibelens_core::ports::{
-    CredentialSource, ProfileStore, ToolBackend, TunnelHandle, TunnelProvider,
+    CredentialSource, FileVersion, ProfileStore, ToolBackend, TunnelHandle, TunnelProvider,
 };
 use vibelens_core::workspace::WorkspaceFs;
 
@@ -262,7 +264,14 @@ async fn conn_engine_mismatch_is_invalid_and_never_dials() {
     );
     assert!(matches!(
         backend
-            .execute_sql(&vk.id, None, "select 1", true, 10)
+            .execute_sql(
+                &vk.id,
+                None,
+                "select 1",
+                true,
+                10,
+                tokio_util::sync::CancellationToken::new()
+            )
             .await,
         Err(CoreError::Invalid(_))
     ));
@@ -561,6 +570,91 @@ async fn conn_different_databases_connect_independently() {
 
 // ---- test() -------------------------------------------------------------------------------
 
+/// Review finding M7, the open point: a token that whoever reads it can replay is not sent
+/// without TLS to another machine. The in-memory store here has no rules of its own, like a
+/// `profiles.json` edited by hand.
+#[tokio::test]
+async fn conn_bearer_credentials_are_not_sent_without_tls_to_another_machine() {
+    let h = harness();
+    let aws = AwsTarget {
+        identity: AwsIdentity::DefaultChain,
+        region: "eu-west-1".into(),
+    };
+
+    let mut token = pg_profile("token");
+    token.auth = AuthMethod::AccessToken {
+        username: "me".into(),
+        command: None,
+    };
+    token.tls.mode = TlsMode::Disable;
+    token.pg.connect_timeout_secs = 2;
+    let token = h.profiles.upsert(token).unwrap();
+
+    let mut iam = token.clone();
+    iam.id = String::new();
+    iam.name = "iam".into();
+    iam.auth = AuthMethod::RdsIam {
+        username: "app".into(),
+        aws: aws.clone(),
+    };
+    let iam = h.profiles.upsert(iam).unwrap();
+
+    for p in [&token, &iam] {
+        let e = h.mgr.pg(&p.id, None).await.err().expect("refused");
+        assert!(
+            matches!(&e, CoreError::Invalid(m) if m.contains("TLS")),
+            "{}: {e:?}",
+            p.name
+        );
+        assert!(
+            matches!(h.mgr.test(p, None).await, Err(CoreError::Invalid(_))),
+            "{}",
+            p.name
+        );
+    }
+
+    let mut cache = valkey_profile("cache", "cache.internal.example", 6379);
+    cache.auth = AuthMethod::ElastiCacheIam {
+        username: "app".into(),
+        cache_name: "c".into(),
+        serverless: false,
+        aws,
+    };
+    cache.valkey.connect_timeout_secs = 2;
+    let cache = h.profiles.upsert(cache).unwrap();
+    let e = h.mgr.valkey(&cache.id).await.err().expect("refused");
+    assert!(
+        matches!(&e, CoreError::Invalid(m) if m.contains("TLS")),
+        "{e:?}"
+    );
+    assert!(matches!(
+        h.mgr.test(&cache, None).await,
+        Err(CoreError::Invalid(_))
+    ));
+
+    assert_eq!(
+        h.creds.resolves.load(Ordering::SeqCst),
+        0,
+        "no credential was fetched"
+    );
+
+    // Through the SSH tunnel the same profile is dialled (and fails here only because the
+    // fake tunnel leads to a closed port).
+    let mut tunnelled = token.clone();
+    tunnelled.id = String::new();
+    tunnelled.name = "tunnelled".into();
+    tunnelled.tunnel = Some(ssh_tunnel());
+    let tunnelled = h.profiles.upsert(tunnelled).unwrap();
+    let e = h
+        .mgr
+        .pg(&tunnelled.id, None)
+        .await
+        .err()
+        .expect("dead port");
+    assert!(!matches!(e, CoreError::Invalid(_)), "{e:?}");
+    assert_eq!(h.tunnels.calls().len(), 1);
+}
+
 #[tokio::test]
 async fn conn_test_rejects_invalid_input_with_err() {
     let h = harness();
@@ -709,7 +803,9 @@ async fn conn_backend_profile_lookup_delegates_to_the_store() {
 async fn conn_backend_workspace_calls_go_through_the_jail() {
     let h = harness();
     let (_d, be) = backend(&h);
-    be.write_file("notes/todo.md", "- ship it").await.unwrap();
+    be.write_file("notes/todo.md", "- ship it", &FileVersion::Absent)
+        .await
+        .unwrap();
     assert_eq!(be.read_file("notes/todo.md").await.unwrap(), "- ship it");
     let files = be.list_files().await.unwrap();
     assert_eq!(files.len(), 1);
@@ -720,11 +816,11 @@ async fn conn_backend_workspace_calls_go_through_the_jail() {
         Err(CoreError::Invalid(_))
     ));
     assert!(matches!(
-        be.write_file("/tmp/x.sql", "x").await,
+        be.write_file("/tmp/x.sql", "x", &FileVersion::Absent).await,
         Err(CoreError::Invalid(_))
     ));
     assert!(matches!(
-        be.write_file("run.sh", "x").await,
+        be.write_file("run.sh", "x", &FileVersion::Absent).await,
         Err(CoreError::Invalid(_))
     ));
 }
@@ -735,9 +831,16 @@ async fn conn_backend_sql_against_unreachable_database_is_a_connection_error_not
     let p = h.profiles.upsert(dead_pg("pg")).unwrap();
     let (_d, be) = backend(&h);
     assert!(
-        be.execute_sql(&p.id, None, "select 1", true, 100)
-            .await
-            .is_err()
+        be.execute_sql(
+            &p.id,
+            None,
+            "select 1",
+            true,
+            100,
+            tokio_util::sync::CancellationToken::new()
+        )
+        .await
+        .is_err()
     );
     assert!(
         be.schema_metadata(&p.id, Some("app"), None, 10)
@@ -745,7 +848,15 @@ async fn conn_backend_sql_against_unreachable_database_is_a_connection_error_not
             .is_err()
     );
     assert!(matches!(
-        be.execute_sql("ghost", None, "select 1", true, 100).await,
+        be.execute_sql(
+            "ghost",
+            None,
+            "select 1",
+            true,
+            100,
+            tokio_util::sync::CancellationToken::new()
+        )
+        .await,
         Err(CoreError::NotFound(_))
     ));
 }

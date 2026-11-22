@@ -16,7 +16,7 @@ import { useExplainAi } from "./useExplainAi";
 
 export interface TextPlanViewProps {
   sections: readonly TextPlanSection[];
-  /** `datafusion` or `athena`. */
+  /** `datafusion`, `athena`, `trino` or `spark`. */
   engine: string;
   sql?: string;
   profileId?: string | null;
@@ -48,7 +48,7 @@ export function TextPlanView({ sections, engine, sql, profileId = null }: TextPl
   const access = profile?.aiDataAccess ?? null;
   const aiOff = access === "none";
   const redacted = explainNeedsRedaction(access, profile?.environment);
-  const engineLabel = engine.toLowerCase() === "athena" ? "Amazon Athena" : "Apache DataFusion";
+  const engineLabel = ({ athena: "Amazon Athena", trino: "Trino", spark: "Apache Spark" } as Record<string, string>)[engine.toLowerCase()] ?? "Apache DataFusion";
   // Fail closed: when the plan or the SQL cannot be redacted, nothing is sent.
   const prompt = useMemo(() => buildTextPlanPrompt({ sql, sections, engineLabel, redact: redacted }), [sql, sections, engineLabel, redacted]);
   const ai = useExplainAi({ prompt: prompt ?? "", profileId, database: null, access, blocked: prompt === null });

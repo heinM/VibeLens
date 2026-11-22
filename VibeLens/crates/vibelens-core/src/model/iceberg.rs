@@ -125,6 +125,66 @@ pub enum IcebergQueryEngine {
         /// Defaults to the catalog's AWS identity.
         aws: Option<AwsTarget>,
     },
+    /// A Trino coordinator, through Trino's client REST protocol. Works with every catalog kind:
+    /// `catalog` is the Trino catalog that points at the same Iceberg catalog.
+    Trino {
+        /// Coordinator base URL, `https://trino.example:8443`. No credentials, query or fragment.
+        url: String,
+        /// Trino catalog name, sent as `X-Trino-Catalog`.
+        catalog: String,
+        /// `X-Trino-User`.
+        user: String,
+        auth: HttpEngineAuth,
+        /// PEM bundle trusted in addition to the OS roots.
+        #[serde(default)]
+        ca_cert_path: Option<String>,
+    },
+    /// Spark SQL through an Apache Livy server (Livy 0.8+, EMR on EKS interactive endpoints).
+    Spark {
+        /// Livy base URL, `https://livy.example:8998`.
+        url: String,
+        /// Spark catalog name configured for this Iceberg catalog.
+        catalog: String,
+        auth: HttpEngineAuth,
+        #[serde(default)]
+        ca_cert_path: Option<String>,
+        /// Livy `proxyUser` for the session.
+        #[serde(default)]
+        proxy_user: Option<String>,
+        /// Spark configuration for the session. Not secret: credential-looking entries and
+        /// code-loading keys are refused on save (`cleartext::check_profile`).
+        #[serde(default)]
+        session_conf: BTreeMap<String, String>,
+        /// How long to wait for a new session to become idle. Default 300.
+        #[serde(default)]
+        session_start_timeout_secs: Option<u64>,
+    },
+}
+
+/// How a remote HTTP query engine (Trino, Livy) authenticates. The secret, when there is one,
+/// lives in the vault under [`super::vault_keys::engine_secret`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum HttpEngineAuth {
+    None,
+    /// HTTP Basic; the password is in the vault under [`super::vault_keys::engine_secret`].
+    Basic {
+        username: String,
+    },
+    /// `Authorization: Bearer`; the token (a JWT for Trino) is in the vault under
+    /// [`super::vault_keys::engine_secret`].
+    Bearer,
+}
+
+impl HttpEngineAuth {
+    /// Whether this mode reads a secret from the vault.
+    pub fn uses_secret(&self) -> bool {
+        !matches!(self, HttpEngineAuth::None)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

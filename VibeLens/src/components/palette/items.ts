@@ -2,10 +2,13 @@
 import type { ConnectionProfile, ConnectionState, Environment, SchemaMetadata, SchemaObject, WorkspaceFile } from "../../ipc/types";
 import type { HistoryEntry } from "../../store/useHistoryStore";
 import type { Rankable } from "./rank";
+import { quoteIdentFor, type SqlDialect } from "../../lib/sqlIntel/dialect";
 
 export type IconKey =
   | "pg"
   | "iceberg"
+  | "redshift"
+  | "mysql"
   | "valkey"
   | "table"
   | "view"
@@ -84,25 +87,39 @@ function icebergWhere(p: ConnectionProfile): string {
   return c.kind === "rest" || c.kind === "sql" ? c.uri : c.kind === "hms" ? c.address : c.kind === "s3Tables" ? `S3 Tables · ${c.aws.region}` : `AWS Glue · ${c.aws.region}`;
 }
 
+/** Where a Redshift connection's warehouse is, for the palette row. */
+function redshiftWhere(p: ConnectionProfile): string {
+  const o = p.redshift;
+  if (!o) return "Amazon Redshift";
+  const name = o.target.kind === "provisioned" ? o.target.clusterIdentifier : o.target.workgroupName;
+  return [name || "Amazon Redshift", o.database, o.aws.region].filter(Boolean).join(" · ");
+}
+
 export function connectionItems(profiles: readonly ConnectionProfile[], stateOf: (id: string) => ConnectionState, a: GoActions): PaletteItem[] {
   return profiles.map((p): PaletteItem => {
     const pg = p.engine === "postgres";
     const ice = p.engine === "iceberg";
+    const rs = p.engine === "redshift";
+    const my = p.engine === "mysql";
     const state = stateOf(p.id);
     return {
       id: `conn:${p.id}`,
       group: "Connections",
       title: p.name || "(unnamed)",
-      search: ice ? `${icebergWhere(p)} iceberg lakehouse athena glue rest ${p.environment}` : `${p.host} ${pg ? "postgres postgresql" : "valkey redis"} ${p.environment}`,
-      icon: ice ? "iceberg" : pg ? "pg" : "valkey",
-      tone: ice ? "cyan" : pg ? "sky" : "rose",
-      crumbs: [ice ? icebergWhere(p) : `${p.host}:${p.port}`],
+      search: ice
+        ? `${icebergWhere(p)} iceberg lakehouse athena trino spark glue rest ${p.environment}`
+        : rs
+          ? `${redshiftWhere(p)} redshift warehouse aws ${p.environment}`
+          : `${p.host} ${pg ? "postgres postgresql" : my ? "mysql aurora" : "valkey redis"} ${p.environment}`,
+      icon: ice ? "iceberg" : rs ? "redshift" : my ? "mysql" : pg ? "pg" : "valkey",
+      tone: ice ? "cyan" : rs ? "violet" : my ? "amber" : pg ? "sky" : "rose",
+      crumbs: [ice ? icebergWhere(p) : rs ? redshiftWhere(p) : `${p.host}:${p.port}`],
       meta: state === "connected" ? "connected" : state === "connecting" ? "connecting" : state === "error" ? "error" : undefined,
       env: p.environment,
       state,
       primary: state === "connected" ? "Focus" : "Connect",
       run: () => a.openConnection(p),
-      alt: { label: pg || ice ? "New SQL tab" : "New console", run: () => a.newTabOnConnection(p) },
+      alt: { label: pg || ice || rs || my ? "New SQL tab" : "New console", run: () => a.newTabOnConnection(p) },
     };
   });
 }
@@ -146,6 +163,37 @@ export function catalogItems(p: ConnectionProfile, db: string | null, meta: Sche
       primary: "Open ER diagram",
       run: () => a.openErd(p, db, schema),
       alt: { label: "Insert name", run: () => a.insertName(p, db, schema, "") },
+    });
+  }
+  return out;
+}
+
+/**
+ * Tables and views of a MySQL database. MySQL has no data tab or ER diagram (Postgres features), so the
+ * primary action opens a SELECT in a SQL tab and the alternative inserts the backtick-quoted name.
+ */
+export function mysqlCatalogItems(
+  p: ConnectionProfile,
+  meta: SchemaMetadata,
+  a: { query: (db: string, name: string) => void; insertName: (p: ConnectionProfile, db: string | null, schema: string, name: string) => void },
+): PaletteItem[] {
+  const out: PaletteItem[] = [];
+  for (const t of meta.tables) {
+    if (t.kind === "sequence" || t.kind === "function" || t.kind === "procedure") continue;
+    const isView = VIEW_KINDS.has(t.kind);
+    out.push({
+      id: `myobj:${p.id}:${t.schema}.${t.name}`,
+      group: isView ? "Views" : "Tables",
+      title: t.name,
+      search: `${t.schema}.${t.name}`,
+      context: p.name,
+      icon: isView ? "view" : "table",
+      tone: isView ? "emerald" : "sky",
+      crumbs: [p.name, t.schema],
+      meta: compactRows(t.estimatedRows) || undefined,
+      primary: "Query in new tab",
+      run: () => a.query(t.schema, t.name),
+      alt: { label: "Insert name", run: () => a.insertName(p, t.schema, t.schema, t.name) },
     });
   }
   return out;
@@ -271,10 +319,11 @@ export function groupRanked<T extends { item: { group: string }; score: number }
 const PLAIN_IDENT = /^[a-z_][a-z0-9_$]*$/;
 const RESERVED = new Set(["user", "order", "group", "table", "select", "from", "where", "limit", "offset", "desc", "asc", "end", "all", "analyse", "analyze", "and", "any", "as", "check", "column", "constraint", "default", "distinct", "do", "else", "for", "grant", "having", "in", "into", "not", "null", "on", "or", "primary", "references", "then", "to", "union", "unique", "using", "when", "with"]);
 
-/** Quote an identifier only when it needs it (mixed case, spaces, reserved words). */
-export const identForSql = (s: string): string => (PLAIN_IDENT.test(s) && !RESERVED.has(s) ? s : `"${s.replace(/"/g, '""')}"`);
+/** Quote an identifier only when it needs it (mixed case, spaces, reserved words), in the dialect's quotes (Spark: backticks). */
+export const identForSql = (s: string, dialect?: SqlDialect | null): string =>
+  PLAIN_IDENT.test(s) && !RESERVED.has(s) && !(dialect === "spark" && s.includes("$")) ? s : quoteIdentFor(s, dialect);
 
 /** Text inserted into the editor for an object: `schema.name`, or just `schema` when `name` is empty. */
-export function insertionText(schema: string, name: string): string {
-  return name ? `${identForSql(schema)}.${identForSql(name)}` : identForSql(schema);
+export function insertionText(schema: string, name: string, dialect?: SqlDialect | null): string {
+  return name ? `${identForSql(schema, dialect)}.${identForSql(name, dialect)}` : identForSql(schema, dialect);
 }

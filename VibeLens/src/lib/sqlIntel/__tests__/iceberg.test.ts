@@ -237,7 +237,7 @@ describe("time travel and metadata hints", () => {
   });
   it("offers the metadata tables of each engine", () => {
     const df = labels(at('select * from shop."orders$|', "datafusion"));
-    expect(df).toEqual(["orders$snapshots", "orders$manifests"]);
+    expect(df).toEqual(["orders$snapshots", "orders$manifests", "orders$history"]);
     const ath = at('select * from shop."orders$|', "athena")!.suggestions;
     expect(ath.map((s) => s.label)).toEqual(expect.arrayContaining(["orders$snapshots", "orders$history", "orders$files", "orders$partitions", "orders$refs"]));
     expect(ath[0].insertText).toBe('"orders$snapshots"');

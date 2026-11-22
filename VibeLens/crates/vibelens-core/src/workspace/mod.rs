@@ -15,6 +15,12 @@
 //!   outside it makes everything beneath it unreachable);
 //! - files larger than [`MAX_FILE_BYTES`] can be neither read nor written.
 //!
+//! [`WorkspaceFs::import_files`] copies files the *user* picked (outside the jail) into the
+//! workspace root. It applies the same extension list and size cap to the source, accepts only
+//! regular files (a symlink, directory, FIFO or device is refused), never overwrites (a clash
+//! gets a numeric suffix, and a symlink already sitting at the target name counts as taken, so
+//! nothing is ever written through it), and reports a reason for everything it skipped.
+//!
 //! Known limit: like any path-based check there is a small window between `resolve` and the
 //! subsequent open in which another local process could swap a directory for a symlink. The
 //! workspace lives in the user's own Documents folder, so that attacker already owns the account.
@@ -23,9 +29,11 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 
 use crate::error::{CoreError, Result};
 use crate::model::WorkspaceFile;
+use crate::ports::FileVersion;
 use crate::profiles::atomic_write;
 
 pub const ALLOWED_EXTENSIONS: &[&str] = &["sql", "valkey", "redis", "md", "txt", "json"];
@@ -39,6 +47,27 @@ const MAX_REL_LEN: usize = 1024;
 const MAX_COMPONENT_LEN: usize = 255;
 /// `list` stops after this many files so a pathological tree can't stall the UI or flood the model.
 const MAX_LISTED_FILES: usize = 10_000;
+
+/// Most files one import call will look at; the rest are reported as skipped.
+pub const MAX_IMPORT_FILES: usize = 200;
+/// Most name-clash suffixes tried (`name-2.sql` .. `name-N.sql`) before giving up on a file.
+const MAX_CLASH_SUFFIX: u32 = 1000;
+
+/// A file an import left out, and why. `name` is the file name only, never a full path.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSkip {
+    pub name: String,
+    pub reason: String,
+}
+
+/// What an import did: the workspace-relative paths created (in the order picked) and what was skipped.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportOutcome {
+    pub imported: Vec<String>,
+    pub skipped: Vec<ImportSkip>,
+}
 
 /// Path-jailed file access under a single root directory.
 pub struct WorkspaceFs {
@@ -127,8 +156,178 @@ impl WorkspaceFs {
             .map_err(|e| CoreError::Other(format!("workspace task failed: {e}")))?
     }
 
+    /// Copies the given files (chosen by the user, anywhere on disk) into the workspace root.
+    /// Never fails as a whole: each file either lands in `imported` or in `skipped` with a reason.
+    /// See the module docs for the rules.
+    pub async fn import_files(&self, sources: Vec<PathBuf>) -> ImportOutcome {
+        let this = Self {
+            root: self.root.clone(),
+        };
+        match tokio::task::spawn_blocking(move || this.import_files_blocking(&sources)).await {
+            Ok(out) => out,
+            Err(e) => ImportOutcome {
+                imported: Vec::new(),
+                skipped: vec![ImportSkip {
+                    name: String::new(),
+                    reason: format!("workspace task failed: {e}"),
+                }],
+            },
+        }
+    }
+
+    fn import_files_blocking(&self, sources: &[PathBuf]) -> ImportOutcome {
+        let mut out = ImportOutcome::default();
+        for (i, src) in sources.iter().enumerate() {
+            let name = src
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if i >= MAX_IMPORT_FILES {
+                out.skipped.push(ImportSkip {
+                    name,
+                    reason: format!("at most {MAX_IMPORT_FILES} files can be imported at once"),
+                });
+                continue;
+            }
+            match self.import_one(src) {
+                Ok(rel) => out.imported.push(rel),
+                Err(e) => out.skipped.push(ImportSkip {
+                    name,
+                    reason: match e {
+                        CoreError::Invalid(m) => m,
+                        other => other.to_string(),
+                    },
+                }),
+            }
+        }
+        out
+    }
+
+    fn import_one(&self, src: &Path) -> Result<String> {
+        use std::io::{Read, Write};
+
+        let invalid = |why: String| CoreError::Invalid(why);
+        // The name must be one plain, allowed workspace file name: this is the same check as
+        // for any other workspace path, and rules out hidden files, device names and odd forms.
+        let name = src
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| invalid("the file name is not valid UTF-8".into()))?;
+        if validate_relative(name)?.as_slice() != [name] {
+            return Err(invalid("the file name is not a plain file name".into()));
+        }
+
+        // Look at the entry itself first (no symlink following), and only open a regular file:
+        // opening a FIFO or device could block or read forever.
+        let link_meta = fs::symlink_metadata(src).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => invalid("the file no longer exists".into()),
+            _ => CoreError::Io(e),
+        })?;
+        if link_meta.file_type().is_symlink() {
+            return Err(invalid(
+                "a symbolic link is not imported; pick the file itself".into(),
+            ));
+        }
+        if !link_meta.is_file() {
+            return Err(invalid("not a regular file".into()));
+        }
+        // The entry could be swapped between the check above and this open, so the open itself
+        // refuses a symbolic link and never blocks on a FIFO; the checks below see what was opened.
+        let mut open = fs::OpenOptions::new();
+        open.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = open.open(src)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(invalid("not a regular file".into()));
+        }
+        if meta.len() > MAX_FILE_BYTES {
+            return Err(invalid(format!(
+                "the file is {} bytes; the limit is {MAX_FILE_BYTES}",
+                meta.len()
+            )));
+        }
+        // Bounded read in case the file grows between the stat and the read.
+        let mut bytes = Vec::with_capacity(meta.len() as usize);
+        file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_FILE_BYTES {
+            return Err(invalid(format!(
+                "the file exceeds the {MAX_FILE_BYTES} byte limit"
+            )));
+        }
+        if std::str::from_utf8(&bytes).is_err() {
+            return Err(invalid("the file is not valid UTF-8 text".into()));
+        }
+
+        // `create_new` fails if anything (file, directory, dangling or outward-pointing
+        // symlink) is already at the name, so an import can neither overwrite nor write
+        // through a link; the next numbered name is tried instead.
+        let (stem, ext) = name.rsplit_once('.').unwrap_or((name, ""));
+        for n in 1..=MAX_CLASH_SUFFIX {
+            let candidate = if n == 1 {
+                name.to_string()
+            } else {
+                format!("{stem}-{n}.{ext}")
+            };
+            // Anything already at the name (a symlink included, dangling or not) means taken.
+            if fs::symlink_metadata(self.root.join(&candidate)).is_ok() {
+                continue;
+            }
+            let target = self.resolve(&candidate)?;
+            let mut dest = match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)
+            {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let written = dest.write_all(&bytes).and_then(|()| dest.sync_all());
+            drop(dest);
+            if let Err(e) = written {
+                let _ = fs::remove_file(&target);
+                return Err(e.into());
+            }
+            return Ok(candidate);
+        }
+        Err(invalid(format!(
+            "too many files named like {name} already exist in the workspace"
+        )))
+    }
+
     /// Atomic write (tmp + fsync + rename). Creates parent dirs inside the root.
     pub async fn write(&self, rel: &str, contents: &str) -> Result<()> {
+        self.write_checked(rel, contents, None).await
+    }
+
+    /// Like [`write`](Self::write), but only if the file is still at `expected`: the version
+    /// somebody was shown before agreeing to this write. If the file has changed, appeared or
+    /// gone since, nothing is written and the error says which.
+    ///
+    /// The check and the rename are two steps, so a change in the instant between them is
+    /// still overwritten. What this closes is the wait before it: the approval has no time
+    /// limit, and the file on disk used to be replaced whatever had happened to it meanwhile.
+    pub async fn write_if_unchanged(
+        &self,
+        rel: &str,
+        contents: &str,
+        expected: &FileVersion,
+    ) -> Result<()> {
+        self.write_checked(rel, contents, Some(expected.clone()))
+            .await
+    }
+
+    async fn write_checked(
+        &self,
+        rel: &str,
+        contents: &str,
+        expected: Option<FileVersion>,
+    ) -> Result<()> {
         if contents.len() as u64 > MAX_FILE_BYTES {
             return Err(CoreError::Invalid(format!(
                 "file would be {} bytes; the limit is {MAX_FILE_BYTES}",
@@ -137,15 +336,63 @@ impl WorkspaceFs {
         }
         let path = self.resolve(rel)?;
         let bytes = contents.as_bytes().to_vec();
+        let shown = rel.to_string();
         tokio::task::spawn_blocking(move || {
             if path.is_dir() {
                 return Err(CoreError::Invalid("path is a directory".into()));
+            }
+            if let Some(expected) = expected {
+                let now = version_on_disk(&path)?;
+                if now != expected {
+                    return Err(changed_since_shown(&shown, &expected, &now));
+                }
             }
             atomic_write(&path, &bytes, false)
         })
         .await
         .map_err(|e| CoreError::Other(format!("workspace task failed: {e}")))?
     }
+}
+
+/// What is at `path` now. Reads at most one byte more than a workspace file may hold: a file
+/// that has grown past the limit is a different file whatever the rest of it says.
+fn version_on_disk(path: &Path) -> Result<FileVersion> {
+    use sha2::Digest as _;
+    use std::io::Read;
+
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FileVersion::Absent),
+        Err(e) => return Err(e.into()),
+    };
+    let mut hasher = sha2::Sha256::new();
+    let mut limited = file.take(MAX_FILE_BYTES + 1);
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = limited.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(FileVersion::Sha256(hasher.finalize().into()))
+}
+
+/// The refusal of [`WorkspaceFs::write_if_unchanged`], worded for whoever has to act on it
+/// (the agent's model reads it and can read the file again).
+fn changed_since_shown(shown: &str, expected: &FileVersion, now: &FileVersion) -> CoreError {
+    let what = match (expected, now) {
+        (FileVersion::Absent, _) => {
+            "did not exist when this change was shown for approval, and it exists now"
+        }
+        (_, FileVersion::Absent) => {
+            "has been deleted or moved since this change was shown for approval"
+        }
+        _ => "has changed since this change was shown for approval",
+    };
+    CoreError::Other(format!(
+        "{shown} {what}. Nothing was written. Read the file again and propose the change against what it holds now."
+    ))
 }
 
 /// Syntactic checks. Returns the normal components (no `.`/empty segments) on success.

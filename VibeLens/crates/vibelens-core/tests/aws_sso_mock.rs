@@ -500,6 +500,15 @@ async fn start_validates_input() {
         e.svc.sso_start("http://insecure/start", REGION).await,
         Err(CoreError::Invalid(_))
     ));
+    for region in ["x.evil.example/#", "EU-WEST-1", "eu west 1"] {
+        assert!(
+            matches!(
+                e.svc.sso_start(START_URL, region).await,
+                Err(CoreError::Invalid(_))
+            ),
+            "{region}"
+        );
+    }
     assert!(matches!(
         e.svc.sso_start(START_URL, " ").await,
         Err(CoreError::Invalid(_))
@@ -575,6 +584,8 @@ fn profile_with(auth: AuthMethod) -> ConnectionProfile {
         created_at: None,
         updated_at: None,
         iceberg: None,
+        redshift: None,
+        mysql: Default::default(),
     }
 }
 

@@ -172,6 +172,16 @@ impl SsoCore {
                 "SSO start URL must look like https://d-xxxxxxxxxx.awsapps.com/start".into(),
             ));
         }
+        // The region becomes part of the endpoint host name: letters, digits and hyphens only.
+        if region.len() > 32
+            || !region
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(CoreError::Invalid(
+                "SSO region must look like eu-west-1".into(),
+            ));
+        }
         if region.is_empty() {
             return Err(CoreError::Invalid("SSO region is required".into()));
         }

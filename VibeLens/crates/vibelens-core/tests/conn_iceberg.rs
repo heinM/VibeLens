@@ -8,6 +8,8 @@
 //!   its invalidation, disconnect, the idle reaper and the agent's tool backend.
 #![cfg(feature = "iceberg")]
 
+mod services;
+
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -154,6 +156,8 @@ fn base(name: &str, options: Option<IcebergOptions>) -> ConnectionProfile {
         created_at: None,
         updated_at: None,
         iceberg: options,
+        redshift: None,
+        mysql: Default::default(),
     }
 }
 
@@ -237,7 +241,14 @@ async fn ice_missing_deps_is_invalid_and_is_not_a_connection_failure() {
     ));
     let (b, _ws) = backend(&h);
     let err = b
-        .execute_sql(&p.id, None, "select 1", true, 10)
+        .execute_sql(
+            &p.id,
+            None,
+            "select 1",
+            true,
+            10,
+            tokio_util::sync::CancellationToken::new(),
+        )
         .await
         .unwrap_err();
     assert!(
@@ -316,6 +327,84 @@ async fn ice_engine_mismatch_and_missing_options_are_invalid_and_never_dial() {
 }
 
 // ---- always-on: status transitions on failure --------------------------------------------------
+
+/// Review finding M7: a profile edited by hand (the in-memory store has no rules) that would
+/// send a secret in the clear, or that keeps one outside the keychain, is refused when used.
+#[tokio::test]
+async fn ice_profiles_with_a_secret_in_the_wrong_place_are_refused_on_use() {
+    let h = harness();
+    let vault = Arc::new(MemoryVault::new());
+    h.mgr.set_iceberg_deps(IcebergDeps {
+        aws: AwsService::new(),
+        vault: vault.clone(),
+    });
+    let options = |catalog| {
+        Some(IcebergOptions {
+            catalog,
+            storage: IcebergStorage::Local,
+            query_engine: IcebergQueryEngine::Local,
+            default_namespace: None,
+        })
+    };
+    let rest = |uri: String, auth, header: Option<(&str, &str)>| IcebergCatalog::Rest {
+        uri,
+        warehouse: None,
+        auth,
+        headers: header
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    };
+    let here = format!("http://127.0.0.1:{}", closed_port());
+    for p in [
+        base(
+            "token to a cleartext catalog",
+            options(rest(
+                "http://catalog.internal.example:8181".into(),
+                RestAuth::Bearer,
+                None,
+            )),
+        ),
+        base(
+            "credential in a header",
+            options(rest(
+                here.clone(),
+                RestAuth::None,
+                Some(("Authorization", "Basic c2VjcmV0")),
+            )),
+        ),
+        base(
+            "password in the catalog URI",
+            options(IcebergCatalog::Sql {
+                uri: format!("postgres://iceberg:hunter2@127.0.0.1:{}/c", closed_port()),
+                warehouse: "file:///tmp/vg-none".into(),
+                catalog_name: "c".into(),
+            }),
+        ),
+    ] {
+        let saved = h.profiles.upsert(p).unwrap();
+        // A token is in the keychain, so only the rule stands between it and the network.
+        use vibelens_core::ports::SecretVault;
+        vault
+            .set(
+                &vault_keys::iceberg_secret(&saved.id),
+                &SecretString::from("s3cr3t-token".to_string()),
+            )
+            .await
+            .unwrap();
+        let e = h.mgr.iceberg(&saved.id).await.err().expect("refused");
+        assert!(
+            matches!(&e, CoreError::Invalid(m) if !m.contains("hunter2") && !m.contains("c2VjcmV0") && !m.contains("s3cr3t")),
+            "{}: {e:?}",
+            saved.name
+        );
+        assert!(
+            matches!(h.mgr.test(&saved, None).await, Err(CoreError::Invalid(_))),
+            "{}",
+            saved.name
+        );
+    }
+}
 
 #[tokio::test]
 async fn ice_failed_connect_records_error_status_with_detail_then_disconnect_clears_it() {
@@ -414,11 +503,15 @@ struct Fixture {
     warehouse: String,
 }
 
+/// The pyiceberg fixture, or `None` after reporting the skip: the test returns.
 fn fixture() -> Option<Fixture> {
-    let db = std::env::var("VG_TEST_ICEBERG_SQL_DB").ok()?;
-    let warehouse = std::env::var("VG_TEST_ICEBERG_WAREHOUSE").ok()?;
+    let db = std::env::var("VG_TEST_ICEBERG_SQL_DB").unwrap_or_default();
+    let warehouse = std::env::var("VG_TEST_ICEBERG_WAREHOUSE").unwrap_or_default();
     if db.is_empty() || warehouse.is_empty() {
-        eprintln!("skipping: set VG_TEST_ICEBERG_SQL_DB and VG_TEST_ICEBERG_WAREHOUSE");
+        services::skip(
+            "iceberg",
+            "VG_TEST_ICEBERG_SQL_DB and VG_TEST_ICEBERG_WAREHOUSE are not both set",
+        );
         return None;
     }
     Some(Fixture { db, warehouse })
@@ -652,6 +745,7 @@ async fn ice_tool_backend_runs_sql_and_reads_the_schema() {
             "select count(*) as n from shop.customers",
             true,
             100,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("select");
@@ -663,6 +757,7 @@ async fn ice_tool_backend_runs_sql_and_reads_the_schema() {
             "select id from customers order by id limit 3",
             true,
             100,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("default namespace resolves unqualified names");
@@ -670,7 +765,14 @@ async fn ice_tool_backend_runs_sql_and_reads_the_schema() {
 
     // max_rows is honoured.
     let res = b
-        .execute_sql(&p.id, None, "select id from shop.customers", true, 7)
+        .execute_sql(
+            &p.id,
+            None,
+            "select id from shop.customers",
+            true,
+            7,
+            tokio_util::sync::CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(res.rows.len(), 7);
@@ -684,6 +786,7 @@ async fn ice_tool_backend_runs_sql_and_reads_the_schema() {
             "insert into shop.customers select * from shop.customers",
             true,
             10,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .unwrap_err();
@@ -692,7 +795,14 @@ async fn ice_tool_backend_runs_sql_and_reads_the_schema() {
         "{err:?}"
     );
     let still = b
-        .execute_sql(&p.id, None, "select count(*) from shop.customers", true, 10)
+        .execute_sql(
+            &p.id,
+            None,
+            "select count(*) from shop.customers",
+            true,
+            10,
+            tokio_util::sync::CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(still.rows, vec![vec![serde_json::json!("500")]]);
@@ -704,6 +814,7 @@ async fn ice_tool_backend_runs_sql_and_reads_the_schema() {
             "delete from shop.customers where id = 1",
             false,
             10,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .unwrap_err();

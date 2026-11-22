@@ -71,9 +71,14 @@ impl AgentService {
         }
         // Idempotent: errors only mean a provider is already installed.
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        // Never follow a redirect. Every request carries the API key and the conversation, and
+        // a redirect would pass them on: custom headers such as `x-api-key` survive a redirect
+        // to another host, and a 307/308 re-sends the body. `ProviderClient::post` reports the
+        // 3xx with its target instead.
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(20))
             .user_agent(concat!("VibeLens/", env!("CARGO_PKG_VERSION")))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| CoreError::Llm(format!("could not initialise the HTTP client: {e}")))?;
         *guard = Some(client.clone());
@@ -120,6 +125,21 @@ impl AgentService {
         config.base_url = config.base_url.trim().to_string();
         config.model = config.model.trim().to_string();
         store::validate(&config)?;
+        // The key this provider will have once saved: the new one, or the stored one when kept.
+        let will_have_key = match &api_key {
+            Some(k) => !k.expose_secret().trim().is_empty(),
+            // An unreadable keychain is not a reason to refuse the save; the same rule runs
+            // again when the provider is used.
+            None => self
+                .api_key(&config.id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|k| !k.expose_secret().trim().is_empty()),
+        };
+        if will_have_key {
+            store::check_key_is_not_sent_in_cleartext(&config)?;
+        }
         let key_name = vault_keys::llm_api_key(&config.id);
         if let Some(k) = &api_key {
             let k = k.expose_secret().trim();

@@ -68,6 +68,26 @@ pub trait TunnelProvider: Send + Sync {
 /// Everything the agent's tools are allowed to do, and nothing else.
 /// Implemented by `connections::AppToolBackend`. Policy (approval, AiDataAccess) is enforced
 /// by the agent layer *before* calling these; implementations still honour `read_only`.
+/// What a workspace file held at one moment: enough to tell later whether it has changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileVersion {
+    /// There was no file.
+    Absent,
+    /// SHA-256 of the file's contents.
+    Sha256([u8; 32]),
+}
+
+impl FileVersion {
+    /// The version of a file with these contents (`None`: no file).
+    pub fn of(contents: Option<&str>) -> Self {
+        use sha2::Digest as _;
+        match contents {
+            None => FileVersion::Absent,
+            Some(text) => FileVersion::Sha256(sha2::Sha256::digest(text.as_bytes()).into()),
+        }
+    }
+}
+
 #[async_trait]
 pub trait ToolBackend: Send + Sync {
     fn profile(&self, profile_id: &str) -> Result<ConnectionProfile>;
@@ -79,6 +99,9 @@ pub trait ToolBackend: Send + Sync {
         sql: &str,
         read_only: bool,
         max_rows: usize,
+        // The agent turn's token: when it fires (Stop, tool timeout) the engine stops the
+        // statement on the server before returning.
+        cancel: CancellationToken,
     ) -> Result<QueryResult>;
     async fn schema_metadata(
         &self,
@@ -105,7 +128,16 @@ pub trait ToolBackend: Send + Sync {
     ) -> Result<CommandOutcome>;
     async fn list_files(&self) -> Result<Vec<WorkspaceFile>>;
     async fn read_file(&self, path: &str) -> Result<String>;
-    async fn write_file(&self, path: &str, contents: &str) -> Result<()>;
+    /// Writes `contents` to `path` if the file is still what the user was shown: `expected` is
+    /// the file as it was when the change was put up for approval. If it has changed since (or
+    /// appeared, or gone), nothing is written and the call fails.
+    async fn write_file(&self, path: &str, contents: &str, expected: &FileVersion) -> Result<()>;
+    /// Names of the databases a `list_databases` call may show: on Postgres the server's
+    /// databases that accept connections (no templates), on Redshift those of the cluster or
+    /// workgroup. Other engines are refused. Default: not supported, so fakes need not implement it.
+    async fn list_databases(&self, _profile_id: &str) -> Result<Vec<String>> {
+        Err(crate::error::CoreError::NotImplemented("list_databases"))
+    }
     /// Full Iceberg table metadata (partition spec, sort order, snapshots) for `describe_table`.
     /// Default: not supported, so fakes and non-Iceberg backends need not implement it; callers
     /// fall back to `schema_metadata` on `CoreError::NotImplemented`.

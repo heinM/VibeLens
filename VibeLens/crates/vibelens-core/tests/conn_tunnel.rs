@@ -1,17 +1,19 @@
 //! SshTunnelProvider against a real, throwaway `sshd` (127.0.0.1:2222).
 //!
 //! Opt-in: set `VG_TEST_SSH=1` (the setup script installs `openssh-server` if needed and starts
-//! `sshd -D` with generated keys; see `conn_tunnel_setup.sh`). Without it every test returns
-//! immediately. The forwarding target is the local Redis on 127.0.0.1:6379 (override with
+//! `sshd -D` with generated keys; see `conn_tunnel_setup.sh`). Without it every test skips
+//! (`services::skip`, service `ssh`). The forwarding target is the local Redis on 127.0.0.1:6379 (override with
 //! `VG_TEST_REDIS_ADDR`) and a small in-process echo server.
 //!
 //! Tests are serialised: they share the sshd port and a few process-wide environment variables
 //! (`SSH_AUTH_SOCK`, `HOME`).
 
+mod services;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 mod conn_common;
@@ -33,19 +35,8 @@ fn redis_addr() -> String {
     std::env::var("VG_TEST_REDIS_ADDR").unwrap_or_else(|_| "127.0.0.1:6379".to_string())
 }
 
-type Seen = Arc<Mutex<Vec<(String, String)>>>;
-
-fn provider(vault: Arc<dyn SecretVault>) -> (Arc<SshTunnelProvider>, Seen) {
-    let seen: Seen = Arc::default();
-    let sink = seen.clone();
-    let p = SshTunnelProvider::new(
-        vault,
-        Arc::new(move |id: &str, fp: &str| {
-            sink.lock().unwrap().push((id.to_string(), fp.to_string()));
-            Ok(())
-        }),
-    );
-    (p, seen)
+fn provider(vault: Arc<dyn SecretVault>) -> Arc<SshTunnelProvider> {
+    SshTunnelProvider::new(vault)
 }
 
 fn empty_vault() -> Arc<dyn SecretVault> {
@@ -101,6 +92,52 @@ async fn echo_server() -> SocketAddr {
     addr
 }
 
+/// Everything sshd has logged so far (it runs at `LogLevel DEBUG1`, see the setup script).
+fn sshd_log(sshd: &Sshd) -> String {
+    std::fs::read_to_string(sshd.dir.path().join("sshd.log")).unwrap_or_default()
+}
+
+/// Waits until the part of the sshd log written after byte `from` contains `needle`, and
+/// returns that part. Panics with the log when it never does.
+async fn sshd_log_after(sshd: &Sshd, from: usize, needle: &str) -> String {
+    for _ in 0..50 {
+        let log = sshd_log(sshd);
+        let tail = log.get(from..).unwrap_or_default();
+        if tail.contains(needle) {
+            return tail.to_string();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!(
+        "sshd never logged {needle:?}; log since then:\n{}",
+        sshd_log(sshd).get(from..).unwrap_or_default()
+    );
+}
+
+/// What sshd logs for every authentication request it receives, whatever the method.
+const AUTH_REQUEST: &str = "userauth-request";
+
+/// A vault that counts how often it is asked for a secret.
+#[derive(Default)]
+struct CountingVault {
+    inner: MemoryVault,
+    gets: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl SecretVault for CountingVault {
+    async fn get(&self, key: &str) -> Result<Option<SecretString>, CoreError> {
+        self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.get(key).await
+    }
+    async fn set(&self, key: &str, value: &SecretString) -> Result<(), CoreError> {
+        self.inner.set(key, value).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), CoreError> {
+        self.inner.delete(key).await
+    }
+}
+
 macro_rules! sshd_or_return {
     ($guard:ident, $sshd:ident) => {
         let $guard = SERIAL.lock().await;
@@ -109,14 +146,14 @@ macro_rules! sshd_or_return {
 }
 
 #[tokio::test]
-async fn conn_forwards_to_redis_and_captures_the_host_key_fingerprint_on_first_use() {
+async fn conn_forwards_to_redis_through_a_host_with_a_pinned_key() {
     sshd_or_return!(_g, sshd);
-    let (p, seen) = provider(empty_vault());
+    let p = provider(empty_vault());
 
     let handle = open(
         &p,
         "profile-1",
-        &sshd.cfg(sshd.key_auth(), None),
+        &sshd.trusted(sshd.key_auth()),
         &redis_addr(),
     )
     .await
@@ -128,11 +165,12 @@ async fn conn_forwards_to_redis_and_captures_the_host_key_fingerprint_on_first_u
     // A second connection over the same SSH session.
     assert_eq!(redis_ping(handle.local_addr).await.unwrap(), "+PONG\r\n");
 
-    // TOFU: reported exactly once, for this profile, in `SHA256:<base64 no padding>` form that
-    // matches what `ssh-keygen -lf` prints for the host key.
-    let seen = seen.lock().unwrap().clone();
-    assert_eq!(seen, vec![("profile-1".to_string(), sshd.host_fp())]);
-    assert!(seen[0].1.starts_with("SHA256:") && !seen[0].1.contains('='));
+    // The pin is what `ssh-keygen -lf` prints for the host key: `SHA256:<base64 no padding>`.
+    assert!(
+        is_host_key_fingerprint(&sshd.host_fp()),
+        "{}",
+        sshd.host_fp()
+    );
 
     // Dropping the handle closes the listener.
     let addr = handle.local_addr;
@@ -151,19 +189,84 @@ async fn conn_forwards_to_redis_and_captures_the_host_key_fingerprint_on_first_u
     );
 }
 
+/// Review finding M1. A host whose key is not pinned gets no authentication attempt at all: no
+/// password, no key offer, not even the user name. The error says which key the server showed.
 #[tokio::test]
-async fn conn_correctly_pinned_fingerprint_connects_and_is_not_reported_again() {
+async fn conn_unknown_host_key_stops_before_any_authentication_attempt() {
     sshd_or_return!(_g, sshd);
-    let (p, seen) = provider(empty_vault());
+    let vault = Arc::new(CountingVault::default());
+    for key in [
+        vault_keys::ssh_password("p"),
+        vault_keys::ssh_passphrase("p"),
+    ] {
+        vault
+            .set(&key, &SecretString::from("hunter2".to_string()))
+            .await
+            .unwrap();
+    }
+    let p = provider(vault.clone());
+
+    // Control: a pinned connect does authenticate, and sshd's log shows it. Without this the
+    // "no authentication request" check below would prove nothing.
+    let mark = sshd_log(&sshd).len();
+    let pinned = sshd.cfg(sshd.key_auth(), Some(sshd.host_fp()));
+    drop(
+        open(&p, "p", &pinned, &redis_addr())
+            .await
+            .expect("pinned connect"),
+    );
+    sshd_log_after(&sshd, mark, AUTH_REQUEST).await;
+
+    for (auth, pin) in [
+        (sshd.key_auth(), None),
+        (SshAuth::Password, None),
+        // A blank pin is no pin.
+        (SshAuth::Password, Some("  ".to_string())),
+    ] {
+        let mark = sshd_log(&sshd).len();
+        let asked = vault.gets.load(std::sync::atomic::Ordering::SeqCst);
+        let err = open(&p, "p", &sshd.cfg(auth.clone(), pin), &redis_addr())
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{auth:?}: connected to a host whose key nobody checked"));
+        assert_eq!(err.code(), "unknown_host_key", "{auth:?}: {err:?}");
+        assert!(
+            err.to_string().contains(&sshd.host_fp()),
+            "the error shows the key the server presented: {err}"
+        );
+        match &err {
+            CoreError::UnknownHostKey(key) => assert_eq!(
+                (key.host.as_str(), key.port, key.fingerprint.clone()),
+                ("127.0.0.1", sshd.port(), sshd.host_fp())
+            ),
+            other => panic!("{other:?}"),
+        }
+
+        // The server saw the connection end, and never an authentication request.
+        let log = sshd_log_after(&sshd, mark, "Connection from").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let log = sshd_log(&sshd).get(mark..).unwrap_or(&log).to_string();
+        assert!(
+            !log.contains(AUTH_REQUEST),
+            "{auth:?}: an authentication request reached the server:\n{log}"
+        );
+        assert_eq!(
+            vault.gets.load(std::sync::atomic::Ordering::SeqCst),
+            asked,
+            "{auth:?}: the SSH secret was not even read from the vault"
+        );
+    }
+}
+
+#[tokio::test]
+async fn conn_correctly_pinned_fingerprint_connects() {
+    sshd_or_return!(_g, sshd);
+    let p = provider(empty_vault());
     let cfg = sshd.cfg(sshd.key_auth(), Some(sshd.host_fp()));
     let handle = open(&p, "p", &cfg, &redis_addr())
         .await
         .expect("pinned connect");
     assert_eq!(redis_ping(handle.local_addr).await.unwrap(), "+PONG\r\n");
-    assert!(
-        seen.lock().unwrap().is_empty(),
-        "no TOFU callback when a fingerprint is already pinned"
-    );
 }
 
 #[tokio::test]
@@ -171,7 +274,7 @@ async fn conn_wrong_pinned_fingerprint_is_refused_before_authentication() {
     sshd_or_return!(_g, sshd);
     // Auth is Password with nothing in the vault: if the host key check did not run first we
     // would see an Auth error instead of the mismatch.
-    let (p, seen) = provider(empty_vault());
+    let p = provider(empty_vault());
     for wrong in [
         sshd.other_fp(),
         "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
@@ -197,13 +300,12 @@ async fn conn_wrong_pinned_fingerprint_is_refused_before_authentication() {
             other => panic!("expected Tunnel error, got {other:?}"),
         }
     }
-    assert!(seen.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn conn_pinned_fingerprint_survives_whitespace() {
     sshd_or_return!(_g, sshd);
-    let (p, _) = provider(empty_vault());
+    let p = provider(empty_vault());
     let cfg = sshd.cfg(sshd.key_auth(), Some(format!("  {}\n", sshd.host_fp())));
     open(&p, "p", &cfg, &redis_addr())
         .await
@@ -223,16 +325,13 @@ async fn conn_tilde_in_key_path_is_expanded() {
     let old = std::env::var_os("HOME");
     // SAFETY: tests in this file are serialised by SERIAL and nothing else here reads HOME.
     unsafe { std::env::set_var("HOME", fake_home.path()) };
-    let (p, _) = provider(empty_vault());
+    let p = provider(empty_vault());
     let result = open(
         &p,
         "p",
-        &sshd.cfg(
-            SshAuth::PrivateKey {
-                path: "~/.ssh/id_test".into(),
-            },
-            None,
-        ),
+        &sshd.trusted(SshAuth::PrivateKey {
+            path: "~/.ssh/id_test".into(),
+        }),
         &redis_addr(),
     )
     .await;
@@ -259,16 +358,16 @@ async fn conn_encrypted_key_uses_the_passphrase_from_the_vault() {
         sshd.get("CLIENT_KEY_PASSPHRASE"),
     )])
     .await;
-    let (p, _) = provider(vault);
-    let h = open(&p, "p", &sshd.cfg(auth.clone(), None), &redis_addr())
+    let p = provider(vault);
+    let h = open(&p, "p", &sshd.trusted(auth.clone()), &redis_addr())
         .await
         .expect("decrypts and authenticates");
     assert_eq!(redis_ping(h.local_addr).await.unwrap(), "+PONG\r\n");
     drop(h);
 
     // No passphrase saved.
-    let (p, _) = provider(empty_vault());
-    match open(&p, "p", &sshd.cfg(auth.clone(), None), &redis_addr())
+    let p = provider(empty_vault());
+    match open(&p, "p", &sshd.trusted(auth.clone()), &redis_addr())
         .await
         .err()
         .unwrap()
@@ -279,8 +378,8 @@ async fn conn_encrypted_key_uses_the_passphrase_from_the_vault() {
 
     // Wrong passphrase; the message must not echo it.
     let vault = secret_vault(&[(vault_keys::ssh_passphrase("p"), "definitely-wrong")]).await;
-    let (p, _) = provider(vault);
-    match open(&p, "p", &sshd.cfg(auth, None), &redis_addr())
+    let p = provider(vault);
+    match open(&p, "p", &sshd.trusted(auth), &redis_addr())
         .await
         .err()
         .unwrap()
@@ -293,13 +392,10 @@ async fn conn_encrypted_key_uses_the_passphrase_from_the_vault() {
 #[tokio::test]
 async fn conn_missing_or_unreadable_key_file_is_an_auth_error() {
     sshd_or_return!(_g, sshd);
-    let (p, _) = provider(empty_vault());
-    let cfg = sshd.cfg(
-        SshAuth::PrivateKey {
-            path: "/nonexistent/id_ed25519".into(),
-        },
-        None,
-    );
+    let p = provider(empty_vault());
+    let cfg = sshd.trusted(SshAuth::PrivateKey {
+        path: "/nonexistent/id_ed25519".into(),
+    });
     let err = open(&p, "p", &cfg, &redis_addr()).await.err().unwrap();
     assert!(
         matches!(&err, CoreError::Auth(m) if m.contains("/nonexistent/id_ed25519")),
@@ -312,8 +408,9 @@ async fn conn_password_authentication() {
     sshd_or_return!(_g, sshd);
     let pw_user = sshd.get("PASSWORD_USER").to_string();
     if pw_user.is_empty() {
-        eprintln!(
-            "skipping password auth: setup script could not create a password user (not root?)"
+        services::skip(
+            "ssh-password",
+            "the setup script could not create a password user (not root?)",
         );
         return;
     }
@@ -322,11 +419,11 @@ async fn conn_password_authentication() {
         port: sshd.port(),
         username: pw_user,
         auth: SshAuth::Password,
-        known_host_fingerprint: None,
+        known_host_fingerprint: Some(sshd.host_fp()),
     };
 
     let vault = secret_vault(&[(vault_keys::ssh_password("p"), sshd.get("PASSWORD"))]).await;
-    let (p, _) = provider(vault);
+    let p = provider(vault);
     let h = open(&p, "p", &cfg, &redis_addr())
         .await
         .expect("password auth");
@@ -334,14 +431,14 @@ async fn conn_password_authentication() {
     drop(h);
 
     let vault = secret_vault(&[(vault_keys::ssh_password("p"), "not-the-password")]).await;
-    let (p, _) = provider(vault);
+    let p = provider(vault);
     let err = open(&p, "p", &cfg, &redis_addr()).await.err().unwrap();
     assert!(
         matches!(&err, CoreError::Auth(m) if !m.contains("not-the-password")),
         "{err:?}"
     );
 
-    let (p, _) = provider(empty_vault());
+    let p = provider(empty_vault());
     let err = open(&p, "p", &cfg, &redis_addr()).await.err().unwrap();
     assert!(
         matches!(&err, CoreError::Auth(m) if m.contains("no SSH password")),
@@ -352,20 +449,16 @@ async fn conn_password_authentication() {
 #[tokio::test]
 async fn conn_unknown_user_is_rejected_as_an_auth_error() {
     sshd_or_return!(_g, sshd);
-    let (p, seen) = provider(empty_vault());
+    let p = provider(empty_vault());
     let cfg = TunnelConfig::Ssh {
         host: "127.0.0.1".into(),
         port: sshd.port(),
         username: "no-such-user-xyz".into(),
         auth: sshd.key_auth(),
-        known_host_fingerprint: None,
+        known_host_fingerprint: Some(sshd.host_fp()),
     };
     let err = open(&p, "p", &cfg, &redis_addr()).await.err().unwrap();
     assert!(matches!(err, CoreError::Auth(_)), "{err:?}");
-    assert!(
-        seen.lock().unwrap().is_empty(),
-        "a host key is only pinned after authentication succeeds"
-    );
 }
 
 #[tokio::test]
@@ -392,8 +485,8 @@ async fn conn_ssh_agent_authentication() {
     // No identities loaded yet.
     // SAFETY: serialised by SERIAL; only the agent code reads SSH_AUTH_SOCK.
     unsafe { std::env::set_var("SSH_AUTH_SOCK", &sock) };
-    let (p, _) = provider(empty_vault());
-    let empty = open(&p, "p", &sshd.cfg(SshAuth::Agent, None), &redis_addr())
+    let p = provider(empty_vault());
+    let empty = open(&p, "p", &sshd.trusted(SshAuth::Agent), &redis_addr())
         .await
         .err();
 
@@ -404,7 +497,7 @@ async fn conn_ssh_agent_authentication() {
         .status()
         .unwrap();
     assert!(added.success());
-    let loaded = open(&p, "p", &sshd.cfg(SshAuth::Agent, None), &redis_addr()).await;
+    let loaded = open(&p, "p", &sshd.trusted(SshAuth::Agent), &redis_addr()).await;
     let ping = match &loaded {
         Ok(h) => Some(redis_ping(h.local_addr).await),
         Err(_) => None,
@@ -412,7 +505,7 @@ async fn conn_ssh_agent_authentication() {
 
     // SSH_AUTH_SOCK unset.
     unsafe { std::env::remove_var("SSH_AUTH_SOCK") };
-    let unset = open(&p, "p", &sshd.cfg(SshAuth::Agent, None), &redis_addr())
+    let unset = open(&p, "p", &sshd.trusted(SshAuth::Agent), &redis_addr())
         .await
         .err();
 
@@ -442,6 +535,7 @@ async fn conn_ssh_agent_authentication() {
 async fn conn_unreachable_bastion_is_a_tunnel_error() {
     let _g = SERIAL.lock().await;
     if std::env::var("VG_TEST_SSH").as_deref() != Ok("1") {
+        services::skip("ssh", "VG_TEST_SSH is not 1 (the sshd-backed tests)");
         return;
     }
     let free = std::net::TcpListener::bind("127.0.0.1:0")
@@ -456,7 +550,7 @@ async fn conn_unreachable_bastion_is_a_tunnel_error() {
         auth: SshAuth::Agent,
         known_host_fingerprint: None,
     };
-    let (p, _) = provider(empty_vault());
+    let p = provider(empty_vault());
     let err = open(&p, "p", &cfg, "127.0.0.1:6379").await.err().unwrap();
     assert!(
         matches!(&err, CoreError::Tunnel(m) if m.contains("cannot reach")),
@@ -466,7 +560,7 @@ async fn conn_unreachable_bastion_is_a_tunnel_error() {
 
 #[tokio::test]
 async fn conn_invalid_config_is_rejected_up_front() {
-    let (p, _) = provider(empty_vault());
+    let p = provider(empty_vault());
     let bad_user = TunnelConfig::Ssh {
         host: "h".into(),
         port: 22,
@@ -510,8 +604,8 @@ async fn conn_invalid_config_is_rejected_up_front() {
 async fn conn_moves_a_megabyte_both_ways_with_half_close_and_parallel_connections() {
     sshd_or_return!(_g, sshd);
     let echo = echo_server().await;
-    let (p, _) = provider(empty_vault());
-    let h = open(&p, "p", &sshd.cfg(sshd.key_auth(), None), &echo.to_string())
+    let p = provider(empty_vault());
+    let h = open(&p, "p", &sshd.trusted(sshd.key_auth()), &echo.to_string())
         .await
         .unwrap();
     let addr = h.local_addr;
@@ -555,11 +649,11 @@ async fn conn_refused_target_closes_the_client_socket_instead_of_hanging() {
         .local_addr()
         .unwrap()
         .port();
-    let (p, _) = provider(empty_vault());
+    let p = provider(empty_vault());
     let h = open(
         &p,
         "p",
-        &sshd.cfg(sshd.key_auth(), None),
+        &sshd.trusted(sshd.key_auth()),
         &format!("127.0.0.1:{free}"),
     )
     .await
@@ -573,8 +667,8 @@ async fn conn_refused_target_closes_the_client_socket_instead_of_hanging() {
     assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
 
     // The tunnel itself is still healthy for a good target afterwards.
-    let (p2, _) = provider(empty_vault());
-    let good = open(&p2, "p", &sshd.cfg(sshd.key_auth(), None), &redis_addr())
+    let p2 = provider(empty_vault());
+    let good = open(&p2, "p", &sshd.trusted(sshd.key_auth()), &redis_addr())
         .await
         .unwrap();
     assert_eq!(redis_ping(good.local_addr).await.unwrap(), "+PONG\r\n");
@@ -591,7 +685,7 @@ async fn conn_tunnel_notices_when_the_bastion_goes_away() {
         auth: sshd.key_auth(),
         known_host_fingerprint: Some(sshd.host_fp()),
     };
-    let (p, _) = provider(empty_vault());
+    let p = provider(empty_vault());
     let h = open(&p, "p", &cfg, &redis_addr()).await.unwrap();
     assert_eq!(redis_ping(h.local_addr).await.unwrap(), "+PONG\r\n");
     assert!(!h.cancel.is_cancelled());

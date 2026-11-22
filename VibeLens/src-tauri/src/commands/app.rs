@@ -24,7 +24,15 @@ pub async fn app_info(state: State<'_, AppState>) -> CmdResult<AppInfo> {
     })
 }
 
+/// Classifies `sql` with the rules of `engine` (MySQL has its own lexer and classifier; every
+/// other engine, and no engine, uses the PostgreSQL one).
 #[tauri::command]
-pub fn sql_classify(sql: String) -> vibelens_core::sql::SqlClassification {
-    vibelens_core::sql::classify(&sql)
+pub fn sql_classify(
+    sql: String,
+    engine: Option<vibelens_core::model::EngineKind>,
+) -> vibelens_core::sql::SqlClassification {
+    match engine {
+        Some(vibelens_core::model::EngineKind::Mysql) => vibelens_core::mysql::classify(&sql),
+        _ => vibelens_core::sql::classify(&sql),
+    }
 }

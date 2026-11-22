@@ -4,8 +4,9 @@
 //! (non-finite floats become strings); `int8`, `numeric` and `money` become **strings** so JS
 //! never rounds them; `bytea` becomes `{"$bytes": base64, "len": n}`; `json/jsonb` are embedded;
 //! temporal types are strings (RFC3339 for `timestamptz`); arrays are (nested) JSON arrays;
-//! anything we cannot decode becomes a readable `"<typename>"` placeholder. Nothing in this
-//! module panics on malformed input.
+//! anything we cannot decode becomes a readable `"<typename>"` placeholder. A value larger than
+//! `MAX_CELL_BYTES` is not decoded at all: its cell is a `{"$truncated": …}` marker with the
+//! value's size and first part. Nothing in this module panics on malformed input.
 
 use std::error::Error;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -15,7 +16,7 @@ use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use serde_json::{Map, Value};
 use tokio_postgres::types::{FromSql, Kind, Type};
 
-use crate::model::Cell;
+use crate::model::{Cell, MAX_CELL_BYTES, TruncatedKind, truncated_cell};
 
 /// Microseconds between the Unix epoch and the Postgres epoch (2000-01-01).
 const PG_EPOCH_UNIX_MICROS: i64 = 946_684_800_000_000;
@@ -42,9 +43,47 @@ impl<'a> FromSql<'a> for CellValue {
 }
 
 /// Decodes one non-NULL binary value. Falls back to `"<typename>"` when the value is malformed
-/// or the type is not supported.
+/// or the type is not supported. A value over [`MAX_CELL_BYTES`] is not decoded: it becomes a
+/// truncation marker (see [`Cell`]) holding its first part.
 pub fn decode(ty: &Type, raw: &[u8]) -> Cell {
+    if raw.len() > MAX_CELL_BYTES {
+        let (kind, value) = oversized(ty, raw);
+        return truncated_cell(kind, value.len(), value);
+    }
     decode_inner(ty, raw).unwrap_or_else(|| Value::String(format!("<{}>", ty.name())))
+}
+
+/// What an oversized value is, and the bytes that are the value itself (`jsonb` has a version
+/// byte in front). Only types whose wire form starts with readable content get a preview; for
+/// the rest (arrays, ranges, composites, …) the marker says how large the value is and no more.
+fn oversized<'a>(ty: &Type, raw: &'a [u8]) -> (TruncatedKind, &'a [u8]) {
+    match ty.kind() {
+        Kind::Domain(base) => return oversized(base, raw),
+        Kind::Enum(_) => return (TruncatedKind::Text, raw),
+        Kind::Array(_) | Kind::Range(_) | Kind::Multirange(_) | Kind::Composite(_) => {
+            return (TruncatedKind::Other, raw);
+        }
+        _ => {}
+    }
+    match *ty {
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN | Type::XML => {
+            (TruncatedKind::Text, raw)
+        }
+        Type::JSON => (TruncatedKind::Json, raw),
+        Type::JSONB => match raw.split_first() {
+            Some((1, rest)) => (TruncatedKind::Json, rest),
+            _ => (TruncatedKind::Other, raw),
+        },
+        Type::JSONPATH => match raw.split_first() {
+            Some((1, rest)) => (TruncatedKind::Text, rest),
+            _ => (TruncatedKind::Other, raw),
+        },
+        Type::BYTEA => (TruncatedKind::Bytes, raw),
+        _ => match ty.name() {
+            "citext" | "ltree" | "lquery" | "ltxtquery" => (TruncatedKind::Text, raw),
+            _ => (TruncatedKind::Other, raw),
+        },
+    }
 }
 
 fn decode_inner(ty: &Type, raw: &[u8]) -> Option<Cell> {
@@ -618,7 +657,103 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{MAX_CELL_BYTES, is_truncated_cell};
     use serde_json::json;
+
+    // ---- oversized values (review finding H1) ------------------------------------------------
+
+    fn marker(c: &Cell) -> (&str, u64, &str) {
+        assert!(is_truncated_cell(c), "not a truncation marker: {}", {
+            let s = c.to_string();
+            s.chars().take(120).collect::<String>()
+        });
+        let t = &c["$truncated"];
+        (
+            t["kind"].as_str().unwrap(),
+            t["bytes"].as_u64().unwrap(),
+            t["preview"].as_str().unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_value_at_the_limit_is_decoded_in_full() {
+        let raw = vec![b'a'; MAX_CELL_BYTES];
+        assert_eq!(
+            decode(&Type::TEXT, &raw),
+            Value::String("a".repeat(MAX_CELL_BYTES))
+        );
+        let c = decode(&Type::BYTEA, &raw);
+        assert_eq!(c["len"], json!(MAX_CELL_BYTES));
+    }
+
+    #[test]
+    fn oversized_text_is_cut_and_marked() {
+        let raw = vec![b'a'; MAX_CELL_BYTES + 1];
+        for ty in [Type::TEXT, Type::VARCHAR, Type::BPCHAR, Type::XML] {
+            let c = decode(&ty, &raw);
+            let (kind, bytes, preview) = marker(&c);
+            assert_eq!((kind, bytes), ("text", raw.len() as u64), "{ty}");
+            assert_eq!(preview.len(), MAX_CELL_BYTES, "{ty}");
+        }
+        // The cut never lands inside a character: "é" is two bytes, the limit is even, so shift
+        // the text by one byte.
+        let mut raw = vec![b'x'];
+        raw.extend("é".repeat(MAX_CELL_BYTES).as_bytes());
+        let c = decode(&Type::TEXT, &raw);
+        let (_, bytes, preview) = marker(&c);
+        assert_eq!(bytes, raw.len() as u64);
+        assert_eq!(preview.len(), MAX_CELL_BYTES - 1);
+        assert!(preview.ends_with('é'));
+    }
+
+    #[test]
+    fn oversized_bytea_is_cut_and_marked() {
+        let raw = vec![0xABu8; 3 * MAX_CELL_BYTES];
+        let c = decode(&Type::BYTEA, &raw);
+        let (kind, bytes, preview) = marker(&c);
+        assert_eq!((kind, bytes), ("bytes", raw.len() as u64));
+        let kept = base64::engine::general_purpose::STANDARD
+            .decode(preview)
+            .unwrap();
+        assert_eq!(kept.len(), MAX_CELL_BYTES);
+        assert!(kept.iter().all(|b| *b == 0xAB));
+        // In particular it is not a `$bytes` cell, which every consumer would take as complete.
+        assert!(c.get("$bytes").is_none());
+    }
+
+    #[test]
+    fn oversized_json_is_not_parsed_into_a_tree() {
+        let text = format!(r#"{{"k":"{}"}}"#, "y".repeat(2 * MAX_CELL_BYTES));
+        let c = decode(&Type::JSON, text.as_bytes());
+        let (kind, bytes, preview) = marker(&c);
+        assert_eq!((kind, bytes), ("json", text.len() as u64));
+        assert!(preview.starts_with(r#"{"k":"yyy"#) && preview.len() == MAX_CELL_BYTES);
+
+        // jsonb carries a version byte, which is not part of the value.
+        let mut raw = vec![1u8];
+        raw.extend(text.as_bytes());
+        let c = decode(&Type::JSONB, &raw);
+        let (kind, bytes, preview) = marker(&c);
+        assert_eq!((kind, bytes), ("json", text.len() as u64));
+        assert!(preview.starts_with(r#"{"k":"yyy"#));
+    }
+
+    #[test]
+    fn oversized_values_of_other_types_are_marked_without_a_preview() {
+        // The binary form of an array has no readable prefix.
+        let raw = vec![0u8; MAX_CELL_BYTES + 1];
+        let c = decode(&Type::INT4_ARRAY, &raw);
+        assert_eq!(marker(&c), ("other", raw.len() as u64, ""));
+        let c = decode(&Type::TEXT_ARRAY, &raw);
+        assert_eq!(marker(&c), ("other", raw.len() as u64, ""));
+    }
+
+    #[test]
+    fn from_sql_goes_through_the_same_limit() {
+        let raw = vec![b'a'; MAX_CELL_BYTES + 1];
+        let CellValue(c) = CellValue::from_sql(&Type::TEXT, &raw).unwrap();
+        assert_eq!(marker(&c).0, "text");
+    }
 
     fn numeric_raw(weight: i16, sign: u16, dscale: i16, digits: &[i16]) -> Vec<u8> {
         let mut v = Vec::new();

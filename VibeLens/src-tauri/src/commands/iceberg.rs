@@ -3,7 +3,6 @@
 use tauri::State;
 use tauri::ipc::Channel;
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use vibelens_core::ErrorPayload;
 use vibelens_core::model::*;
 
@@ -69,21 +68,20 @@ pub async fn ice_execute(
     let opts = options.unwrap_or_default();
     if profile.environment == Environment::Prod
         && !confirmed.unwrap_or(false)
-        && let Some(reason) = super::pg::prod_guard_reason(&sql, opts.read_only)
+        && let Some(reason) = super::pg::prod_guard_reason_on(
+            profile.iceberg.as_ref().map(|o| &o.query_engine),
+            &sql,
+            opts.read_only,
+        )
     {
-        return Err(ErrorPayload {
-            code: "confirm_required".into(),
-            message: format!("Production write guard: {reason}"),
-        });
+        return Err(ErrorPayload::new(
+            "confirm_required",
+            format!("Production write guard: {reason}"),
+        ));
     }
     let handle = state.connections.iceberg(&profile_id).await.map_err(err)?;
-    let query_id = uuid::Uuid::new_v4().to_string();
-    let cancel = CancellationToken::new();
-    state
-        .running_queries
-        .lock()
-        .unwrap()
-        .insert(query_id.clone(), cancel.clone());
+    let run = state.running_queries.start();
+    let (query_id, cancel) = (run.id.clone(), run.cancel.clone());
 
     let (tx, mut rx) = mpsc::channel::<QueryEvent>(16);
     tauri::async_runtime::spawn(async move {
@@ -96,6 +94,8 @@ pub async fn ice_execute(
     let qid = query_id.clone();
     let tx_err = tx.clone();
     tauri::async_runtime::spawn(async move {
+        // Registered for as long as this task runs: the entry goes when the statement ends.
+        let _run = run;
         if let Err(e) = handle.execute_stream(qid, &sql, opts, cancel, tx).await {
             let _ = tx_err
                 .send(QueryEvent::Failed {
@@ -120,12 +120,10 @@ pub async fn ice_expire_snapshots(
     confirmed: Option<bool>,
 ) -> CmdResult<ExpireSnapshotsResult> {
     if !confirmed.unwrap_or(false) {
-        return Err(ErrorPayload {
-            code: "confirm_required".into(),
-            message: format!(
-                "Expiring snapshots of {name} permanently removes time-travel history."
-            ),
-        });
+        return Err(ErrorPayload::new(
+            "confirm_required",
+            format!("Expiring snapshots of {name} permanently removes time-travel history."),
+        ));
     }
     let h = state.connections.iceberg(&profile_id).await.map_err(err)?;
     h.expire_snapshots(namespace, &name, older_than_ms, retain_last)

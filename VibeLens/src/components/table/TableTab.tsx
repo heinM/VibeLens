@@ -20,7 +20,7 @@ import { copyToClipboard } from "../ui/clipboard";
 import { readStorage, writeStorage } from "../layout/storage";
 import { DataGrid, selectionRange, type GridSelection, type GridSortKey, type RowState } from "../grid/DataGrid";
 import { CellViewerDialog } from "../grid/CellViewerDialog";
-import { copyText, formatCount } from "../grid/cellFormat";
+import { copyText, formatCount, countTruncated, withTruncatedNote } from "../grid/cellFormat";
 import { useCopyExport } from "../grid/copyExport";
 import { toJson, toSqlInserts } from "../grid/exportFormats";
 import { showToast } from "../grid/toast";
@@ -44,7 +44,7 @@ import {
   type ApplyScript,
   type PendingState,
 } from "./pendingChanges";
-import { SqlGenError, buildWhere, cellToEditText, shortTypeName, type FilterOp, type FilterRow, type SortKey, type TableTarget } from "./sqlGen";
+import { SqlGenError, buildWhere, cellToEditText, shortTypeName, uneditableReason, type FilterOp, type FilterRow, type SortKey, type TableTarget } from "./sqlGen";
 import { composeRows } from "./tableRows";
 
 function readPageSize(): number {
@@ -116,6 +116,8 @@ function TableBrowser({ tab, profileId, schema, name }: { tab: WorkspaceTab; pro
     schema,
     name,
     columns,
+    kind: desc?.kind ?? null,
+    estimatedRows: desc?.estimatedRows ?? null,
     filters: applied.rows,
     rawWhere: applied.raw,
     sort,
@@ -331,6 +333,13 @@ function TableBrowser({ tab, profileId, schema, name }: { tab: WorkspaceTab; pro
       if (col.isPrimaryKey || isGeneratedColumn(col) || (col.default && /nextval|GENERATED/i.test(col.default))) return;
       values[col.name] = composed.rows[r][i] ?? null;
     });
+    // The copy would be inserted with only the start of a value that was too large to load, or
+    // without it. Neither is a duplicate.
+    const cutColumn = Object.keys(values).find((n) => uneditableReason(values[n]) !== null);
+    if (cutColumn) {
+      showToast({ title: "Cannot duplicate this row", detail: `Column ${cutColumn}: ${uneditableReason(values[cutColumn])}`, tone: "info", durationMs: 6000 });
+      return;
+    }
     const at = pending.inserts.length;
     edits.update((p) => addInsert(p, uid(), values));
     setSelection({ anchor: { r: at, c: 0 }, focus: { r: at, c: 0 } });
@@ -445,18 +454,29 @@ function TableBrowser({ tab, profileId, schema, name }: { tab: WorkspaceTab; pro
       items.push("separator");
     }
     const text = cellToEditText(value);
+    // A value that was too large to load in full has no text to filter on (only its start is here).
+    const cut = uneditableReason(value) !== null;
+    const rowCut = countTruncated([composed.rows[r]]);
     items.push(
-      { label: isNull ? "Filter: IS NULL" : "Filter by this value", onSelect: () => quickFilter(col.name, isNull ? "IS NULL" : "=", text) },
-      { label: isNull ? "Filter: IS NOT NULL" : "Exclude this value", onSelect: () => quickFilter(col.name, isNull ? "IS NOT NULL" : "<>", text) },
+      { label: isNull ? "Filter: IS NULL" : "Filter by this value", disabled: cut, onSelect: () => quickFilter(col.name, isNull ? "IS NULL" : "=", text) },
+      { label: isNull ? "Filter: IS NOT NULL" : "Exclude this value", disabled: cut, onSelect: () => quickFilter(col.name, isNull ? "IS NOT NULL" : "<>", text) },
       "separator",
-      { label: "Copy cell", onSelect: () => void copyToClipboard(copyText(value)).then((ok) => ok && notify("Copied cell")) },
+      { label: "Copy cell", onSelect: () => void copyToClipboard(copyText(value)).then((ok) => ok && notify(withTruncatedNote("Copied cell", cut ? 1 : 0))) },
       {
         label: "Copy row as JSON",
-        onSelect: () => void copyToClipboard(toJson(gridColumns, [composed.rows[r]]).trim()).then((ok) => ok && notify("Copied row as JSON")),
+        onSelect: () => void copyToClipboard(toJson(gridColumns, [composed.rows[r]]).trim()).then((ok) => ok && notify(withTruncatedNote("Copied row as JSON", rowCut))),
       },
       {
         label: "Copy row as INSERT",
-        onSelect: () => void copyToClipboard(toSqlInserts(gridColumns, [composed.rows[r]], { schema, name })).then((ok) => ok && notify("Copied row as INSERT")),
+        onSelect: () => {
+          // Fails for a row holding a value that was too large to load: say why instead of copying.
+          try {
+            const sql = toSqlInserts(gridColumns, [composed.rows[r]], { schema, name });
+            void copyToClipboard(sql).then((ok) => ok && notify("Copied row as INSERT"));
+          } catch (e) {
+            showToast({ title: "Cannot copy this row as INSERT", detail: e instanceof Error ? e.message : String(e), tone: "info", durationMs: 6000 });
+          }
+        },
       },
       { label: "View value…", onSelect: () => setViewer({ r, c }) },
     );
@@ -725,6 +745,7 @@ function TableBrowser({ tab, profileId, schema, name }: { tab: WorkspaceTab; pro
         filtered={data.whereActive}
         countStatus={data.countStatus}
         keyset={data.keyset}
+        stableOrder={data.stableOrder}
         elapsedMs={data.elapsedMs}
         onFirst={data.first}
         onPrev={data.prev}

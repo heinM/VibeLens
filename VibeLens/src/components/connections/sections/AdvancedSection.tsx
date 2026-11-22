@@ -10,6 +10,29 @@ const PROXY_MODES: { value: PgProxyMode; label: string }[] = [
   { value: "shunt", label: "Shunt" },
 ];
 import type { SectionProps } from "./types";
+import { newMysqlOptions } from "../../../lib/defaults";
+
+function MysqlAdvanced({ profile, patch, err }: Pick<SectionProps, "profile" | "patch" | "err">) {
+  const uid = useId();
+  const my = profile.mysql ?? newMysqlOptions();
+  const setMy = (n: Partial<typeof my>) => patch((p) => ({ ...p, mysql: { ...(p.mysql ?? newMysqlOptions()), ...n } }));
+  return (
+    <div className="grid gap-4 sm:grid-cols-2">
+      <FormField label="Connect timeout" htmlFor={`${uid}-ct`} error={err("my.connectTimeoutSecs")} hint="TCP connect, TLS and sign-in.">
+        <NumberField id={`${uid}-ct`} value={my.connectTimeoutSecs} min={1} max={600} suffix="s" invalid={!!err("my.connectTimeoutSecs")} onChange={(v) => setMy({ connectTimeoutSecs: v ?? Number.NaN })} />
+      </FormField>
+      <FormField label="Statement timeout" htmlFor={`${uid}-st`} error={err("my.statementTimeoutMs")} hint="Stops statements that run longer, on the server (KILL QUERY). Empty means no limit.">
+        <NumberField id={`${uid}-st`} allowEmpty value={my.statementTimeoutMs} min={1} suffix="ms" placeholder="None" invalid={!!err("my.statementTimeoutMs")} onChange={(v) => setMy({ statementTimeoutMs: v })} />
+      </FormField>
+      <FormField label="Release idle sessions" htmlFor={`${uid}-id`} error={err("my.idleDisconnectSecs")} hint="Closes pooled server sessions after this much idle time. The next query reconnects. 0 keeps them open.">
+        <NumberField id={`${uid}-id`} value={my.idleDisconnectSecs} min={0} suffix="s" invalid={!!err("my.idleDisconnectSecs")} onChange={(v) => setMy({ idleDisconnectSecs: v ?? Number.NaN })} />
+      </FormField>
+      <FormField label="Pool size" htmlFor={`${uid}-ps`} error={err("my.maxPoolSize")} hint="Maximum simultaneous connections per database.">
+        <NumberField id={`${uid}-ps`} value={my.maxPoolSize} min={1} max={32} invalid={!!err("my.maxPoolSize")} onChange={(v) => setMy({ maxPoolSize: v ?? Number.NaN })} />
+      </FormField>
+    </div>
+  );
+}
 
 export function AdvancedSection({ profile, patch, err }: SectionProps) {
   const uid = useId();
@@ -17,6 +40,8 @@ export function AdvancedSection({ profile, patch, err }: SectionProps) {
   const vk = profile.valkey;
   const setPg = (n: Partial<typeof pg>) => patch((p) => ({ ...p, pg: { ...p.pg, ...n } }));
   const setVk = (n: Partial<typeof vk>) => patch((p) => ({ ...p, valkey: { ...p.valkey, ...n } }));
+
+  if (profile.engine === "mysql") return <MysqlAdvanced {...{ profile, patch, err }} />;
 
   if (profile.engine === "postgres") {
     const px = pg.pgproxy ?? null;

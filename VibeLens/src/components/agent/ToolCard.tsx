@@ -1,9 +1,11 @@
 import { memo, useState } from "react";
-import { Ban, Check, ChevronRight, Cable, Database, FileText, FolderOpen, KeyRound, Pencil, ShieldAlert, Table2, Terminal, Wrench, X } from "lucide-react";
+import { Ban, Check, ChevronRight, Cable, Database, FileText, FolderOpen, KeyRound, Pencil, Play, ShieldAlert, SquareArrowOutUpRight, Table2, Terminal, Wrench, X } from "lucide-react";
+import type { SqlRun } from "../../ipc/types";
 import { cn } from "../../lib/cn";
-import { Spinner } from "../ui";
+import { Button, Spinner } from "../ui";
 import type { ToolItem } from "./agentReducer";
-import { compactJson, formatElapsed, summarizeToolArgs, toolIconName, type ToolIconName } from "./toolSummary";
+import { openAgentTab } from "./openInTab";
+import { compactJson, formatElapsed, sqlRunActions, summarizeToolArgs, toolIconName, type ToolIconName } from "./toolSummary";
 
 const ICONS: Record<ToolIconName, typeof Wrench> = {
   list: Cable,
@@ -86,9 +88,40 @@ export const ToolCard = memo(function ToolCard({ item }: { item: ToolItem }) {
           )}
         </div>
       )}
+      <SqlRunButtons item={item} />
     </div>
   );
 });
+
+/**
+ * "Open in tab" / "Run in tab" for a run_sql call that ran. The target is the connection and
+ * database Rust reports the call ran on, not whatever has focus now.
+ */
+function SqlRunButtons({ item }: { item: ToolItem }) {
+  const actions = sqlRunActions(item);
+  const r: SqlRun | null = item.sqlRun;
+  if (!r || !actions.open) return null;
+  const where = r.database ? ` (database ${r.database})` : "";
+  const open = (run: boolean) => openAgentTab({ kind: "sql", profileId: r.profileId, database: r.database, contents: r.sql, run });
+  return (
+    <div className="flex flex-wrap items-center gap-1 px-2 pb-1.5 pl-[38px] pt-0.5">
+      <Button size="sm" variant="ghost" className="!h-6 !px-1.5 text-[11.5px]" onClick={() => open(false)} title={`Open this SQL in a new tab on the connection it ran on${where}`}>
+        <SquareArrowOutUpRight className="size-3" /> Open in tab
+      </Button>
+      {actions.run && (
+        <Button
+          size="sm"
+          variant="ghost"
+          className="!h-6 !px-1.5 text-[11.5px]"
+          onClick={() => open(true)}
+          title={`Open in a new tab on the connection it ran on${where} and run it there, so the full result shows in the results grid`}
+        >
+          <Play className="size-3" /> Run in tab
+        </Button>
+      )}
+    </div>
+  );
+}
 
 function safeStringify(v: unknown): string {
   try {

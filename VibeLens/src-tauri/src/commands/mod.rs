@@ -9,8 +9,10 @@ pub mod connections;
 pub mod files;
 pub mod iceberg;
 pub mod import;
+pub mod mysql;
 pub mod pg;
 pub mod profiles;
+pub mod redshift;
 pub mod valkey;
 pub mod workspace;
 

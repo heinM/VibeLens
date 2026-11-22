@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use super::profile::{EngineKind, Environment};
 use crate::error::ErrorPayload;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,6 +80,11 @@ pub struct ProviderConfig {
     /// Routing options when `kind == Portkey`; ignored otherwise.
     #[serde(default)]
     pub portkey: Option<PortkeyOptions>,
+    /// The model's context window in tokens, when it is smaller than the agent assumes (a local
+    /// model). The conversation history sent each turn is cut to fit it, after leaving room for
+    /// the output and the system prompt. `None`: the agent's own budget applies.
+    #[serde(default)]
+    pub context_window: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -133,6 +139,45 @@ pub struct Usage {
     pub output_tokens: u64,
 }
 
+/// Where a call that needs approval will run. Built by the agent loop from the stored profile
+/// and the same database resolution execution uses ([`super::profile::effective_database`]),
+/// never from text the model wrote, so the approval card can show it apart from the reason.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalTarget {
+    /// The connection's name.
+    pub connection: String,
+    pub engine: EngineKind,
+    pub environment: Environment,
+    /// Postgres: the database the statement runs against. `None` for other engines.
+    pub database: Option<String>,
+    /// Postgres: the connection's default database, i.e. what `database` is when the model
+    /// names none. The card warns when the two differ.
+    pub default_database: Option<String>,
+    /// Valkey: the logical database number. `None` for other engines.
+    pub valkey_db: Option<u8>,
+    /// More about where it runs, resolved from the profile (never from the model), no
+    /// credentials. Trino / Spark: engine, host:port, URL path prefix, catalog, default
+    /// namespace and the acting user. `None` when there is nothing to add.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Where an executed `run_sql` call ran, resolved by the agent loop from the stored profile and
+/// the same database resolution execution uses (never taken from text the model wrote), so the
+/// UI can reopen the statement against that connection and database. Carries no result rows.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SqlRun {
+    pub profile_id: String,
+    /// Postgres or Redshift: the database the statement ran against. `None` for Iceberg.
+    pub database: Option<String>,
+    /// The statement text exactly as executed.
+    pub sql: String,
+    /// Whether it ran as a read-only call (no approval to write was given).
+    pub read_only: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(
     tag = "type",
@@ -163,6 +208,8 @@ pub enum AgentEvent {
         reason: String,
         /// Human-readable preview: the SQL, or a unified diff for file writes.
         preview: Option<String>,
+        /// The connection and database the call runs against; `None` for workspace tools.
+        target: Option<ApprovalTarget>,
     },
     ToolStarted {
         call_id: String,
@@ -172,6 +219,10 @@ pub enum AgentEvent {
         ok: bool,
         summary: String,
         elapsed_ms: u64,
+        /// For a `run_sql` call that was executed: where it ran and how. `None` for every other
+        /// tool and for calls that never ran (denied, rejected, cancelled).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sql_run: Option<SqlRun>,
     },
     /// The agent wrote a workspace file; UI should open/refresh that tab.
     FileWritten {

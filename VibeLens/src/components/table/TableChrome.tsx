@@ -188,6 +188,7 @@ export function TableFooter({
   filtered,
   countStatus,
   keyset,
+  stableOrder,
   elapsedMs,
   onFirst,
   onPrev,
@@ -205,6 +206,8 @@ export function TableFooter({
   filtered: boolean;
   countStatus: "idle" | "loading" | "error";
   keyset: boolean;
+  /** False when nothing fixes the order of rows: pages can overlap or miss rows. */
+  stableOrder: boolean;
   elapsedMs: number | null;
   onFirst: () => void;
   onPrev: () => void;
@@ -235,6 +238,15 @@ export function TableFooter({
       <span className="tabular-nums text-fg" title={keyset ? "Paged by primary key (keyset), so deep pages stay fast." : "Paged with OFFSET."}>
         {rowsOnPage === 0 ? "0 rows" : `${formatCount(start)}–${formatCount(end)}`} <span className="text-muted">{total}</span>
       </span>
+      {/* Only worth saying when there is more than one page to be inconsistent with. */}
+      {!stableOrder && (pageIndex > 0 || hasNext) && (
+        <span
+          className="text-warn"
+          title="Nothing fixes the order of these rows: there is no primary key, and the rows are not sorted in a way that settles every tie. A row can appear on two pages or on none. Sort by a column to fix the order (for a view, a column whose values are unique)."
+        >
+          no fixed order
+        </span>
+      )}
       {exactTotal === null && (
         <button
           type="button"

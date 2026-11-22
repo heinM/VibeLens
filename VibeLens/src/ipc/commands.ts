@@ -12,7 +12,8 @@ export function asError(e: unknown): T.ErrorPayload {
 export const api = {
   // app
   appInfo: () => invoke<T.AppInfo>("app_info"),
-  sqlClassify: (sql: string) => invoke<T.SqlClassification>("sql_classify", { sql }),
+  /** `engine` "mysql" classifies with MySQL's own lexer and rules; anything else uses PostgreSQL's. */
+  sqlClassify: (sql: string, engine?: T.EngineKind) => invoke<T.SqlClassification>("sql_classify", { sql, engine: engine ?? null }),
   /** Number of tabs with unsaved changes; Rust guards window close / quit while it is > 0. */
   appSetUnsaved: (count: number) => invoke<void>("app_set_unsaved", { count }),
 
@@ -20,7 +21,8 @@ export const api = {
   listProfiles: () => invoke<T.ConnectionProfile[]>("list_profiles"),
   /** password / sshSecret: undefined = keep, "" = delete, value = store in OS keychain */
   /** icebergSecret: REST bearer token / OAuth2 client secret / SQL-catalog DB password.
-   *  s3Keys: static S3 keys for storage kind "s3Static". Same keep/delete semantics as password. */
+   *  s3Keys: static S3 keys for storage kind "s3Static".
+   *  engineSecret: Trino / Spark (Livy) password or bearer token. Same keep/delete semantics as password. */
   saveProfile: (
     profile: T.ConnectionProfile,
     password?: string,
@@ -28,6 +30,7 @@ export const api = {
     icebergSecret?: string,
     s3Keys?: { accessKeyId: string; secretAccessKey: string },
     forgetHostKey?: boolean,
+    engineSecret?: string,
   ) =>
     invoke<T.ConnectionProfile>("save_profile", {
       forgetHostKey,
@@ -37,10 +40,20 @@ export const api = {
       icebergSecret: icebergSecret ?? null,
       s3AccessKeyId: s3Keys?.accessKeyId ?? null,
       s3SecretAccessKey: s3Keys?.secretAccessKey ?? null,
+      engineSecret: engineSecret ?? null,
     }),
   deleteProfile: (id: string) => invoke<void>("delete_profile", { id }),
-  testConnection: (profile: T.ConnectionProfile, password?: string) =>
-    invoke<T.TestResult>("test_connection", { profile, password: password ?? null }),
+  /** Never stores anything. An unpinned SSH host comes back as `ok: false` with `hostKey` set. */
+  /** `engineSecret`: a Trino / Spark password or token typed in the form; without it the stored one is used. */
+  testConnection: (profile: T.ConnectionProfile, password?: string, engineSecret?: string) =>
+    invoke<T.TestResult>("test_connection", { profile, password: password ?? null, engineSecret: engineSecret ?? null }),
+  /**
+   * Pins the host key an SSH server presented, on the saved profile. Call it only from the user's
+   * "trust" action. Rust refuses when the profile's tunnel no longer points at that host and port,
+   * or already has a different pin.
+   */
+  trustHostKey: (profileId: string, key: T.PresentedHostKey) =>
+    invoke<T.ConnectionProfile>("trust_host_key", { profileId, host: key.host, port: key.port, fingerprint: key.fingerprint }),
 
   // import from other tools (no secrets are ever imported)
   importScan: () => invoke<T.ImportReport[]>("import_scan"),
@@ -64,6 +77,8 @@ export const api = {
     invoke<T.SchemaInfo[]>("pg_list_schemas", { profileId, database }),
   pgListObjects: (profileId: string, database: string | null, schema: string) =>
     invoke<T.SchemaObject[]>("pg_list_objects", { profileId, database, schema }),
+  pgListPartitions: (profileId: string, database: string | null, schema: string, table: string) =>
+    invoke<T.PartitionListing>("pg_list_partitions", { profileId, database, schema, table }),
   pgDescribeTable: (profileId: string, database: string | null, schema: string, table: string) =>
     invoke<T.TableDescription>("pg_describe_table", { profileId, database, schema, table }),
   /**
@@ -128,6 +143,54 @@ export const api = {
       confirmed: opts.confirmed ?? false,
     }),
 
+  // redshift (Data API). `database` null = the profile's database.
+  rsListDatabases: (profileId: string) => invoke<string[]>("rs_list_databases", { profileId }),
+  rsListSchemas: (profileId: string, database: string | null) => invoke<string[]>("rs_list_schemas", { profileId, database }),
+  rsListTables: (profileId: string, database: string | null, schema: string) =>
+    invoke<T.RedshiftTableRef[]>("rs_list_tables", { profileId, database, schema }),
+  rsDescribeTable: (profileId: string, database: string | null, schema: string, name: string) =>
+    invoke<T.RedshiftColumn[]>("rs_describe_table", { profileId, database, schema, name }),
+  /** Catalog in the Postgres SchemaMetadata shape, for autocomplete. */
+  rsSchemaMetadata: (profileId: string, database: string | null, maxTables?: number) =>
+    invoke<T.SchemaMetadata>("rs_schema_metadata", { profileId, database, maxTables: maxTables ?? null }),
+  /** Same streaming contract as iceExecute; cancel with pgCancel(queryId). */
+  rsExecute: (args: {
+    profileId: string;
+    database: string | null;
+    sql: string;
+    options?: Partial<T.ExecOptions>;
+    confirmed?: boolean;
+    onEvent: (ev: T.QueryEvent) => void;
+  }) => {
+    const ch = new Channel<T.QueryEvent>();
+    ch.onmessage = args.onEvent;
+    const options: T.ExecOptions = { readOnly: false, maxRows: 100_000, pageSize: 500, timeoutMs: null, ...args.options };
+    return invoke<string>("rs_execute", { profileId: args.profileId, sql: args.sql, database: args.database, options, confirmed: args.confirmed ?? false, onEvent: ch });
+  },
+
+  // mysql. Objects carry `schema` = their database.
+  myListDatabases: (profileId: string) => invoke<string[]>("my_list_databases", { profileId }),
+  myListObjects: (profileId: string, database: string) => invoke<T.SchemaObject[]>("my_list_objects", { profileId, database }),
+  myDescribeTable: (profileId: string, database: string, table: string) =>
+    invoke<T.TableDescription>("my_describe_table", { profileId, database, table }),
+  /** `database` null = the profile's database. */
+  mySchemaMetadata: (profileId: string, database: string | null, maxTables?: number) =>
+    invoke<T.SchemaMetadata>("my_schema_metadata", { profileId, database, maxTables: maxTables ?? null }),
+  /** Same streaming contract as pgExecute; cancel with pgCancel(queryId) (KILL QUERY on the server). */
+  myExecute: (args: {
+    profileId: string;
+    database: string | null;
+    sql: string;
+    options?: Partial<T.ExecOptions>;
+    confirmed?: boolean;
+    onEvent: (ev: T.QueryEvent) => void;
+  }) => {
+    const ch = new Channel<T.QueryEvent>();
+    ch.onmessage = args.onEvent;
+    const options: T.ExecOptions = { readOnly: false, maxRows: 100_000, pageSize: 500, timeoutMs: null, ...args.options };
+    return invoke<string>("my_execute", { profileId: args.profileId, database: args.database, sql: args.sql, options, confirmed: args.confirmed ?? false, onEvent: ch });
+  },
+
   // files
   /** Native Save dialog, then writes the file. Resolves to the saved path, or null if cancelled. */
   exportFile: (suggestedName: string, contents: string) => invoke<string | null>("export_file", { suggestedName, contents }),
@@ -183,6 +246,10 @@ export const api = {
   wsList: () => invoke<T.WorkspaceFile[]>("ws_list"),
   wsRead: (path: string) => invoke<string>("ws_read", { path }),
   wsWrite: (path: string, contents: string) => invoke<void>("ws_write", { path, contents }),
+  /** Native file picker, then copies the chosen files into the workspace. null = cancelled. Rust picks and checks every path. */
+  wsImportFiles: () => invoke<T.WorkspaceImportOutcome | null>("ws_import_files"),
+  /** Shows the workspace folder in the system file manager. */
+  wsReveal: () => invoke<void>("ws_reveal"),
 };
 
 export type Api = typeof api;

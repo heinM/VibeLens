@@ -9,7 +9,9 @@
 //!    table. The table can only *downgrade* an `admin` / `pubsub` / `@scripting` verdict; a
 //!    server-reported `write` flag always wins.
 //! 2. `COMMAND INFO` may be unavailable (ACL-restricted users, some managed services). Then the
-//!    table is used as an *allow-list*: listed → read, everything else → write.
+//!    table is used as an *allow-list*: listed → read, everything else → write. A refusal is
+//!    not believed for ever: the server is asked again after a minute or once the connection
+//!    has been rebuilt (`MetaCache::command_info_refused` in `mod.rs`).
 //!
 //! Anything unknown to the server is treated as a write (fail safe).
 
@@ -155,7 +157,7 @@ pub(super) fn classify_fallback(display: &str, name: &str, sub: Option<&str>) ->
 /// Commands whose first argument selects a subcommand.
 const PARENTS: &[&str] = &[
     "config", "client", "slowlog", "latency", "memory", "acl", "command", "module", "function",
-    "script", "object", "xinfo", "pubsub", "cluster", "debug", "xgroup", "memory", "lolwut",
+    "script", "object", "xinfo", "pubsub", "cluster", "debug", "xgroup", "lolwut",
 ];
 
 /// Commands (or `command|subcommand`s) that are known not to write. Used to downgrade
@@ -358,10 +360,50 @@ pub(super) fn is_read_listed(name: &str, sub: Option<&str>) -> bool {
     }
 }
 
-/// Commands the console refuses because they need a dedicated streaming connection or would
-/// corrupt state on a shared multiplexed connection. Returns the user-facing explanation.
+/// Commands that wait on the server until something happens or a timeout ends. This is the one
+/// list of them: the console ([`blocked_reason`]) and the agent's policy both refuse what it
+/// names. `XREAD` and `XREADGROUP` block only with `BLOCK`; any argument spelled `BLOCK` counts,
+/// which errs on the side of refusing.
+pub(crate) fn is_blocking_command(argv: &[String]) -> bool {
+    let Some(name) = argv.first().map(|a| a.to_ascii_uppercase()) else {
+        return false;
+    };
+    match name.as_str() {
+        "BLPOP" | "BRPOP" | "BRPOPLPUSH" | "BLMOVE" | "BLMPOP" | "BZPOPMIN" | "BZPOPMAX"
+        | "BZMPOP" | "WAIT" | "WAITAOF" => true,
+        "XREAD" | "XREADGROUP" => argv.iter().skip(1).any(|a| a.eq_ignore_ascii_case("BLOCK")),
+        _ => false,
+    }
+}
+
+/// Why a blocking command is refused, with the form of it that returns at once.
+fn blocking_reason(name: &str) -> String {
+    let instead = match name {
+        "BLPOP" => "Use LPOP instead.",
+        "BRPOP" => "Use RPOP instead.",
+        "BRPOPLPUSH" | "BLMOVE" => "Use LMOVE instead.",
+        "BLMPOP" => "Use LMPOP instead.",
+        "BZPOPMIN" => "Use ZPOPMIN instead.",
+        "BZPOPMAX" => "Use ZPOPMAX instead.",
+        "BZMPOP" => "Use ZMPOP instead.",
+        "XREAD" | "XREADGROUP" => "Run it without BLOCK instead.",
+        _ => "",
+    };
+    format!(
+        "{name} is not available here: it waits on the server until something happens or its timeout ends, and it would do so on a connection shared by every other query to this server, so they would all wait with it. VibeLens stops waiting after a while but the server does not: the command would stay there and could still take the next element, for nobody. {instead}"
+    )
+    .trim_end()
+    .to_owned()
+}
+
+/// Commands the console refuses because they need a dedicated streaming connection, would
+/// corrupt state on a shared multiplexed connection, or would hold it up. Returns the
+/// user-facing explanation.
 pub(super) fn blocked_reason(argv: &[String]) -> Option<String> {
     let name = argv.first()?.to_ascii_uppercase();
+    if is_blocking_command(argv) {
+        return Some(blocking_reason(&name));
+    }
     let sub = argv.get(1).map(|s| s.to_ascii_uppercase());
     let msg = match name.as_str() {
         "SELECT" => "SELECT is not available: each logical database has its own connection, and switching one \
@@ -741,5 +783,73 @@ mod tests {
         assert!(b(&["get", "select"]).is_none());
         assert!(b(&["set", "k", "v"]).is_none());
         assert!(b(&[]).is_none());
+    }
+
+    /// A blocking command waits on the server for as long as it likes. On a connection every
+    /// other query shares, that stalls all of them; and when the client gives up waiting, the
+    /// server does not: the command can still take an element later, for nobody (finding M9).
+    #[test]
+    fn blocking_commands_are_refused_with_the_reason_and_the_form_that_does_not_block() {
+        let b = |a: &[&str]| blocked_reason(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        for (argv, instead) in [
+            (&["BLPOP", "jobs", "0"][..], "LPOP"),
+            (&["brpop", "jobs", "5"], "RPOP"),
+            (&["BRPOPLPUSH", "a", "b", "0"], "LMOVE"),
+            (&["BLMOVE", "a", "b", "LEFT", "RIGHT", "0"], "LMOVE"),
+            (&["BLMPOP", "0", "1", "a", "LEFT"], "LMPOP"),
+            (&["BZPOPMIN", "z", "0"], "ZPOPMIN"),
+            (&["BZPOPMAX", "z", "0"], "ZPOPMAX"),
+            (&["BZMPOP", "0", "1", "z", "MIN"], "ZMPOP"),
+            (
+                &["XREAD", "BLOCK", "0", "STREAMS", "s", "$"],
+                "without BLOCK",
+            ),
+            (
+                &[
+                    "xreadgroup",
+                    "GROUP",
+                    "g",
+                    "c",
+                    "block",
+                    "100",
+                    "STREAMS",
+                    "s",
+                    ">",
+                ],
+                "without BLOCK",
+            ),
+        ] {
+            let msg = b(argv).unwrap_or_else(|| panic!("{argv:?} must be refused"));
+            assert!(
+                msg.contains(&argv[0].to_ascii_uppercase())
+                    && msg.contains("shared")
+                    && msg.contains(instead),
+                "{argv:?}: {msg}"
+            );
+        }
+        for argv in [&["WAIT", "1", "0"][..], &["waitaof", "1", "0", "0"]] {
+            let msg = b(argv).unwrap_or_else(|| panic!("{argv:?} must be refused"));
+            assert!(msg.contains("shared"), "{argv:?}: {msg}");
+        }
+        // The forms that do not block are ordinary commands.
+        for argv in [
+            &["XREAD", "COUNT", "10", "STREAMS", "s", "0"][..],
+            &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"],
+            &["LPOP", "jobs"],
+            &["LMOVE", "a", "b", "LEFT", "RIGHT"],
+            &["ZPOPMIN", "z"],
+            &["GET", "blpop"],
+        ] {
+            assert!(b(argv).is_none(), "{argv:?}");
+        }
+        // One list for the console and the agent.
+        let listed =
+            |a: &[&str]| is_blocking_command(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert!(
+            listed(&["blpop", "k", "0"]) && listed(&["XREAD", "block", "0", "STREAMS", "s", "$"])
+        );
+        assert!(
+            !listed(&["XREAD", "STREAMS", "s", "0"]) && !listed(&["LPOP", "k"]) && !listed(&[])
+        );
     }
 }

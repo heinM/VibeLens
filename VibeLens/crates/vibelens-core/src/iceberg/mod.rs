@@ -11,8 +11,8 @@
 //!   [`crate::athena::AthenaEngine`] (Glue / S3 Tables only).
 //!
 //! Time travel (local engine): `SELECT * FROM ns."table@<snapshot-id | branch | tag | RFC3339>"`
-//! resolves to the table as of that snapshot; `ns."table$snapshots"` / `"table$manifests"` are the
-//! metadata tables; nested namespaces are `"a.b".table`.
+//! resolves to the table as of that snapshot; `ns."table$snapshots"` / `"table$manifests"` /
+//! `"table$history"` are the metadata tables; nested namespaces are `"a.b".table`.
 //!
 //! Cell encoding is identical to Postgres (`model::query::Cell`): Int64/Decimal/UInt64 → strings,
 //! binary → `{"$bytes", "len"}`, timestamps → RFC3339, structs/lists/maps → JSON.

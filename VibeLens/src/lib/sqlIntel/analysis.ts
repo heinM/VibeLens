@@ -55,11 +55,14 @@ export interface Analysis {
 // -- tokenisation cache ---------------------------------------------------------------------------
 
 let lastSql: string | null = null;
+let lastHash = false;
 let lastTokens: Token[] = [];
-export function tokenizeCached(sql: string): Token[] {
-  if (sql !== lastSql) {
-    lastTokens = tokenize(sql);
+/** `hashComments`: MySQL lexing (`#` comments, backtick identifiers). */
+export function tokenizeCached(sql: string, hashComments = false): Token[] {
+  if (sql !== lastSql || hashComments !== lastHash) {
+    lastTokens = tokenize(sql, { mysql: hashComments });
     lastSql = sql;
+    lastHash = hashComments;
   }
   return lastTokens;
 }
@@ -217,8 +220,8 @@ function expectsRelation(before: Item[], inQueryBlock: boolean): boolean {
 // -- the entry point ------------------------------------------------------------------------------
 
 /** Returns null when the cursor is in a string, comment or number: nothing to complete there. */
-export function analyzeAt(sql: string, offset: number): Analysis | null {
-  const all = tokenizeCached(sql);
+export function analyzeAt(sql: string, offset: number, hashComments = false): Analysis | null {
+  const all = tokenizeCached(sql, hashComments);
   if (insideNonCode(all, offset)) return null;
   const toks = statementTokens(all, offset);
   const tree = buildTree(toks);

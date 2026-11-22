@@ -4,6 +4,8 @@
 //! Only logical databases 14 and 15 are touched; both are flushed at the start and end of
 //! every test. Tests serialise on a global lock because they share those databases.
 
+mod services;
+
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -127,7 +129,7 @@ macro_rules! fixture {
         match setup().await {
             Some(f) => f,
             None => {
-                eprintln!("VG_TEST_VALKEY not set; skipping");
+                crate::services::skip("valkey", "VG_TEST_VALKEY is not set");
                 return;
             }
         }
@@ -596,6 +598,63 @@ async fn command_requires_confirmation_for_writes() {
     flush(&h).await;
 }
 
+/// A blocking command must not reach the server (review finding M9). If it did, it would wait
+/// there on the connection every other query shares; and after the client stopped waiting it
+/// would still be there, ready to take the next element pushed to the list, for nobody.
+#[tokio::test]
+async fn blocking_commands_are_refused_before_they_reach_the_server() {
+    let (_g, env, h) = fixture!();
+    // A second connection, to push to the list and look at it from outside.
+    let outside = env.connect().await;
+
+    let t0 = std::time::Instant::now();
+    let outcome = h.command(DB_A, argv(&["BLPOP", "jobs", "0"]), true).await;
+    let waited = t0.elapsed();
+    run(&outside, DB_A, &["RPUSH", "jobs", "job-1"]).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let left = run(&outside, DB_A, &["LLEN", "jobs"]).await;
+
+    match &outcome {
+        Err(CoreError::Invalid(msg)) => assert!(
+            msg.contains("BLPOP") && msg.contains("shared") && msg.contains("LPOP"),
+            "{msg}"
+        ),
+        other => panic!(
+            "BLPOP should be refused. After {waited:?} it gave {other:?}; an element pushed afterwards left the list with {left} element(s)"
+        ),
+    }
+    assert!(waited < std::time::Duration::from_secs(2), "{waited:?}");
+    assert_eq!(left, json!(1), "nothing on the server took the element");
+
+    for blocked in [
+        &["brpop", "jobs", "1"][..],
+        &["BLMOVE", "jobs", "done", "LEFT", "RIGHT", "0"],
+        &["BLMPOP", "0", "1", "jobs", "LEFT"],
+        &["BZPOPMIN", "scores", "0"],
+        &["BZMPOP", "0", "1", "scores", "MIN"],
+        &["XREAD", "BLOCK", "0", "STREAMS", "events", "$"],
+        &["WAIT", "1", "0"],
+    ] {
+        let t0 = std::time::Instant::now();
+        // even with allow_write=true
+        match h.command(DB_A, argv(blocked), true).await {
+            Err(CoreError::Invalid(msg)) => assert!(msg.contains("shared"), "{blocked:?}: {msg}"),
+            other => panic!("{blocked:?} should be refused, got {other:?}"),
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "{blocked:?}"
+        );
+    }
+
+    // The forms that do not block still run, and the connection was never stalled.
+    assert_eq!(run(&h, DB_A, &["LPOP", "jobs"]).await, json!("job-1"));
+    run(&h, DB_A, &["XADD", "events", "*", "kind", "view"]).await;
+    let read = run(&h, DB_A, &["XREAD", "COUNT", "1", "STREAMS", "events", "0"]).await;
+    assert!(!read.is_null(), "{read}");
+    flush(&h).await;
+}
+
 #[tokio::test]
 async fn command_rejects_empty_and_blocked() {
     let (_g, _env, h) = fixture!();
@@ -824,7 +883,7 @@ async fn idle_secs_and_close() {
 #[tokio::test]
 async fn wrong_credentials_are_an_auth_error_and_unreachable_is_not_connected() {
     let Some(env) = env() else {
-        eprintln!("VG_TEST_VALKEY not set; skipping");
+        crate::services::skip("valkey", "VG_TEST_VALKEY is not set");
         return;
     };
     // Dead port
@@ -866,7 +925,7 @@ async fn cluster_options_reject_nonzero_db_without_a_cluster() {
     // Pure option plumbing: asking for cluster mode against a standalone server fails to connect
     // cleanly (no panic, a typed error).
     let Some(env) = env() else {
-        eprintln!("VG_TEST_VALKEY not set; skipping");
+        crate::services::skip("valkey", "VG_TEST_VALKEY is not set");
         return;
     };
     let mut p = env.params();
@@ -874,6 +933,91 @@ async fn cluster_options_reject_nonzero_db_without_a_cluster() {
     p.options.connect_timeout_secs = 5;
     let r = ValkeyHandle::connect(p, env.creds()).await;
     assert!(r.is_err(), "a standalone server is not a cluster");
+}
+
+/// A refusal of `COMMAND INFO` used to be remembered for as long as the handle lived. Here the
+/// user is allowed `COMMAND` after the first refusal; once the connection has been rebuilt the
+/// server is asked again and its answer is used.
+#[tokio::test]
+async fn command_info_is_asked_again_after_the_connection_is_rebuilt() {
+    let (_g, env, h) = fixture!();
+    let user = "vgtest_latecommand";
+    run(
+        &h,
+        DB_A,
+        &[
+            "ACL",
+            "SETUSER",
+            user,
+            "on",
+            ">pw-for-test",
+            "+@all",
+            "-command",
+            "~*",
+            "&*",
+        ],
+    )
+    .await;
+    let creds: CredentialFn = Arc::new(move || {
+        async move {
+            Ok(ResolvedCredentials {
+                username: Some(user.into()),
+                password: Some(SecretString::from("pw-for-test".to_owned())),
+                ..ResolvedCredentials::anonymous()
+            })
+        }
+        .boxed()
+    });
+    let restricted = ValkeyHandle::connect(env.params(), creds)
+        .await
+        .expect("ACL user can connect");
+    let reason_for_set = || {
+        let r = restricted.clone();
+        async move {
+            match r.command(DB_A, argv(&["SET", "k", "v"]), false).await {
+                Ok(CommandOutcome::RequiresConfirmation { reason }) => reason,
+                other => panic!("{other:?}"),
+            }
+        }
+    };
+    // BITFIELD_RO only reads, and it is not on the built-in list: only the server can say so.
+    let unlisted_read = argv(&["BITFIELD_RO", "k", "GET", "u8", "0"]);
+
+    let before = reason_for_set().await;
+    assert!(before.contains("COMMAND INFO is unavailable"), "{before}");
+    assert!(
+        restricted.is_write_command(&unlisted_read).await.unwrap(),
+        "without COMMAND INFO an unlisted command counts as a write"
+    );
+
+    // The administrator allows COMMAND, and the user's connection is dropped.
+    run(&h, DB_A, &["ACL", "SETUSER", user, "+command"]).await;
+    let mut raw = env.raw(DB_A).await;
+    let killed: i64 = redis::cmd("CLIENT")
+        .arg("KILL")
+        .arg("USER")
+        .arg(user)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!(killed >= 1, "the user's connection was open");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // A read notices the drop and rebuilds the connection.
+    assert_eq!(run(&restricted, DB_A, &["GET", "after"]).await, Json::Null);
+
+    let after = reason_for_set().await;
+    assert!(
+        !after.contains("COMMAND INFO is unavailable"),
+        "the server must be asked again on the rebuilt connection, got: {after}"
+    );
+    assert!(
+        !restricted.is_write_command(&unlisted_read).await.unwrap(),
+        "the server's own answer is used again"
+    );
+
+    restricted.close().await;
+    run(&h, DB_A, &["ACL", "DELUSER", user]).await;
+    flush(&h).await;
 }
 
 /// An ACL user that may not call COMMAND: `COMMAND INFO` is unusable, so the static read-only

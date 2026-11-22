@@ -4,6 +4,8 @@
 //! card text and what the model is told, for both the embedded engine and Athena.
 #![cfg(feature = "iceberg")]
 
+mod services;
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,7 +19,7 @@ use tokio::sync::mpsc;
 use vibelens_core::agent::AgentService;
 use vibelens_core::error::{CoreError, Result};
 use vibelens_core::model::*;
-use vibelens_core::ports::{SecretVault, ToolBackend};
+use vibelens_core::ports::{FileVersion, SecretVault, ToolBackend};
 
 // ---------------------------------------------------------------------------------------------
 // Mock LLM server (same shape as tests/agent_loop.rs; integration tests are separate crates)
@@ -316,6 +318,8 @@ fn iceberg_profile(
             },
             default_namespace: default_namespace.map(String::from),
         }),
+        redshift: None,
+        mysql: Default::default(),
     }
 }
 
@@ -377,6 +381,7 @@ impl ToolBackend for FakeBackend {
         sql: &str,
         read_only: bool,
         _max_rows: usize,
+        _cancel: tokio_util::sync::CancellationToken,
     ) -> Result<QueryResult> {
         self.sql_calls.lock().unwrap().push(SqlCall {
             profile: profile_id.into(),
@@ -498,7 +503,7 @@ impl ToolBackend for FakeBackend {
     async fn read_file(&self, path: &str) -> Result<String> {
         Err(CoreError::NotFound(format!("file {path}")))
     }
-    async fn write_file(&self, _: &str, _: &str) -> Result<()> {
+    async fn write_file(&self, _: &str, _: &str, _: &FileVersion) -> Result<()> {
         Ok(())
     }
 }
@@ -536,6 +541,7 @@ impl Harness {
                 extra_headers: Default::default(),
                 requires_api_key: true,
                 portkey: None,
+                context_window: None,
             },
             Some(SecretString::from("sk-ant-test-key-0123456789".to_string())),
         )
@@ -1227,7 +1233,10 @@ mod real {
             std::env::var("VG_TEST_ICEBERG_SQL_DB"),
             std::env::var("VG_TEST_ICEBERG_WAREHOUSE"),
         ) else {
-            eprintln!("skipping: set VG_TEST_ICEBERG_SQL_DB and VG_TEST_ICEBERG_WAREHOUSE");
+            crate::services::skip(
+                "iceberg",
+                "VG_TEST_ICEBERG_SQL_DB and VG_TEST_ICEBERG_WAREHOUSE are not both set",
+            );
             return;
         };
         let mut profile = iceberg_profile(
@@ -1287,6 +1296,7 @@ mod real {
                 extra_headers: Default::default(),
                 requires_api_key: true,
                 portkey: None,
+                context_window: None,
             },
             Some(SecretString::from("sk-ant-test-key-0123456789".to_string())),
         )

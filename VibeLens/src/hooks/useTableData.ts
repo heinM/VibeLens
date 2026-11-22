@@ -1,17 +1,11 @@
 // Loads one page of a table for the table browser: keyset pagination on the primary key when it is
 // safe (every ordering column is NOT NULL), OFFSET otherwise, an exact count on demand, and
 // cancellation of superseded loads. Rows come through api.pgExecute in a READ ONLY transaction.
+// The order of a page, and whether anything fixes it, is decided by planTablePage (sqlGen.ts).
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, asError } from "../ipc/commands";
-import type { Cell, ColumnInfo, ErrorPayload, QueryEvent } from "../ipc/types";
-import {
-  buildCount,
-  buildSelectPage,
-  buildWhere,
-  type FilterRow,
-  type KeysetKey,
-  type SortKey,
-} from "../components/table/sqlGen";
+import type { Cell, ColumnInfo, ErrorPayload, ObjectKind, QueryEvent } from "../ipc/types";
+import { buildCount, buildSelectPage, buildWhere, planTablePage, type FilterRow, type SortKey } from "../components/table/sqlGen";
 
 export interface TableDataArgs {
   profileId: string | null;
@@ -20,6 +14,9 @@ export interface TableDataArgs {
   name: string;
   /** From pg_describe_table; null until it has loaded. */
   columns: ColumnInfo[] | null;
+  /** What the relation is, and the catalog's row estimate: they decide how its pages can be ordered. */
+  kind: ObjectKind | null;
+  estimatedRows: number | null;
   filters: FilterRow[];
   rawWhere: string;
   sort: SortKey[];
@@ -39,6 +36,8 @@ export interface TableData {
   hasNext: boolean;
   /** True when this query pages by primary key instead of OFFSET. */
   keyset: boolean;
+  /** False when nothing fixes the order of rows (no primary key, and no `ctid` order was possible or affordable): pages can then overlap or miss rows. */
+  stableOrder: boolean;
   /** Filter validation problems by filter id ("raw" for the raw WHERE). Loading is paused while there are any. */
   whereErrors: Record<string, string>;
   whereActive: boolean;
@@ -62,26 +61,14 @@ interface Paging {
 }
 
 export function useTableData(a: TableDataArgs): TableData {
-  const { profileId, database, schema, name, columns, filters, rawWhere, sort, pageSize, enabled } = a;
+  const { profileId, database, schema, name, columns, kind, estimatedRows, filters, rawWhere, sort, pageSize, enabled } = a;
 
   const colRefs = useMemo(() => (columns ?? []).map((c) => ({ name: c.name, dataType: c.dataType })), [columns]);
   const where = useMemo(() => buildWhere(filters, colRefs, rawWhere), [filters, colRefs, rawWhere]);
   const hasWhereErrors = Object.keys(where.errors).length > 0;
 
   // Ordering and the keyset decision.
-  const plan = useMemo(() => {
-    if (!columns) return null;
-    const pk = columns.filter((c) => c.isPrimaryKey);
-    const known = new Set(columns.map((c) => c.name));
-    const userSort = sort.filter((s) => known.has(s.column));
-    const orderBy: SortKey[] = [...userSort];
-    for (const c of pk) if (!orderBy.some((k) => k.column === c.name)) orderBy.push({ column: c.name, dir: "asc" });
-    const byName = new Map(columns.map((c) => [c.name, c]));
-    const keyset = pk.length > 0 && orderBy.every((k) => byName.get(k.column)?.nullable === false);
-    const keys: KeysetKey[] = orderBy.map((k) => ({ column: k.column, dataType: byName.get(k.column)?.dataType ?? "text", dir: k.dir }));
-    const keyIdx = orderBy.map((k) => columns.findIndex((c) => c.name === k.column));
-    return { orderBy, keyset, keys, keyIdx, names: columns.map((c) => c.name) };
-  }, [columns, sort]);
+  const plan = useMemo(() => (columns ? planTablePage(columns, sort, { kind, estimatedRows }) : null), [columns, sort, kind, estimatedRows]);
 
   const identity = useMemo(
     () => JSON.stringify([profileId, database, schema, name, where.sql, plan?.orderBy, plan?.names, pageSize]),
@@ -254,6 +241,7 @@ export function useTableData(a: TableDataArgs): TableData {
     pageIndex: state.page,
     hasNext: state.hasNext,
     keyset: plan?.keyset ?? false,
+    stableOrder: plan?.stableOrder ?? true,
     whereErrors: where.errors,
     whereActive: where.sql !== null,
     sql: state.sql,

@@ -1,0 +1,56 @@
+{
+ "revenueByCountry": {
+  "sql": "SELECT c.country, count(*) AS orders, sum(o.total) AS revenue\nFROM shop.orders o\nJOIN shop.customers c ON c.id = o.customer_id\nWHERE o.status <> 'cancelled'\nGROUP BY c.country\nORDER BY revenue DESC;",
+  "columns": [
+   {
+    "name": "country",
+    "typeName": "varchar",
+    "typeOid": 0
+   },
+   {
+    "name": "orders",
+    "typeName": "bigint",
+    "typeOid": 0
+   },
+   {
+    "name": "revenue",
+    "typeName": "decimal(38,2)",
+    "typeOid": 0
+   }
+  ],
+  "rows": [
+   [
+    "ZA",
+    "381",
+    "197337.98"
+   ],
+   [
+    "NL",
+    "369",
+    "195707.98"
+   ],
+   [
+    "NA",
+    "380",
+    "181982.81"
+   ],
+   [
+    "GB",
+    "334",
+    "162459.19"
+   ],
+   [
+    "BW",
+    "301",
+    "158600.80"
+   ],
+   [
+    "KE",
+    "251",
+    "132975.16"
+   ]
+  ]
+ },
+ "orderCount": 3000,
+ "customerCount": 500
+}

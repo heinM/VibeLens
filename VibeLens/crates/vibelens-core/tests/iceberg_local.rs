@@ -2,6 +2,8 @@
 //! Gated on `VG_TEST_ICEBERG_SQL_DB` and `VG_TEST_ICEBERG_WAREHOUSE`.
 #![cfg(feature = "iceberg")]
 
+mod services;
+
 mod iceberg_common;
 
 use iceberg_common::*;
@@ -9,6 +11,7 @@ use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use vibelens_core::iceberg::IcebergHandle;
 use vibelens_core::model::*;
 
 macro_rules! fixture {
@@ -16,7 +19,7 @@ macro_rules! fixture {
         match shared() {
             Some(f) => f,
             None => {
-                eprintln!("skipping: VG_TEST_ICEBERG_SQL_DB / VG_TEST_ICEBERG_WAREHOUSE not set");
+                // The fixture helper has reported the skip.
                 return;
             }
         }
@@ -180,7 +183,16 @@ async fn schema_metadata_maps_every_table() {
         .iter()
         .map(|t| format!("{}.{}", t.schema, t.name))
         .collect();
-    assert_eq!(names, ["shop.customers", "shop.events", "shop.orders"]);
+    assert_eq!(
+        names,
+        [
+            "history.branched",
+            "history.rolled_back",
+            "shop.customers",
+            "shop.events",
+            "shop.orders"
+        ]
+    );
     let orders = m.tables.iter().find(|t| t.name == "orders").unwrap();
     assert_eq!(orders.kind, ObjectKind::PartitionedTable);
     assert_eq!(orders.estimated_rows, Some(3000));
@@ -272,6 +284,132 @@ async fn counts_and_time_travel() {
     assert_eq!(
         scalar(&h, "SELECT count(*) FROM shop.\"orders$snapshots\"").await,
         json!("4")
+    );
+}
+
+/// The snapshots of a `history` fixture table, oldest first. These tables were added to the
+/// seed script later, so an older fixture does not have them.
+async fn history_snapshots(h: &IcebergHandle, table: &str) -> Vec<IcebergSnapshot> {
+    let t = h
+        .describe_table(vec!["history".into()], table)
+        .await
+        .unwrap_or_else(|e| {
+            panic!("history.{table} is missing: seed the fixture again with scripts/seed/iceberg-seed.py ({e})")
+        });
+    let mut snapshots = t.snapshots;
+    snapshots.sort_by_key(|s| s.timestamp_ms);
+    assert_eq!(snapshots.len(), 3, "{table}");
+    assert!(
+        snapshots[0].timestamp_ms < snapshots[1].timestamp_ms
+            && snapshots[1].timestamp_ms + 1 < snapshots[2].timestamp_ms,
+        "{table}: the fixture's commits are some milliseconds apart"
+    );
+    snapshots
+}
+
+/// `SELECT count(*)` of a `history` table as it was at `ms`.
+async fn count_at(h: &IcebergHandle, table: &str, ms: i64) -> Value {
+    let at = chrono::DateTime::from_timestamp_millis(ms)
+        .unwrap()
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    scalar(h, &format!("SELECT count(*) FROM history.\"{table}@{at}\"")).await
+}
+
+/// `history.rolled_back`: 100 rows, then 150, then rolled back to the first snapshot, then 10
+/// rows on top of that. In the time between the rollback and the last commit the table held 100
+/// rows, although the newest snapshot from before that time is the one with 150 (finding M8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_timestamp_after_a_rollback_reads_what_the_table_was_rolled_back_to() {
+    let f = fixture!();
+    let h = connect_sql(&f).await;
+    let s = history_snapshots(&h, "rolled_back").await;
+    assert_eq!(
+        s[2].parent_snapshot_id.as_deref(),
+        Some(s[0].snapshot_id.as_str()),
+        "the last commit sits on the first snapshot, not on the second"
+    );
+    assert_eq!(
+        scalar(&h, "SELECT count(*) FROM history.rolled_back").await,
+        json!("110")
+    );
+    assert_eq!(
+        count_at(&h, "rolled_back", s[2].timestamp_ms - 1).await,
+        json!("100"),
+        "one millisecond before the last commit the table was rolled back to its first snapshot"
+    );
+    // Before the rollback the second snapshot was current, although it is not an ancestor of
+    // what is current now.
+    assert_eq!(
+        count_at(&h, "rolled_back", s[1].timestamp_ms).await,
+        json!("150")
+    );
+    assert_eq!(
+        count_at(&h, "rolled_back", s[0].timestamp_ms).await,
+        json!("100")
+    );
+    assert_eq!(
+        count_at(&h, "rolled_back", s[2].timestamp_ms).await,
+        json!("110")
+    );
+    // The snapshot itself is still there to be read by id.
+    assert_eq!(
+        scalar(
+            &h,
+            &format!(
+                "SELECT count(*) FROM history.\"rolled_back@{}\"",
+                s[1].snapshot_id
+            )
+        )
+        .await,
+        json!("150")
+    );
+    // Before the table had any snapshot: an error that says so.
+    let before = chrono::DateTime::from_timestamp_millis(s[0].timestamp_ms - 1)
+        .unwrap()
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let e = h
+        .execute_collect(
+            &format!("SELECT count(*) FROM history.\"rolled_back@{before}\""),
+            ExecOptions::default(),
+        )
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("no snapshot at or before"), "{e}");
+}
+
+/// `history.branched`: 100 rows on main, 50 more on the branch `audit` only, then 10 more on
+/// main. The branch's snapshot was never the table's current one, so no time selects it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_timestamp_never_reads_a_snapshot_of_another_branch() {
+    let f = fixture!();
+    let h = connect_sql(&f).await;
+    let s = history_snapshots(&h, "branched").await;
+    assert_eq!(
+        scalar(&h, "SELECT count(*) FROM history.branched").await,
+        json!("110")
+    );
+    assert_eq!(
+        count_at(&h, "branched", s[2].timestamp_ms - 1).await,
+        json!("100"),
+        "after the commit on the branch and before the next one on main, main still had 100 rows"
+    );
+    assert_eq!(
+        count_at(&h, "branched", s[1].timestamp_ms).await,
+        json!("100"),
+        "the instant of the branch's commit"
+    );
+    assert_eq!(
+        count_at(&h, "branched", s[2].timestamp_ms).await,
+        json!("110")
+    );
+    // The branch is read by its name.
+    assert_eq!(
+        scalar(&h, "SELECT count(*) FROM history.\"branched@audit\"").await,
+        json!("150")
+    );
+    assert_eq!(
+        scalar(&h, "SELECT count(*) FROM history.\"branched@main\"").await,
+        json!("110")
     );
 }
 

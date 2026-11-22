@@ -16,6 +16,7 @@ import { showToast } from "../grid/toast";
 import { openIcebergSqlTab } from "../sidebar/IcebergTree";
 import { iceQueries } from "./iceQueries";
 import { qualifiedName, selectAllSql } from "./iceSql";
+import { dialectOf } from "../../lib/sqlIntel/dialect";
 import { countFields } from "./iceTableModel";
 import { joinNamespace, namespaceLevels } from "./openIcebergTab";
 import { FormatBadge } from "./icePrimitives";
@@ -49,7 +50,9 @@ function TableExplorer({ profileId, namespace, name }: { profileId: string; name
 
   const q = useQuery({ ...iceQueries.describe(profileId, namespace, name), enabled: connected });
   const info = q.data;
-  const sql = useMemo(() => selectAllSql(namespace, name, 100), [namespace, name]);
+  // Written for the connection's query engine: the preview runs there (Spark quotes with backticks).
+  const dialect = dialectOf(profile);
+  const sql = useMemo(() => selectAllSql(namespace, name, 100, dialect), [namespace, name, dialect]);
   const preview = useIcePreview(profileId, sql);
 
   const go = useCallback((p: PaneId) => {
@@ -130,13 +133,13 @@ function TableExplorer({ profileId, namespace, name }: { profileId: string; name
         {activePane === "overview" && <OverviewPane info={info} onGo={go} />}
         {activePane === "schema" && <SchemaPane info={info} />}
         {activePane === "layout" && <LayoutPane info={info} />}
-        {activePane === "snapshots" && <SnapshotsPane info={info} onQueryAsOf={(id, text) => openSql(`${name}@${id.slice(-6)}`, text)} />}
+        {activePane === "snapshots" && <SnapshotsPane info={info} dialect={dialect} onQueryAsOf={(id, text) => openSql(`${name}@${id.slice(-6)}`, text)} />}
         {activePane === "maintenance" && <MaintenancePane profile={profile} info={info} onExpired={() => undefined} />}
       </div>
     );
   }
 
-  const qualified = qualifiedName(namespace, name);
+  const qualified = qualifiedName(namespace, name, dialect);
   return (
     <div className="@container flex h-full min-h-0 flex-col bg-bg">
       <div className="flex h-10 shrink-0 items-center gap-2 border-b border-border bg-panel px-3">

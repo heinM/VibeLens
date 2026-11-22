@@ -1,10 +1,10 @@
 import { useMemo, useRef, useState } from "react";
-import { ArrowDown, Settings2, Sparkles, SquarePen, Square } from "lucide-react";
+import { ArrowDown, Settings2, Sparkles, SquarePen, Square, X } from "lucide-react";
 import { cn } from "../../lib/cn";
 import { useAgentContextInfo, NO_EXCLUSIONS, type ChipExclusions } from "../../hooks/useAgentContext";
 import { useAgentProviders } from "../../hooks/useAgentProviders";
 import { useAgentTurn } from "../../hooks/useAgentTurn";
-import { useAgentStore, userPrompts, type TranscriptItem } from "../../store/useAgentStore";
+import { useAgentStore, userPrompts, type ErrorItem, type TranscriptItem } from "../../store/useAgentStore";
 import { useUIStore } from "../../store/useUIStore";
 import { AgentEmpty } from "./AgentEmpty";
 import { canAttachResults } from "./lastResult";
@@ -33,6 +33,8 @@ export function AgentTerminal() {
   const pendingCallId = useAgentStore((s) => s.pendingApproval);
   const reset = useAgentStore((s) => s.reset);
   const setDefaultProviderId = useAgentStore((s) => s.setDefaultProviderId);
+  const pinTarget = useAgentStore((s) => s.pinTarget);
+  const unpin = useAgentStore((s) => s.unpin);
   const setSettingsOpen = useUIStore((s) => s.setSettingsOpen);
   const primary = useUIStore((s) => s.aiMode === "agentFirst");
 
@@ -52,6 +54,10 @@ export function AgentTerminal() {
   );
   const history = useMemo(() => userPrompts(transcript), [transcript]);
   const access = info.profile ? aiAccessMeta(info.profile.aiDataAccess) : null;
+  const togglePin = () => {
+    if (info.pinned) unpin();
+    else if (info.profileId) pinTarget({ profileId: info.profileId, database: info.database });
+  };
 
   const sendDisabledReason = providersQuery.isPending
     ? "Loading providers…"
@@ -107,7 +113,14 @@ export function AgentTerminal() {
         )}
 
         <div className="order-last w-full min-w-0 @[760px]:order-none @[760px]:w-auto @[760px]:flex-1">
-          <ContextChips info={info} exclude={exclude} onChange={setExclude} attachResult={attachResult} onToggleResult={() => setAttachResult((v) => !v)} />
+          <ContextChips
+            info={info}
+            exclude={exclude}
+            onChange={setExclude}
+            attachResult={attachResult}
+            onToggleResult={() => setAttachResult((v) => !v)}
+            onTogglePin={togglePin}
+          />
         </div>
 
         <div className="ml-auto flex items-center gap-1.5">
@@ -142,7 +155,15 @@ export function AgentTerminal() {
 
       {/* Transcript */}
       <div className="relative min-h-0 flex-1">
-        <div ref={stick.scroller} onScroll={stick.onScroll} className="h-full overflow-y-auto" role="log" aria-live="polite" aria-label="Conversation">
+        <div
+          ref={stick.scroller}
+          onScroll={stick.onScroll}
+          tabIndex={0}
+          className="h-full overflow-y-auto outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent/40"
+          role="log"
+          aria-live="polite"
+          aria-label="Conversation"
+        >
           <div ref={stick.content} className={cn("@container mx-auto flex flex-col gap-3 px-4 py-3", primary ? "max-w-3xl" : "max-w-4xl")}>
             {transcript.length === 0 ? (
               <AgentEmpty
@@ -220,7 +241,7 @@ function Row({ item }: { item: TranscriptItem }) {
     case "approval":
       return item.status === "pending" ? null : <ApprovalNote item={item} />;
     case "error":
-      return <ErrorBox error={item.error} />;
+      return <DismissableError item={item} />;
     case "usage":
       return (
         <div className="flex justify-end gap-2 text-[11px] tabular-nums text-muted">
@@ -233,4 +254,23 @@ function Row({ item }: { item: TranscriptItem }) {
         </div>
       );
   }
+}
+
+/** A transcript error with a control to clear it (ErrorBox itself has none here). */
+function DismissableError({ item }: { item: ErrorItem }) {
+  const dispatch = useAgentStore((s) => s.dispatch);
+  return (
+    <div className="relative [&>div]:pr-8">
+      <ErrorBox error={item.error} />
+      <button
+        type="button"
+        onClick={() => dispatch({ type: "dismissError", id: item.id })}
+        aria-label="Dismiss this error"
+        title="Dismiss"
+        className="absolute right-1.5 top-1.5 grid size-5 place-items-center rounded text-danger/70 outline-none hover:bg-danger/15 hover:text-danger focus-visible:ring-2 focus-visible:ring-accent/60"
+      >
+        <X className="size-3.5" />
+      </button>
+    </div>
+  );
 }

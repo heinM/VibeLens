@@ -108,6 +108,8 @@ fn conn(auth: AuthMethod) -> ConnectionProfile {
         created_at: None,
         updated_at: None,
         iceberg: None,
+        redshift: None,
+        mysql: Default::default(),
     }
 }
 
@@ -223,6 +225,86 @@ async fn app_credential_source_none_and_password() {
     assert!(ok.expires_at.is_none() && ok.host_override.is_none());
     // Debug output must not contain the password.
     assert!(!format!("{ok:?}").contains("s3cret"));
+}
+
+/// A MySQL password is used only for the endpoint it was saved for: the credential source
+/// refuses it once the profile points at another host (hand-edited file, direct IPC call).
+#[tokio::test]
+async fn app_credential_source_binds_a_mysql_password_to_its_endpoint() {
+    let f = fixture(CONFIG, CREDENTIALS);
+    let vault = Arc::new(MemoryVault::new());
+    let src = AppCredentialSource::new(service(&f), vault.clone());
+    let mut profile = conn(AuthMethod::Password {
+        username: "alice".into(),
+    });
+    profile.engine = EngineKind::Mysql;
+    profile.port = 3306;
+    vibelens_core::mysql::secret::save_password(vault.as_ref(), &profile, Some("s3cret".into()))
+        .await
+        .unwrap();
+    let ok = src.resolve(&profile).await.unwrap();
+    assert_eq!(ok.password.as_ref().unwrap().expose_secret(), "s3cret");
+
+    let mut moved = profile.clone();
+    moved.host = "attacker.example".into();
+    let err = src.resolve(&moved).await.unwrap_err();
+    assert!(
+        matches!(&err, CoreError::Auth(m) if m.contains("different host") && !m.contains("s3cret")),
+        "{err:?}"
+    );
+    // Audit finding 1: editing the engine (or a test_connection with another engine and the
+    // same id) does not reach the bound password, through password or access-token auth.
+    for engine in [EngineKind::Postgres, EngineKind::Valkey] {
+        let mut other = profile.clone();
+        other.engine = engine;
+        assert!(
+            matches!(src.resolve(&other).await, Err(CoreError::Auth(_))),
+            "{engine:?}"
+        );
+        other.auth = AuthMethod::AccessToken {
+            username: "alice".into(),
+            command: None,
+        };
+        let err = src.resolve(&other).await.unwrap_err();
+        assert!(!err.to_string().contains("s3cret"));
+    }
+    // A password written without its binding (e.g. by an older version) is not used either.
+    vault
+        .set(&vault_keys::password("p1"), &SecretString::from("other"))
+        .await
+        .unwrap();
+    vault
+        .delete(&vault_keys::password_origin("p1"))
+        .await
+        .unwrap();
+    assert!(src.resolve(&profile).await.is_err());
+    // Postgres passwords keep their old, unbound behaviour.
+    let mut pg = profile.clone();
+    pg.engine = EngineKind::Postgres;
+    assert!(src.resolve(&pg).await.is_ok());
+}
+
+/// RDS IAM for MySQL: the token is signed for the profile's real host and MySQL port.
+#[tokio::test]
+async fn rds_iam_token_for_mysql_names_the_mysql_endpoint() {
+    let f = fixture(CONFIG, CREDENTIALS);
+    let src = AppCredentialSource::new(service(&f), Arc::new(MemoryVault::new()));
+    let mut p = conn(AuthMethod::RdsIam {
+        username: "iam_user".into(),
+        aws: profile_target("ci"),
+    });
+    p.engine = EngineKind::Mysql;
+    p.host = "mydb.cluster-xyz.eu-west-1.rds.amazonaws.com".into();
+    p.port = 3306;
+    let c = src.resolve(&p).await.unwrap();
+    let tok = c.password.unwrap();
+    assert!(
+        tok.expose_secret().starts_with(
+            "mydb.cluster-xyz.eu-west-1.rds.amazonaws.com:3306/?Action=connect&DBUser=iam_user&"
+        ),
+        "{}",
+        tok.expose_secret()
+    );
 }
 
 #[tokio::test]

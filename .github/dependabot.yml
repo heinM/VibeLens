@@ -2,6 +2,7 @@ version: 2
 updates:
   - package-ecosystem: cargo
     directory: /VibeLens
+    target-branch: develop # day-to-day work lands on develop (docs/RELEASING.md §0)
     schedule:
       interval: weekly
     groups:
@@ -9,6 +10,7 @@ updates:
         update-types: [minor, patch]
   - package-ecosystem: npm
     directory: /VibeLens
+    target-branch: develop # day-to-day work lands on develop (docs/RELEASING.md §0)
     schedule:
       interval: weekly
     groups:
@@ -16,6 +18,7 @@ updates:
         update-types: [minor, patch]
   - package-ecosystem: github-actions
     directory: /
+    target-branch: develop # day-to-day work lands on develop (docs/RELEASING.md §0)
     schedule:
       interval: weekly
     groups:

@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Group, Panel, Separator, useDefaultLayout } from "react-resizable-panels";
-import { AlertCircle, AlignLeft, ChevronDown, Gauge, ListVideo, Lock, LockOpen, Play, Save, Sparkles, Square, Zap } from "lucide-react";
+import { AlertCircle, AlignLeft, ChevronDown, Gauge, ListVideo, Lock, LockOpen, Play, Save, Sparkles, Square, X, Zap } from "lucide-react";
 import { api, asError } from "../../ipc/commands";
 import type { ErrorPayload } from "../../ipc/types";
 import { selectAiEnabled, useUIStore } from "../../store/useUIStore";
@@ -11,20 +11,21 @@ import { useConnect, useConnectionStatus } from "../../hooks/useConnectionStatus
 import { useProfile } from "../../hooks/useProfiles";
 import { useQueryRunner } from "../../hooks/useQueryRunner";
 import { WS_FILES_KEY } from "../../hooks/useWorkspaceFiles";
-import { Button, ConfirmDialog } from "../ui";
+import { Button, ConfirmDialog, IconButton } from "../ui";
 import { cn } from "../../lib/cn";
 import { ResultsPanel } from "../grid/ResultsPanel";
 import { MOD } from "../ui/platform";
 import { layoutStorage, panelStyle } from "../layout/storage";
-import { consumeAutoRun } from "./autoRun";
+import { consumeAutoRun, consumeAutoRunReadOnly } from "./autoRun";
 import { redactDbError } from "../../lib/sqlIntel/redact";
 import { dialectOf, isIcebergDialect } from "../../lib/sqlIntel/dialect";
-import { ICEBERG_NO_ANALYZE, planExplain, startsWithExplain } from "./explainGuard";
+import { ICEBERG_NO_ANALYZE, MYSQL_NO_EXPLAIN, REDSHIFT_NO_EXPLAIN, planExplain, startsWithExplain } from "./explainGuard";
 import { AI_OFF_HINT } from "../../lib/aiInline";
 import { SaveAsDialog } from "./SaveAsDialog";
 import { SqlEditor, runnableAtCursor, type CodeEditor, type SqlEditorControls, type SqlEditorHandlers, type TrackedRange } from "./SqlEditor";
 import { splitStatements } from "./sqlSplit";
 import { TargetPicker } from "./TargetPicker";
+import { requestedDatabaseError } from "../connections/redshiftForm";
 import { DropdownMenu, type DropdownItem } from "./ToolbarMenu";
 
 const stripSemicolon = (s: string) => s.trim().replace(/;+\s*$/, "");
@@ -72,8 +73,16 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
   // by the default namespace, and no database is ever sent with a run.
   const dialect = dialectOf(profile);
   const isIce = isIcebergDialect(dialect);
+  const isRedshift = dialect === "redshift";
+  // Iceberg engines and Redshift (Data API) have no READ ONLY transaction: read-only means the statement
+  // is checked and refused before it is sent.
+  const refusesWrites = isIce || isRedshift;
+  const isMysql = dialect === "mysql";
+  // EXPLAIN view and Explain Analyze are Postgres (JSON plan) and Iceberg (text plan) features. Not offered
+  // on Redshift or MySQL (whose plans are neither); EXPLAIN <statement> still runs as an ordinary query.
+  const canExplain = !isRedshift && !isMysql;
   const defaultNamespace = isIce ? (profile?.iceberg?.defaultNamespace ?? null) : null;
-  const database = isIce ? null : (tab.database ?? profile?.database ?? null);
+  const database = isIce ? null : isRedshift ? (tab.database ?? profile?.redshift?.database ?? null) : (tab.database ?? profile?.database ?? null);
 
   const executeNow = useCallback(
     async (sql: string, opts: ExecOpts = {}) => {
@@ -84,6 +93,11 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
       }
       if (!profile) {
         setLocalError({ code: "no_connection", message: "Choose a connection for this tab before running." });
+        return;
+      }
+      const dbProblem = profile.engine === "redshift" ? requestedDatabaseError(tab.database) : null;
+      if (dbProblem) {
+        setLocalError({ code: "invalid", message: dbProblem });
         return;
       }
       if (status?.state !== "connected") {
@@ -139,12 +153,13 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
   const runCurrent = useCallback(
     (mode: RunMode = "run", readOnlyOnce = false) => {
       const ed = editorRef.current;
-      const r = ed ? runnableAtCursor(ed) : null;
+      const r = ed ? runnableAtCursor(ed, dialect) : null;
       if (!r) return void setLocalError({ code: "empty", message: "There is nothing to run at the cursor." });
       let sql = r.sql;
       let ro = readOnlyOnce;
       let textPlan = false;
       if (mode !== "run") {
+        if (!canExplain) return void setNotice({ tone: "info", text: isMysql ? MYSQL_NO_EXPLAIN : REDSHIFT_NO_EXPLAIN });
         // Explain and Explain Analyze never get write access: EXPLAIN ANALYZE really executes the
         // statement, and a statement that already starts with EXPLAIN is refused rather than run as is.
         // On Iceberg connections the engine answers a plain `EXPLAIN <sql>` with a text plan.
@@ -157,7 +172,7 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
       track(r.sql, r.start, r.end);
       void execute(sql, { readOnly: ro || undefined, textPlan: textPlan || undefined });
     },
-    [execute, track, dialect],
+    [execute, track, dialect, canExplain, isMysql],
   );
 
   const runScript = useCallback(
@@ -192,7 +207,7 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
 
   // Open-table double-click: run once when the pane first has a connection to run against.
   useEffect(() => {
-    if (profile && consumeAutoRun(tab.id)) void execute(tab.contents);
+    if (profile && consumeAutoRun(tab.id)) void execute(tab.contents, { readOnly: consumeAutoRunReadOnly(tab.id) || undefined });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profile]);
 
@@ -211,7 +226,7 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
   // -- Explain Analyze gate: ask the classifier when the menu opens, never per keystroke ------------
   const openExplainMenu = (anchor: HTMLElement) => {
     const ed = editorRef.current;
-    const r = ed ? runnableAtCursor(ed) : null;
+    const r = ed ? runnableAtCursor(ed, dialect) : null;
     setMenu({ kind: "explain", anchor });
     // The Iceberg engines have no read-only ANALYZE that this app can vouch for: Explain only.
     if (isIce) return setGate({ state: "blocked", reason: ICEBERG_NO_ANALYZE });
@@ -237,14 +252,18 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
           { id: "run", label: "Run selection or statement", hint: `${MOD}↵`, icon: <Play className="size-3.5" />, onSelect: () => runCurrent("run") },
           {
             id: "ro",
-            label: isIce ? "Run read-only" : "Run in read-only transaction",
+            label: refusesWrites ? "Run read-only" : "Run in read-only transaction",
             hint: `${MOD}⌥↵`,
             icon: <Lock className="size-3.5" />,
-            detail: isIce ? "Refuses statements that would change data or tables." : "Wraps this run in BEGIN READ ONLY. Writes fail instead of changing data.",
+            detail: refusesWrites
+              ? "Refuses statements that would change data or tables."
+              : isMysql
+                ? "Checks each statement is a plain read before sending it, and wraps the run in START TRANSACTION READ ONLY."
+                : "Wraps this run in BEGIN READ ONLY. Writes fail instead of changing data.",
             onSelect: () => runCurrent("run", true),
           },
           { id: "script", label: "Run whole script", hint: `${MOD}⇧↵`, icon: <ListVideo className="size-3.5" />, onSelect: () => runScript() },
-          { id: "script-ro", label: isIce ? "Run script read-only" : "Run script in read-only transaction", icon: <Lock className="size-3.5" />, onSelect: () => runScript(true) },
+          { id: "script-ro", label: refusesWrites ? "Run script read-only" : "Run script in read-only transaction", icon: <Lock className="size-3.5" />, onSelect: () => runScript(true) },
         ]
       : menu?.kind === "explain"
         ? [
@@ -277,7 +296,7 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
     let range = tr;
     // A script: narrow to the statement the server rejected when our splitter agrees on the count.
     if (failed && model.getValueInRange(tr) === run.sql) {
-      const stmts = splitStatements(run.sql);
+      const stmts = splitStatements(run.sql, { mysql: isMysql });
       const stmt = stmts.length === runner.statementCount ? stmts[failed.index] : undefined;
       if (stmt) {
         const base = model.getOffsetAt({ lineNumber: tr.startLineNumber, column: tr.startColumn });
@@ -329,6 +348,7 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
             </button>
           </div>
         )}
+        {canExplain && (
         <div className="inline-flex shrink-0">
           <button
             type="button"
@@ -353,6 +373,7 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
             <ChevronDown className="size-3.5" />
           </button>
         </div>
+        )}
         <Button size="sm" variant="ghost" disabled={running} onClick={() => runScript()} title={`Run the whole script (${MOD}+Shift+Enter)`} aria-label="Run script">
           <ListVideo className="size-3.5" /> <span className="hidden @[1040px]:inline">Run script</span>
         </Button>
@@ -363,7 +384,7 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
           aria-label="Read-only mode"
           onClick={() => setReadOnly((v) => !v)}
           title={
-            isIce
+            refusesWrites
               ? readOnly
                 ? "Read-only: statements that change data or tables are refused"
                 : "Writes allowed. Click to refuse statements that change data or tables"
@@ -427,6 +448,9 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
                   <Button size="sm" variant="secondary" onClick={fixWithAi} title="Ask the AI for a corrected statement. You review it before anything changes.">
                     <Sparkles className="size-3.5 text-accent" /> Fix with AI
                   </Button>
+                  <IconButton label="Dismiss" className="size-6 shrink-0" onClick={() => setFixDismissedRun(runner.runId)}>
+                    <X className="size-3.5" aria-hidden />
+                  </IconButton>
                 </div>
               )}
               {notice && (

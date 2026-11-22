@@ -11,6 +11,12 @@ pub enum EngineKind {
     Valkey,
     /// Apache Iceberg tables via a catalog (REST, Glue, S3 Tables, SQL, HMS). Options in `iceberg`.
     Iceberg,
+    /// Amazon Redshift (provisioned or Serverless) through the Redshift Data API, authenticated
+    /// with IAM. Options in `redshift`.
+    Redshift,
+    /// MySQL 8.x, Aurora MySQL, RDS MySQL. Uses `host`, `port`, `database` (required), `auth`
+    /// (`password` or `rdsIam`), `tls` and `tunnel`; its own settings are in `mysql`.
+    Mysql,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -179,9 +185,33 @@ pub enum TunnelConfig {
         port: u16,
         username: String,
         auth: SshAuth,
-        /// SHA256 host-key fingerprint pinned on first successful connect (TOFU). `None` until first connect.
+        /// The pinned host key, as `SHA256:<base64 without padding>`. Only this key is connected
+        /// to. `None` until the user has checked and trusted the key the server presents (or
+        /// pasted it); until then no connection gets as far as authentication.
         known_host_fingerprint: Option<String>,
     },
+}
+
+/// The host key an SSH server presented when no key was pinned for it. Nothing was sent to that
+/// server; the user decides whether this is the key to pin.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PresentedHostKey {
+    pub host: String,
+    pub port: u16,
+    /// `SHA256:<base64 without padding>`, what `ssh-keygen -lf` prints.
+    pub fingerprint: String,
+}
+
+/// Whether `s` has the shape of an OpenSSH SHA-256 key fingerprint: `SHA256:` followed by the
+/// 43 unpadded base64 characters of a 32-byte digest.
+pub fn is_host_key_fingerprint(s: &str) -> bool {
+    s.strip_prefix("SHA256:").is_some_and(|b64| {
+        b64.len() == 43
+            && b64
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+    })
 }
 
 /// How a capitec/pg-proxy (PGProxy) in front of the database is configured (its `PROXY_MODE`).
@@ -296,9 +326,33 @@ pub struct ConnectionProfile {
     /// Required when `engine == Iceberg`; ignored otherwise. `host`/`port` are unused for Iceberg.
     #[serde(default)]
     pub iceberg: Option<super::iceberg::IcebergOptions>,
+    /// Required when `engine == Redshift`; ignored otherwise. `host`, `port`, `auth`, `tls` and
+    /// `tunnel` are unused for Redshift. Holds no secret, so it has no vault entry.
+    #[serde(default)]
+    pub redshift: Option<super::redshift::RedshiftOptions>,
+    /// MySQL settings; ignored for other engines.
+    #[serde(default)]
+    pub mysql: super::mysql::MysqlOptions,
+}
+
+/// The Postgres database a call runs against: the requested one, else the profile's configured
+/// database, else `postgres` (blank names count as unset).
+///
+/// This is the only place that rule lives. The connection manager opens its pool with the
+/// result and the agent's approval card shows it, so the two cannot disagree.
+pub fn effective_database(configured: Option<&str>, requested: Option<&str>) -> String {
+    let named = |d: Option<&str>| d.map(str::trim).filter(|d| !d.is_empty()).map(String::from);
+    named(requested)
+        .or_else(|| named(configured))
+        .unwrap_or_else(|| "postgres".to_string())
 }
 
 impl ConnectionProfile {
+    /// [`effective_database`] for this profile.
+    pub fn effective_database(&self, requested: Option<&str>) -> String {
+        effective_database(self.database.as_deref(), requested)
+    }
+
     /// Keychain entries this profile's current auth, tunnel and Iceberg settings never read.
     /// Anything here is left over from an earlier configuration and should be deleted.
     pub fn unused_vault_keys(&self) -> Vec<String> {
@@ -319,10 +373,20 @@ impl ConnectionProfile {
         });
         let uses_s3_keys =
             iceberg.is_some_and(|o| matches!(o.storage, IcebergStorage::S3Static { .. }));
+        let uses_engine_secret = self.engine == EngineKind::Iceberg
+            && iceberg.is_some_and(|o| match &o.query_engine {
+                super::iceberg::IcebergQueryEngine::Trino { auth, .. }
+                | super::iceberg::IcebergQueryEngine::Spark { auth, .. } => auth.uses_secret(),
+                _ => false,
+            });
 
         let mut unused = Vec::new();
         if !self.auth.uses_stored_password() {
             unused.push(vault_keys::password(id));
+        }
+        // A MySQL password is bound to the endpoint it was saved for (`mysql::secret`).
+        if !(self.engine == EngineKind::Mysql && self.auth.uses_stored_password()) {
+            unused.push(vault_keys::password_origin(id));
         }
         if !matches!(ssh, Some(SshAuth::Password)) {
             unused.push(vault_keys::ssh_password(id));
@@ -336,6 +400,10 @@ impl ConnectionProfile {
         if !uses_s3_keys {
             unused.push(vault_keys::s3_access_key_id(id));
             unused.push(vault_keys::s3_secret_access_key(id));
+        }
+        if !uses_engine_secret {
+            unused.push(vault_keys::engine_secret(id));
+            unused.push(vault_keys::engine_secret_origin(id));
         }
         unused
     }
@@ -395,6 +463,9 @@ pub struct TestResult {
     pub server_version: Option<String>,
     pub latency_ms: u64,
     pub message: String,
+    /// Set when the test stopped because the SSH host's key is not pinned: the key the server
+    /// presented, for the user to check. A test never stores it.
+    pub host_key: Option<PresentedHostKey>,
 }
 
 /// Keychain entry names. Service name is always [`vault_keys::SERVICE`].
@@ -404,6 +475,11 @@ pub mod vault_keys {
     pub const BUNDLE: &str = "vault-bundle";
     pub fn password(profile_id: &str) -> String {
         format!("profile:{profile_id}:password")
+    }
+    /// The endpoint a MySQL [`password`] was saved for (`mysql::secret::password_origin`). Not
+    /// secret, but kept next to it so a hand-edited profile cannot send the password elsewhere.
+    pub fn password_origin(profile_id: &str) -> String {
+        format!("profile:{profile_id}:password-origin")
     }
     pub fn ssh_password(profile_id: &str) -> String {
         format!("profile:{profile_id}:ssh-password")
@@ -423,5 +499,14 @@ pub mod vault_keys {
     }
     pub fn s3_secret_access_key(profile_id: &str) -> String {
         format!("profile:{profile_id}:s3-secret-access-key")
+    }
+    /// Password or bearer token of a remote query engine (Trino, Spark through Livy).
+    pub fn engine_secret(profile_id: &str) -> String {
+        format!("profile:{profile_id}:engine-secret")
+    }
+    /// The endpoint [`engine_secret`] was saved for (`remote::secret::engine_origin`). Not
+    /// secret, but kept next to it so a hand-edited profile cannot move the secret elsewhere.
+    pub fn engine_secret_origin(profile_id: &str) -> String {
+        format!("profile:{profile_id}:engine-secret-origin")
     }
 }

@@ -11,6 +11,8 @@
 //!
 //! The test writes keys prefixed `vgtest:` and deletes them at the end.
 
+mod services;
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -64,7 +66,7 @@ async fn cleanup(h: &ValkeyHandle, keys: &[String]) {
 #[tokio::test]
 async fn scans_every_primary_exactly_once() {
     let Some(h) = connect().await else {
-        eprintln!("VG_TEST_VALKEY_CLUSTER not set; skipping");
+        services::skip("valkey-cluster", "VG_TEST_VALKEY_CLUSTER is not set");
         return;
     };
 
@@ -106,16 +108,20 @@ async fn scans_every_primary_exactly_once() {
     let mut seen = Vec::new();
     let mut cursor = "0".to_string();
     let mut nodes_visited = BTreeSet::new();
+    let mut mid_scan_cursor: Option<String> = None;
     let mut pages = 0;
     loop {
         let page = h.scan(0, "vgtest:*", &cursor, 25).await.unwrap();
         pages += 1;
         if !page.done {
-            let (node, _) = page
+            // "<nodeCursor>@<host>:<port>#<topology>": the scan names the node it is on.
+            let (_, rest) = page
                 .cursor
-                .split_once(':')
-                .expect("cluster cursor is node:cursor");
-            nodes_visited.insert(node.parse::<usize>().expect("node index"));
+                .split_once('@')
+                .expect("a cluster cursor names its node");
+            let (node, _) = rest.rsplit_once('#').expect("and the topology it saw");
+            nodes_visited.insert(node.to_string());
+            mid_scan_cursor = Some(page.cursor.clone());
         }
         for k in page.keys {
             let i: usize = k.key["vgtest:".len()..].parse().unwrap();
@@ -166,7 +172,30 @@ async fn scans_every_primary_exactly_once() {
             .unwrap()
     );
 
-    // A cursor from a different topology is rejected, not silently restarted.
+    // A cursor from a different topology is rejected, not silently restarted or carried on
+    // with on another node: its node is not a primary (any more), or the primaries are not the
+    // set it was handed out under.
+    let valid = mid_scan_cursor.expect("the scan took more than one page");
+    assert!(h.scan(0, "vgtest:*", &valid, 25).await.is_ok(), "{valid}");
+    let (cursor, rest) = valid.split_once('@').unwrap();
+    let (_, topology) = rest.rsplit_once('#').unwrap();
+    for stale in [
+        format!("{cursor}@127.0.0.1:1#{topology}"),
+        format!(
+            "{cursor}@{}#0000000000000000",
+            rest.rsplit_once('#').unwrap().0
+        ),
+    ] {
+        match h.scan(0, "vgtest:*", &stale, 25).await {
+            Err(CoreError::Invalid(m)) => {
+                assert!(m.contains("topology changed"), "{stale}: {m}")
+            }
+            other => panic!(
+                "{stale} should be refused, got {:?}",
+                other.map(|p| p.cursor)
+            ),
+        }
+    }
     assert!(matches!(
         h.scan(0, "*", "99:0", 10).await,
         Err(CoreError::Invalid(_))
@@ -196,7 +225,10 @@ async fn tls_cluster_verifies_the_certificate_name_not_the_dial_host() {
             .ok()
             .filter(|s| !s.is_empty()),
     ) else {
-        eprintln!("VG_TEST_VALKEY_CLUSTER_TLS/CA/SNI not set; skipping");
+        services::skip(
+            "valkey-cluster-tls",
+            "VG_TEST_VALKEY_CLUSTER_TLS, _CA and _SNI are not all set",
+        );
         return;
     };
     let (host, port) = target.rsplit_once(':').expect("host:port");

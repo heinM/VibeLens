@@ -2,7 +2,10 @@
 //! started with TLS on a free loopback port (killed when the test ends).
 //!
 //! Skipped unless `VG_TEST_VALKEY` is set (the same switch as the other Valkey tests) and both
-//! `redis-server` and `openssl` are on `PATH`. Does not touch the shared server on :6379.
+//! `redis-server` and `openssl` are on `PATH` (service `valkey-tls` in `VG_TEST_REQUIRE`, apart
+//! from `valkey`). Does not touch the shared server on :6379.
+
+mod services;
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -55,10 +58,15 @@ fn start(password: &str) -> Option<TlsServer> {
     if std::env::var("VG_TEST_VALKEY")
         .map(|v| v.is_empty())
         .unwrap_or(true)
-        || !have("redis-server")
-        || !have("openssl")
     {
-        eprintln!("VG_TEST_VALKEY / redis-server / openssl unavailable; skipping");
+        services::skip("valkey", "VG_TEST_VALKEY is not set");
+        return None;
+    }
+    if let Some(missing) = ["redis-server", "openssl"].into_iter().find(|b| !have(b)) {
+        services::skip(
+            "valkey-tls",
+            format!("`{missing}` is not on PATH, and these tests start their own TLS server"),
+        );
         return None;
     }
     let dir = tempfile::tempdir().expect("tempdir");

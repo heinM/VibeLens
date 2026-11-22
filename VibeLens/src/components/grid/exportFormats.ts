@@ -2,7 +2,8 @@
 // Copy / Export menu of every result and table tab. No React, no IPC.
 import type { Cell, ColumnMeta } from "../../ipc/types";
 import { bytesToHex, qualifiedName, quoteIdent, quoteLiteral, sqlLiteral, SqlGenError, typeCategory } from "../table/sqlGen";
-import { copyText, isBytesCell, isNumericType, uniqueColumnKeys } from "./cellFormat";
+import { copyText, isBytesCell, isNumericType, notingTruncated, uniqueColumnKeys } from "./cellFormat";
+import { uneditableReason } from "../table/sqlGen";
 
 type Rows = readonly (readonly Cell[])[];
 type Cols = readonly Pick<ColumnMeta, "name" | "typeName">[];
@@ -67,7 +68,8 @@ export function toJson(columns: Cols, rows: Rows, pretty = true): string {
     const o: Record<string, unknown> = {};
     for (let c = 0; c < keys.length; c++) {
       const v = row[c] ?? null;
-      o[keys[c]] = isBytesCell(v) ? `\\x${bytesToHex(v)}` : v;
+      // A value that was cut when it was read is exported as a note that says so, never as its start.
+      o[keys[c]] = isBytesCell(v) ? `\\x${bytesToHex(v)}` : notingTruncated(v);
     }
     return o;
   });
@@ -85,7 +87,10 @@ export interface InsertTarget {
 
 export const PLACEHOLDER_TABLE = "table_name";
 
-function exportLiteral(cell: Cell, typeName: string): string {
+function exportLiteral(cell: Cell, typeName: string, column: string): string {
+  // Not caught below: an INSERT script holding a placeholder would load wrong data.
+  const cut = uneditableReason(cell);
+  if (cut) throw new SqlGenError(`Column ${column}: ${cut}`);
   try {
     return sqlLiteral(cell, typeName, { cast: false });
   } catch (e) {
@@ -96,7 +101,10 @@ function exportLiteral(cell: Cell, typeName: string): string {
   }
 }
 
-/** Multi-row INSERT statements, `batchSize` rows each. Values are typed by the result column type. */
+/**
+ * Multi-row INSERT statements, `batchSize` rows each. Values are typed by the result column type.
+ * Throws `SqlGenError` when a row holds a value that was cut when it was read.
+ */
 export function toSqlInserts(columns: Cols, rows: Rows, table: InsertTarget | null, batchSize = 500): string {
   const target = table ? (table.schema ? qualifiedName(table.schema, table.name) : quoteIdent(table.name)) : quoteIdent(PLACEHOLDER_TABLE);
   const head = `INSERT INTO ${target} (${columns.map((c) => quoteIdent(c.name)).join(", ")}) VALUES`;
@@ -108,7 +116,7 @@ export function toSqlInserts(columns: Cols, rows: Rows, table: InsertTarget | nu
   }
   for (let i = 0; i < rows.length; i += batchSize) {
     const chunk = rows.slice(i, i + batchSize);
-    const values = chunk.map((row) => `  (${columns.map((c, ci) => exportLiteral(row[ci] ?? null, c.typeName)).join(", ")})`);
+    const values = chunk.map((row) => `  (${columns.map((c, ci) => exportLiteral(row[ci] ?? null, c.typeName, c.name)).join(", ")})`);
     out.push(`${head}\n${values.join(",\n")};`);
   }
   return out.join("\n") + "\n";

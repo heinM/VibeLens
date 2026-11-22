@@ -22,8 +22,16 @@ const WORD_PART = /[A-Za-z0-9_$\u0080-￿]/;
 const DIGIT = /[0-9]/;
 const DOLLAR_TAG = /^\$([A-Za-z_\u0080-￿][A-Za-z0-9_\u0080-￿]*)?\$/;
 
+export interface TokenizeOptions {
+  /**
+   * MySQL lexing: `#` starts a line comment and `` `quoted` `` is an identifier. Off for every
+   * other dialect, which keeps its tokens exactly as before (in Postgres `#` is an operator).
+   */
+  mysql?: boolean;
+}
+
 /** Tokenizes `sql`. Whitespace is dropped; comments are kept (as `comment` tokens). */
-export function tokenize(sql: string): Token[] {
+export function tokenize(sql: string, opts: TokenizeOptions = {}): Token[] {
   const out: Token[] = [];
   const n = sql.length;
   let i = 0;
@@ -43,6 +51,34 @@ export function tokenize(sql: string): Token[] {
       while (j < n && sql[j] !== "\n" && sql[j] !== "\r") j++;
       push("comment", i, j);
       i = j;
+      continue;
+    }
+
+    if (ch === "#" && opts.mysql) {
+      let j = i + 1;
+      while (j < n && sql[j] !== "\n") j++;
+      push("comment", i, j);
+      i = j;
+      continue;
+    }
+
+    if (ch === "`" && opts.mysql) {
+      let j = i + 1;
+      let closed = false;
+      while (j < n) {
+        if (sql[j] === "`") {
+          if (sql[j + 1] === "`") {
+            j += 2;
+            continue;
+          }
+          j++;
+          closed = true;
+          break;
+        }
+        j++;
+      }
+      push("quoted", i, Math.min(j, n), closed);
+      i = Math.min(j, n);
       continue;
     }
 
@@ -184,7 +220,7 @@ export const kw = (t: Token | undefined): string => (t && t.kind === "word" ? t.
 export function identValue(t: Token): string {
   if (t.kind !== "quoted") return t.text;
   const inner = t.closed ? t.text.slice(1, -1) : t.text.slice(1);
-  return inner.replace(/""/g, '"');
+  return t.text.startsWith("`") ? inner.replace(/``/g, "`") : inner.replace(/""/g, '"');
 }
 
 /**
@@ -196,7 +232,7 @@ export function insideNonCode(tokens: Token[], offset: number): Token | null {
   for (const t of tokens) {
     if (t.start >= offset) break;
     if (t.kind === "string" || t.kind === "comment") {
-      const lineComment = t.kind === "comment" && t.text.startsWith("--");
+      const lineComment = t.kind === "comment" && (t.text.startsWith("--") || t.text.startsWith("#"));
       if (offset < t.end || (offset === t.end && (!t.closed || lineComment))) return t;
     } else if ((t.kind === "number" || t.kind === "param") && offset <= t.end) {
       return t;

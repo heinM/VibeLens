@@ -1,6 +1,6 @@
 // Pure transcript reducer for the AI agent. No React, no IPC: unit-tested in
 // src/store/__tests__/agentReducer.test.ts.
-import type { AgentEvent, ErrorPayload, ToolRisk, Usage } from "../../ipc/types";
+import type { AgentEvent, ApprovalTarget, ErrorPayload, SqlRun, ToolRisk, Usage } from "../../ipc/types";
 
 export type ToolStatus = "proposed" | "awaitingApproval" | "running" | "ok" | "error" | "denied" | "rejected";
 
@@ -29,6 +29,8 @@ export interface ToolItem {
   status: ToolStatus;
   summary: string | null;
   elapsedMs: number | null;
+  /** run_sql only, once it ran: the connection, database and SQL Rust says it ran with. */
+  sqlRun: SqlRun | null;
 }
 export interface ApprovalItem {
   kind: "approval";
@@ -38,6 +40,8 @@ export interface ApprovalItem {
   args: unknown;
   reason: string;
   preview: string | null;
+  /** Connection and database the call runs against; null for workspace tools. */
+  target: ApprovalTarget | null;
   status: "pending" | "approved" | "rejected";
   rejectReason: string | null;
 }
@@ -72,7 +76,9 @@ export type ClientEvent =
   | { type: "clientError"; error: ErrorPayload }
   /** An error that does not end the turn (e.g. a failed cancel or approval call). */
   | { type: "noticeError"; error: ErrorPayload }
-  | { type: "cancelled" };
+  | { type: "cancelled" }
+  /** The user dismissed an error in the transcript. */
+  | { type: "dismissError"; id: string };
 
 export type AgentStoreEvent = AgentEvent | ClientEvent;
 
@@ -131,7 +137,7 @@ export function applyAgentEvent(state: AgentCore, ev: AgentStoreEvent): AgentCor
         };
       }
       const status: ToolStatus = ev.risk === "denied" ? "denied" : ev.risk === "needsApproval" ? "awaitingApproval" : "proposed";
-      const item: ToolItem = { kind: "tool", id, callId: ev.callId, tool: ev.tool, args: ev.arguments, risk: ev.risk, reason: ev.reason, status, summary: null, elapsedMs: null };
+      const item: ToolItem = { kind: "tool", id, callId: ev.callId, tool: ev.tool, args: ev.arguments, risk: ev.risk, reason: ev.reason, status, summary: null, elapsedMs: null, sqlRun: null };
       return { ...state, seq, transcript: [...closeStreaming(state.transcript), item] };
     }
 
@@ -142,7 +148,7 @@ export function applyAgentEvent(state: AgentCore, ev: AgentStoreEvent): AgentCor
         const tid = `i${seq++}`;
         transcript = [
           ...transcript,
-          { kind: "tool", id: tid, callId: ev.callId, tool: ev.tool, args: ev.arguments, risk: "needsApproval", reason: ev.reason, status: "awaitingApproval", summary: null, elapsedMs: null },
+          { kind: "tool", id: tid, callId: ev.callId, tool: ev.tool, args: ev.arguments, risk: "needsApproval", reason: ev.reason, status: "awaitingApproval", summary: null, elapsedMs: null, sqlRun: null },
         ];
       } else {
         transcript = mapTool(transcript, ev.callId, (t) => (t.status === "proposed" ? { ...t, status: "awaitingApproval", risk: "needsApproval" } : t));
@@ -155,6 +161,7 @@ export function applyAgentEvent(state: AgentCore, ev: AgentStoreEvent): AgentCor
         args: ev.arguments,
         reason: ev.reason,
         preview: ev.preview,
+        target: ev.target ?? null,
         status: "pending",
         rejectReason: null,
       };
@@ -183,7 +190,7 @@ export function applyAgentEvent(state: AgentCore, ev: AgentStoreEvent): AgentCor
         transcript: mapTool(state.transcript, ev.callId, (t) => {
           // A call the policy denied or the user rejected stays muted; just keep the explanation.
           if (t.status === "denied" || t.status === "rejected") return { ...t, summary: t.summary ?? ev.summary, elapsedMs: ev.elapsedMs };
-          return { ...t, status: ev.ok ? "ok" : "error", summary: ev.summary, elapsedMs: ev.elapsedMs };
+          return { ...t, status: ev.ok ? "ok" : "error", summary: ev.summary, elapsedMs: ev.elapsedMs, sqlRun: ev.sqlRun ?? null };
         }),
         pendingApproval: state.pendingApproval === ev.callId ? null : state.pendingApproval,
       };
@@ -217,6 +224,11 @@ export function applyAgentEvent(state: AgentCore, ev: AgentStoreEvent): AgentCor
     case "noticeError": {
       const [id, seq] = nextId(state);
       return { ...state, seq, transcript: [...state.transcript, { kind: "error", id, error: ev.error }] };
+    }
+
+    case "dismissError": {
+      const transcript = state.transcript.filter((i) => !(i.kind === "error" && i.id === ev.id));
+      return transcript.length === state.transcript.length ? state : { ...state, transcript };
     }
 
     case "cancelled":

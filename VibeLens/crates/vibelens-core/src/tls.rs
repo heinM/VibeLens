@@ -18,7 +18,7 @@ pub fn set_rds_bundle_path(path: std::path::PathBuf) {
     let _ = RDS_BUNDLE_PATH.set(path);
 }
 
-fn ensure_provider() {
+pub(crate) fn ensure_provider() {
     // aws-lc-rs is what the AWS SDK already pulls in; install it once as the process default.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
@@ -50,37 +50,89 @@ pub fn client_config(cfg: &TlsConfig) -> Result<Option<Arc<ClientConfig>>> {
                 .with_no_client_auth();
             Ok(Some(Arc::new(c)))
         }
-        TlsMode::VerifyFull => {
-            let mut roots = rustls::RootCertStore::empty();
-            let native = rustls_native_certs::load_native_certs();
-            for cert in native.certs {
-                let _ = roots.add(cert);
+        TlsMode::VerifyFull => Ok(Some(Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(verify_full_roots(cfg)?)
+                .with_no_client_auth(),
+        ))),
+    }
+}
+
+/// The trust anchors of `VerifyFull`: OS roots, the bundled RDS CA bundle when asked for, and the
+/// profile's CA file. Errors when none is left.
+pub(crate) fn verify_full_roots(cfg: &TlsConfig) -> Result<rustls::RootCertStore> {
+    ensure_provider();
+    let mut roots = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    for cert in native.certs {
+        let _ = roots.add(cert);
+    }
+    if cfg.use_rds_bundle {
+        match RDS_BUNDLE_PATH.get() {
+            Some(p) if p.exists() => {
+                load_pem_into(&mut roots, p)?;
             }
-            if cfg.use_rds_bundle {
-                match RDS_BUNDLE_PATH.get() {
-                    Some(p) if p.exists() => {
-                        load_pem_into(&mut roots, p)?;
-                    }
-                    _ => tracing::warn!(
-                        "useRdsBundle requested but RDS CA bundle not found; see README (scripts/fetch-rds-ca.sh)"
-                    ),
-                }
-            }
-            if let Some(path) = &cfg.ca_cert_path {
-                load_pem_into(&mut roots, std::path::Path::new(path))?;
-            }
-            if roots.is_empty() {
-                return Err(CoreError::Invalid(
-                    "no trusted CA certificates available".into(),
-                ));
-            }
-            Ok(Some(Arc::new(
-                ClientConfig::builder()
-                    .with_root_certificates(roots)
-                    .with_no_client_auth(),
-            )))
+            _ => tracing::warn!(
+                "useRdsBundle requested but RDS CA bundle not found; see README (scripts/fetch-rds-ca.sh)"
+            ),
         }
     }
+    if let Some(path) = &cfg.ca_cert_path {
+        load_pem_into(&mut roots, std::path::Path::new(path))?;
+    }
+    if roots.is_empty() {
+        return Err(CoreError::Invalid(
+            "no trusted CA certificates available".into(),
+        ));
+    }
+    Ok(roots)
+}
+
+/// The certificates behind [`verify_full_roots`], in DER, for a driver that builds its own
+/// rustls config from a list of CA certificates (MySQL). Same sources, same errors.
+pub(crate) fn verify_full_root_certs(cfg: &TlsConfig) -> Result<Vec<CertificateDer<'static>>> {
+    ensure_provider();
+    let mut out: Vec<CertificateDer<'static>> = Vec::new();
+    let native = rustls_native_certs::load_native_certs();
+    out.extend(native.certs);
+    if cfg.use_rds_bundle {
+        match RDS_BUNDLE_PATH.get() {
+            Some(p) if p.exists() => out.extend(read_pem(p)?),
+            _ => tracing::warn!(
+                "useRdsBundle requested but RDS CA bundle not found; see README (scripts/fetch-rds-ca.sh)"
+            ),
+        }
+    }
+    if let Some(path) = &cfg.ca_cert_path {
+        out.extend(read_pem(std::path::Path::new(path))?);
+    }
+    // Only certificates rustls accepts as trust anchors are handed on.
+    let mut store = rustls::RootCertStore::empty();
+    out.retain(|c| store.add(c.clone()).is_ok());
+    if out.is_empty() {
+        return Err(CoreError::Invalid(
+            "no trusted CA certificates available".into(),
+        ));
+    }
+    Ok(out)
+}
+
+fn read_pem(path: &std::path::Path) -> Result<Vec<CertificateDer<'static>>> {
+    let data = std::fs::read(path)
+        .map_err(|e| CoreError::Invalid(format!("cannot read CA file {}: {e}", path.display())))?;
+    let mut out = Vec::new();
+    for cert in CertificateDer::pem_slice_iter(&data) {
+        out.push(
+            cert.map_err(|e| CoreError::Invalid(format!("bad PEM in {}: {e}", path.display())))?,
+        );
+    }
+    let mut probe = rustls::RootCertStore::empty();
+    for c in &out {
+        probe
+            .add(c.clone())
+            .map_err(|e| CoreError::Invalid(format!("bad CA cert in {}: {e}", path.display())))?;
+    }
+    Ok(out)
 }
 
 mod insecure {

@@ -221,12 +221,28 @@ export function EmptyState({ icon, title, children }: { icon?: ReactNode; title:
   );
 }
 
-export function ErrorBox({ error }: { error: { code?: string; message: string } | null | undefined }) {
+export function ErrorBox({ error, onDismiss }: { error: { code?: string; message: string } | null | undefined; onDismiss?: () => void }) {
   if (!error) return null;
-  return (
-    <div className="selectable rounded-md border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger">
+  const body = (
+    <>
       {error.code && <span className="mr-1 font-mono opacity-70">[{error.code}]</span>}
       {error.message}
+    </>
+  );
+  const box = "selectable rounded-md border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger";
+  if (!onDismiss) return <div className={box}>{body}</div>;
+  return (
+    <div className={cn(box, "flex items-start gap-2")}>
+      <div className="min-w-0 flex-1">{body}</div>
+      <button
+        type="button"
+        aria-label="Dismiss"
+        title="Dismiss"
+        onClick={onDismiss}
+        className="-mr-1 -mt-0.5 inline-flex size-5 shrink-0 items-center justify-center rounded text-danger/70 outline-none hover:bg-danger/15 hover:text-danger focus-visible:ring-2 focus-visible:ring-accent/60"
+      >
+        <X className="size-3.5" aria-hidden />
+      </button>
     </div>
   );
 }

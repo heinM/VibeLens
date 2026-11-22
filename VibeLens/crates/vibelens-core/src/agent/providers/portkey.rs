@@ -162,6 +162,7 @@ mod tests {
                 routing,
                 ..Default::default()
             }),
+            context_window: None,
         }
     }
 

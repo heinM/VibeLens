@@ -30,6 +30,8 @@ pub fn pg_profile(name: &str) -> ConnectionProfile {
         created_at: None,
         updated_at: None,
         iceberg: None,
+        redshift: None,
+        mysql: Default::default(),
     }
 }
 
@@ -59,7 +61,7 @@ pub struct Sshd {
 impl Sshd {
     pub fn start() -> Option<Sshd> {
         if std::env::var("VG_TEST_SSH").as_deref() != Ok("1") {
-            eprintln!("skipping: set VG_TEST_SSH=1 to run the sshd-backed tunnel tests");
+            crate::services::skip("ssh", "VG_TEST_SSH is not 1 (the sshd-backed tests)");
             return None;
         }
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/conn_tunnel_setup.sh");
@@ -125,6 +127,11 @@ impl Sshd {
             auth,
             known_host_fingerprint: pinned,
         }
+    }
+    /// [`cfg`](Self::cfg) with this sshd's own host key pinned, which is what a connection
+    /// needs to get as far as authentication.
+    pub fn trusted(&self, auth: SshAuth) -> TunnelConfig {
+        self.cfg(auth, Some(self.host_fp()))
     }
     pub fn key_auth(&self) -> SshAuth {
         SshAuth::PrivateKey {

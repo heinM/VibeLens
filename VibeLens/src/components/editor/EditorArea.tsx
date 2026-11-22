@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { useProfiles } from "../../hooks/useProfiles";
 import { useUIStore } from "../../store/useUIStore";
 import { useWorkspaceStore } from "../../store/useWorkspaceStore";
 import { cn } from "../../lib/cn";
@@ -19,6 +20,13 @@ export function EditorArea() {
   const activeTabId = useWorkspaceStore((s) => s.activeTabId);
   const setActiveTarget = useUIStore((s) => s.setActiveTarget);
   const active = tabs.find((t) => t.id === activeTabId);
+
+  // Tabs restored after a reload: files are read again, and tabs whose connection was deleted come back unbound.
+  const profiles = useProfiles().data;
+  useEffect(() => void useWorkspaceStore.getState().refreshFileTabs(), []);
+  useEffect(() => {
+    if (profiles) useWorkspaceStore.getState().reconcileRestored(profiles.map((p) => p.id));
+  }, [profiles]);
 
   // The navigator and status bar follow the focused tab's connection.
   useEffect(() => {

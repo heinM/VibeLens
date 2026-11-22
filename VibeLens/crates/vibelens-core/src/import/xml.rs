@@ -90,15 +90,21 @@ pub(super) fn parse(src: &str) -> Result<El, String> {
                 stack.last_mut().expect("root").children.push(done);
             }
             Event::Text(t) => {
-                let s = t.decode().map_err(|e| e.to_string())?;
-                stack.last_mut().expect("root").text.push_str(&s);
+                stack
+                    .last_mut()
+                    .expect("root")
+                    .text
+                    .push_str(&t.xml10_content());
             }
             Event::CData(t) => {
-                let s = t.decode().map_err(|e| e.to_string())?;
-                stack.last_mut().expect("root").text.push_str(&s);
+                stack
+                    .last_mut()
+                    .expect("root")
+                    .text
+                    .push_str(&t.xml10_content());
             }
             Event::GeneralRef(r) => {
-                let name = r.decode().map_err(|e| e.to_string())?;
+                let name = r.into_inner();
                 if let Some(v) = entity(&name) {
                     stack.last_mut().expect("root").text.push_str(&v);
                 }
@@ -116,15 +122,15 @@ pub(super) fn parse(src: &str) -> Result<El, String> {
 }
 
 fn element(e: &quick_xml::events::BytesStart<'_>) -> Result<El, String> {
-    let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+    let name = e.name().as_ref().to_owned();
     let mut attrs = Vec::new();
     for a in e.attributes().with_checks(false) {
         let a = a.map_err(|e| e.to_string())?;
-        let k = String::from_utf8_lossy(a.key.as_ref()).into_owned();
+        let k = a.key.as_ref().to_owned();
         let v = a
-            .unescape_value()
+            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
             .map(|v| v.into_owned())
-            .unwrap_or_else(|_| String::from_utf8_lossy(&a.value).into_owned());
+            .unwrap_or_else(|_| a.value.clone().into_owned());
         attrs.push((k, v));
     }
     Ok(El {

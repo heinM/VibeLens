@@ -1,9 +1,8 @@
 use tauri::State;
 use tauri::ipc::Channel;
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use vibelens_core::model::*;
-use vibelens_core::sql::{StatementClass, classify};
+use vibelens_core::sql::StatementClass;
 use vibelens_core::{CoreError, ErrorPayload};
 
 use super::{CmdResult, err};
@@ -47,6 +46,23 @@ pub async fn pg_list_objects(
     h.list_objects(&schema).await.map_err(err)
 }
 
+/// Partitions (and pg_partman settings, when present) of one partitioned table.
+#[tauri::command]
+pub async fn pg_list_partitions(
+    state: State<'_, AppState>,
+    profile_id: String,
+    database: Option<String>,
+    schema: String,
+    table: String,
+) -> CmdResult<PartitionListing> {
+    let h = state
+        .connections
+        .pg(&profile_id, database.as_deref())
+        .await
+        .map_err(err)?;
+    h.list_partitions(&schema, &table).await.map_err(err)
+}
+
 #[tauri::command]
 pub async fn pg_describe_table(
     state: State<'_, AppState>,
@@ -82,10 +98,10 @@ pub async fn pg_execute(
         && !confirmed.unwrap_or(false)
         && let Some(reason) = prod_guard_reason(&sql, opts.read_only)
     {
-        return Err(ErrorPayload {
-            code: "confirm_required".into(),
-            message: format!("Production write guard: {reason}"),
-        });
+        return Err(ErrorPayload::new(
+            "confirm_required",
+            format!("Production write guard: {reason}"),
+        ));
     }
 
     let handle = state
@@ -93,13 +109,8 @@ pub async fn pg_execute(
         .pg(&profile_id, database.as_deref())
         .await
         .map_err(err)?;
-    let query_id = uuid::Uuid::new_v4().to_string();
-    let cancel = CancellationToken::new();
-    state
-        .running_queries
-        .lock()
-        .unwrap()
-        .insert(query_id.clone(), cancel.clone());
+    let run = state.running_queries.start();
+    let (query_id, cancel) = (run.id.clone(), run.cancel.clone());
 
     let (tx, mut rx) = mpsc::channel::<QueryEvent>(16);
     tauri::async_runtime::spawn(async move {
@@ -113,6 +124,8 @@ pub async fn pg_execute(
     let qid = query_id.clone();
     let tx_err = tx.clone();
     tauri::async_runtime::spawn(async move {
+        // Registered for as long as this task runs: the entry goes when the statement ends.
+        let _run = run;
         if let Err(e) = handle
             .execute_stream(qid.clone(), &sql, opts, cancel, tx)
             .await
@@ -133,7 +146,18 @@ pub async fn pg_execute(
 /// (`dblink_exec`, `lo_export`, `pg_terminate_backend`, advisory locks, …), which the classifier
 /// reports as `Unknown`. So read-only runs are still classified on prod.
 pub(crate) fn prod_guard_reason(sql: &str, read_only: bool) -> Option<String> {
-    let c = classify(sql);
+    prod_guard_reason_on(None, sql, read_only)
+}
+
+/// [`prod_guard_reason`] for an Iceberg connection on `engine`: Trino and Spark SQL the
+/// PostgreSQL parser cannot read is judged by the engine's own read-only check
+/// (`remote::classify_on`), so ordinary reads do not hit the write guard.
+pub(crate) fn prod_guard_reason_on(
+    engine: Option<&vibelens_core::model::IcebergQueryEngine>,
+    sql: &str,
+    read_only: bool,
+) -> Option<String> {
+    let c = vibelens_core::remote::classify_on(engine, sql);
     let needs = if read_only {
         c.overall == StatementClass::Unknown
     } else {
@@ -144,12 +168,11 @@ pub(crate) fn prod_guard_reason(sql: &str, read_only: bool) -> Option<String> {
 
 #[tauri::command]
 pub async fn pg_cancel(state: State<'_, AppState>, query_id: String) -> CmdResult<()> {
-    match state.running_queries.lock().unwrap().remove(&query_id) {
-        Some(tok) => {
-            tok.cancel();
-            Ok(())
-        }
-        None => Err(CoreError::NotFound(format!("query {query_id}")).into()),
+    // Not found: no such run, or it has already ended or been cancelled.
+    if state.running_queries.cancel(&query_id) {
+        Ok(())
+    } else {
+        Err(CoreError::NotFound(format!("query {query_id}")).into())
     }
 }
 

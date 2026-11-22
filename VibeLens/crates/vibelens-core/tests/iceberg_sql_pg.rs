@@ -2,6 +2,8 @@
 //! Gated on `VG_TEST_PG="host=… port=… user=… password=… dbname=…"`; uses a throwaway database.
 #![cfg(feature = "iceberg")]
 
+mod services;
+
 mod iceberg_common;
 
 use std::sync::Arc;
@@ -22,7 +24,7 @@ fn kv(raw: &str, key: &str) -> Option<String> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_catalog_gets_its_password_from_the_vault() {
     let Some(raw) = std::env::var("VG_TEST_PG").ok().filter(|s| !s.is_empty()) else {
-        eprintln!("VG_TEST_PG not set; skipping");
+        services::skip("pg", "VG_TEST_PG is not set");
         return;
     };
     let (host, port, user, pw) = (
@@ -36,7 +38,12 @@ async fn postgres_catalog_gets_its_password_from_the_vault() {
     let (client, conn) = match tokio_postgres::connect(&admin, tokio_postgres::NoTls).await {
         Ok(x) => x,
         Err(e) => {
-            eprintln!("cannot reach postgres without TLS ({e}); skipping");
+            services::skip(
+                "pg",
+                format!(
+                    "Postgres could not be reached without TLS, which this test needs for its own setup ({e})"
+                ),
+            );
             return;
         }
     };

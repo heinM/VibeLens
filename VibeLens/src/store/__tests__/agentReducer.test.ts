@@ -126,6 +126,13 @@ describe("applyAgentEvent: approvals", () => {
     expect(tool(after)?.status).toBe("rejected");
   });
 
+  it("keeps the target the backend resolved, and tolerates events without one", () => {
+    const target = { connection: "orders-db", engine: "postgres" as const, environment: "prod" as const, database: "payments", defaultDatabase: "shop", valkeyDb: null };
+    const s = run([prompt, started, { type: "approvalRequired", callId: "c1", tool: "run_sql", arguments: { sql: "delete from t" }, reason: "writes", preview: "delete from t", target }]);
+    expect(approval(s)?.target).toEqual(target);
+    expect(approval(run(ask))?.target).toBeNull();
+  });
+
   it("creates the tool card if approvalRequired arrives first", () => {
     const s = run([prompt, { type: "approvalRequired", callId: "z", tool: "write_file", arguments: { path: "m.sql" }, reason: "Writes a file", preview: "--- a\n+++ b" }]);
     expect(tool(s, "z")).toMatchObject({ tool: "write_file", status: "awaitingApproval" });
@@ -179,5 +186,35 @@ describe("applyAgentEvent: failures and cancel", () => {
     const s = run([prompt, started, { type: "turnFinished", stopReason: "end_turn", usage: null }, { type: "userPrompt", text: "again", attached: [] }]);
     expect(s.running).toBe(true);
     expect(userPrompts(s.transcript)).toEqual(["hello", "again"]);
+  });
+});
+
+describe("applyAgentEvent: run_sql target and dismissing errors", () => {
+  const proposed: AgentStoreEvent = { type: "toolCallProposed", callId: "c1", tool: "run_sql", arguments: { sql: "select 1" }, risk: "safe", reason: null };
+  const sqlRun = { profileId: "p1", database: "payments", sql: "select 1", readOnly: true };
+
+  it("keeps where a run_sql call ran", () => {
+    const s = run([prompt, started, proposed, { type: "toolStarted", callId: "c1" }, { type: "toolFinished", callId: "c1", ok: true, summary: "1 row", elapsedMs: 3, sqlRun }]);
+    expect(tool(s)?.sqlRun).toEqual(sqlRun);
+  });
+
+  it("has no target for calls that did not report one", () => {
+    const s = run([prompt, started, proposed, { type: "toolFinished", callId: "c1", ok: false, summary: "denied", elapsedMs: 0 }]);
+    expect(tool(s)?.sqlRun).toBeNull();
+  });
+
+  it("removes only the dismissed error", () => {
+    const err = (message: string): AgentStoreEvent => ({ type: "noticeError", error: { code: "x", message } });
+    const s = run([prompt, err("first"), err("second")]);
+    const [first, second] = s.transcript.filter((i) => i.kind === "error");
+    const after = applyAgentEvent(s, { type: "dismissError", id: first.id });
+    expect(after.transcript.filter((i) => i.kind === "error")).toEqual([second]);
+    expect(kinds(after)).toEqual(["user", "error"]);
+  });
+
+  it("ignores ids that are not errors", () => {
+    const s = run([prompt]);
+    expect(applyAgentEvent(s, { type: "dismissError", id: s.transcript[0].id })).toBe(s);
+    expect(applyAgentEvent(s, { type: "dismissError", id: "nope" })).toBe(s);
   });
 });

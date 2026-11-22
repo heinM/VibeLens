@@ -1,0 +1,1477 @@
+//! The MySQL client against a hostile server: an in-process fake that speaks just enough of
+//! the protocol to log in and answer queries, and then does what a malicious or compromised
+//! server (or an attacker in the path of an unencrypted connection) would do. Runs without any
+//! outside service.
+//!
+//! Each test states what the server tries and what must not happen.
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use futures_util::FutureExt;
+use secrecy::SecretString;
+use serde_json::json;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_util::sync::CancellationToken;
+use vibelens_core::CoreError;
+use vibelens_core::model::*;
+use vibelens_core::mysql::{MysqlConnectParams, MysqlHandle};
+use vibelens_core::ports::CredentialFn;
+
+const PASSWORD: &str = "hunter2-not-for-the-server";
+
+// Capability flags (subset).
+const LONG_PASSWORD: u32 = 0x1;
+const FOUND_ROWS: u32 = 0x2;
+const CONNECT_WITH_DB: u32 = 0x8;
+const LOCAL_FILES: u32 = 0x80;
+const PROTOCOL_41: u32 = 0x200;
+const TRANSACTIONS: u32 = 0x2000;
+const SECURE_CONNECTION: u32 = 0x8000;
+const MULTI_STATEMENTS: u32 = 0x1_0000;
+const MULTI_RESULTS: u32 = 0x2_0000;
+const PS_MULTI_RESULTS: u32 = 0x4_0000;
+const PLUGIN_AUTH: u32 = 0x8_0000;
+const CONNECT_ATTRS: u32 = 0x10_0000;
+const PLUGIN_AUTH_LENENC: u32 = 0x20_0000;
+const DEPRECATE_EOF: u32 = 0x100_0000;
+
+/// Everything the server offers, including what the client must not take up.
+const SERVER_CAPS: u32 = LONG_PASSWORD
+    | FOUND_ROWS
+    | CONNECT_WITH_DB
+    | LOCAL_FILES
+    | PROTOCOL_41
+    | TRANSACTIONS
+    | SECURE_CONNECTION
+    | MULTI_STATEMENTS
+    | MULTI_RESULTS
+    | PS_MULTI_RESULTS
+    | PLUGIN_AUTH
+    | CONNECT_ATTRS
+    | PLUGIN_AUTH_LENENC
+    | DEPRECATE_EOF;
+
+/// What the fake server does after the client's handshake response, and for queries.
+#[derive(Clone, Copy, PartialEq)]
+enum Plan {
+    /// `caching_sha2_password`, then "perform full authentication" without TLS.
+    DemandFullAuth,
+    /// Switch the client to `mysql_clear_password` without TLS.
+    SwitchToCleartext,
+    /// Log in, then answer `SELECT 'trigger'` with a LOCAL INFILE request for `file`.
+    AskForFile,
+    /// Log in, then answer `SELECT 'trigger'` with a hostile result set.
+    HostileRows,
+    /// Log in, then answer `SELECT 'trigger'` with a column of an unknown type.
+    UnknownType,
+    /// Switch the client to this auth plugin (MariaDB `client_ed25519`, `parsec`, …).
+    SwitchTo(&'static str),
+    /// Switch to `mysql_native_password`, then send a second switch.
+    DoubleSwitch,
+    /// Answer `SELECT 'trigger'` with a result header announcing 2^40 columns.
+    HugeColumnCount,
+    /// Answer catalog queries with 600 rows of 70 KB each (42 MB).
+    HugeCatalog,
+    /// Never answer `SELECT 'trigger'`. `moving_uuid`: every connection reports another
+    /// `@@server_uuid`, as behind a reader endpoint that spreads connections over instances.
+    Hang(Uuid),
+    /// Answer `SELECT 'trigger'` with three column definitions of 6 MiB each.
+    FatColumns,
+    /// Log in and answer everything with OK (and `@@server_uuid`). A login to a database
+    /// whose name contains `slow` is answered after 3 seconds.
+    Plain,
+    /// Answer `SELECT @@server_uuid` only after 6 seconds (past the client's 5 s limit), then
+    /// carry on as if nothing happened.
+    SlowUuid,
+}
+
+/// How the fake answers `SELECT @@server_uuid`.
+#[derive(Clone, Copy, PartialEq)]
+enum Uuid {
+    Same,
+    /// Another value on every connection (a reader endpoint spreading connections).
+    Moving,
+    /// Two columns instead of one: the driver's typed conversion panics on that.
+    TwoColumns,
+    /// One column of bytes that are not UTF-8: same.
+    BadUtf8,
+    /// An error (MariaDB has no `@@server_uuid`); `@@hostname, @@port, @@server_id` answers.
+    Missing,
+}
+
+/// What the server saw.
+#[derive(Default)]
+struct Seen {
+    connections: usize,
+    client_caps: Vec<u32>,
+    /// Every packet payload received after the handshake response, in order.
+    packets: Vec<Vec<u8>>,
+}
+
+impl Seen {
+    fn all_bytes(&self) -> Vec<u8> {
+        self.packets.iter().flatten().copied().collect()
+    }
+}
+
+async fn read_packet(s: &mut TcpStream) -> Option<(u8, Vec<u8>)> {
+    read_packet_within(s, Duration::from_secs(5)).await
+}
+
+/// [`read_packet`] that gives up (as if the client had gone) after `limit`.
+async fn read_packet_within(s: &mut TcpStream, limit: Duration) -> Option<(u8, Vec<u8>)> {
+    let mut h = [0u8; 4];
+    tokio::time::timeout(limit, s.read_exact(&mut h))
+        .await
+        .ok()?
+        .ok()?;
+    let len = u32::from_le_bytes([h[0], h[1], h[2], 0]) as usize;
+    let mut p = vec![0u8; len];
+    s.read_exact(&mut p).await.ok()?;
+    Some((h[3], p))
+}
+
+async fn write_packet(s: &mut TcpStream, seq: u8, payload: &[u8]) {
+    let len = payload.len() as u32;
+    let mut out = vec![len as u8, (len >> 8) as u8, (len >> 16) as u8, seq];
+    out.extend_from_slice(payload);
+    let _ = s.write_all(&out).await;
+}
+
+fn lenenc_str(out: &mut Vec<u8>, s: &[u8]) {
+    if s.len() < 251 {
+        out.push(s.len() as u8);
+    } else {
+        assert!(s.len() < 1 << 24);
+        out.push(0xFD);
+        out.extend_from_slice(&(s.len() as u32).to_le_bytes()[..3]);
+    }
+    out.extend_from_slice(s);
+}
+
+/// A one-column (VARCHAR) result set with `rows`, starting at sequence id 1.
+async fn one_column(s: &mut TcpStream, rows: &[Vec<u8>]) {
+    let rows: Vec<Vec<Vec<u8>>> = rows.iter().map(|r| vec![r.clone()]).collect();
+    columns(s, 1, &rows).await;
+}
+
+/// An `n`-column (VARCHAR) result set with `rows`, starting at sequence id 1.
+async fn columns(s: &mut TcpStream, n: u8, rows: &[Vec<Vec<u8>>]) {
+    write_packet(s, 1, &[n]).await;
+    let mut seq = 2u8;
+    for i in 0..n {
+        write_packet(s, seq, &column(&format!("c{i}"), 253, 255, 0)).await;
+        seq = seq.wrapping_add(1);
+    }
+    for r in rows {
+        let mut row = Vec::new();
+        for v in r {
+            lenenc_str(&mut row, v);
+        }
+        write_packet(s, seq, &row).await;
+        seq = seq.wrapping_add(1);
+    }
+    write_packet(s, seq, END).await;
+}
+
+const OK: &[u8] = &[0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00];
+/// Result-set terminator with CLIENT_DEPRECATE_EOF: an OK packet with the 0xFE header.
+const END: &[u8] = &[0xFE, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00];
+
+fn handshake(plugin: &str) -> Vec<u8> {
+    let mut p = vec![0x0a];
+    p.extend_from_slice(b"8.0.99-fake\0");
+    p.extend_from_slice(&7u32.to_le_bytes());
+    p.extend_from_slice(b"abcdefgh");
+    p.push(0);
+    p.extend_from_slice(&(SERVER_CAPS as u16).to_le_bytes());
+    p.push(255);
+    p.extend_from_slice(&0x0002u16.to_le_bytes());
+    p.extend_from_slice(&((SERVER_CAPS >> 16) as u16).to_le_bytes());
+    p.push(21);
+    p.extend_from_slice(&[0u8; 10]);
+    p.extend_from_slice(b"ijklmnopqrst\0");
+    p.extend_from_slice(plugin.as_bytes());
+    p.push(0);
+    p
+}
+
+/// A column definition (protocol 41).
+fn column(name: &str, ty: u8, charset: u16, flags: u16) -> Vec<u8> {
+    let mut c = Vec::new();
+    for s in ["def", "fake", "t", "t", name, name] {
+        lenenc_str(&mut c, s.as_bytes());
+    }
+    c.push(0x0c);
+    c.extend_from_slice(&charset.to_le_bytes());
+    c.extend_from_slice(&1024u32.to_le_bytes());
+    c.push(ty);
+    c.extend_from_slice(&flags.to_le_bytes());
+    c.push(0);
+    c.extend_from_slice(&[0, 0]);
+    c
+}
+
+async fn serve(mut s: TcpStream, plan: Plan, file: String, seen: Arc<Mutex<Seen>>) {
+    let plugin = match plan {
+        Plan::DemandFullAuth => "caching_sha2_password",
+        _ => "mysql_native_password",
+    };
+    write_packet(&mut s, 0, &handshake(plugin)).await;
+    let Some((_, resp)) = read_packet(&mut s).await else {
+        return;
+    };
+    let caps = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
+    let conn_no = {
+        let mut g = seen.lock().unwrap();
+        g.client_caps.push(caps);
+        g.connections += 1;
+        g.connections
+    };
+    match plan {
+        Plan::SwitchTo(plugin) => {
+            let mut sw = vec![0xFE];
+            sw.extend_from_slice(plugin.as_bytes());
+            sw.push(0);
+            sw.extend_from_slice(b"0123456789abcdefghij\0");
+            write_packet(&mut s, 2, &sw).await;
+            while let Some((_, p)) = read_packet(&mut s).await {
+                seen.lock().unwrap().packets.push(p);
+            }
+            return;
+        }
+        Plan::DoubleSwitch => {
+            let mut sw = vec![0xFE];
+            sw.extend_from_slice(b"mysql_native_password\0abcdefghijklmnopqrst\0");
+            write_packet(&mut s, 2, &sw).await;
+            if read_packet(&mut s).await.is_none() {
+                return;
+            }
+            let mut sw2 = vec![0xFE];
+            sw2.extend_from_slice(b"parsec\0");
+            write_packet(&mut s, 4, &sw2).await;
+            while let Some((_, p)) = read_packet(&mut s).await {
+                seen.lock().unwrap().packets.push(p);
+            }
+            return;
+        }
+        Plan::DemandFullAuth => {
+            // "fast authentication failed, send the password" (0x01 0x04).
+            write_packet(&mut s, 2, &[0x01, 0x04]).await;
+            // A vulnerable client now sends 0x02 (give me your RSA key) or the password.
+            while let Some((_, p)) = read_packet(&mut s).await {
+                seen.lock().unwrap().packets.push(p);
+            }
+            return;
+        }
+        Plan::SwitchToCleartext => {
+            let mut sw = vec![0xFE];
+            sw.extend_from_slice(b"mysql_clear_password\0");
+            write_packet(&mut s, 2, &sw).await;
+            while let Some((_, p)) = read_packet(&mut s).await {
+                seen.lock().unwrap().packets.push(p);
+            }
+            return;
+        }
+        _ => {
+            if plan == Plan::Plain && contains(&resp, b"slow") {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+            write_packet(&mut s, 2, OK).await
+        }
+    }
+    // Commands.
+    while let Some((_, p)) = read_packet(&mut s).await {
+        seen.lock().unwrap().packets.push(p.clone());
+        match p.first() {
+            Some(0x01) => return, // COM_QUIT
+            Some(0x03) if plan == Plan::SlowUuid && p[1..].starts_with(b"SELECT @@server_uuid") => {
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                one_column(&mut s, &[b"uuid-late".to_vec()]).await;
+            }
+            Some(0x03) if p[1..].starts_with(b"SELECT @@server_uuid") => match plan {
+                Plan::Hang(Uuid::Moving) => {
+                    one_column(&mut s, &[format!("uuid-{conn_no}").into_bytes()]).await
+                }
+                Plan::Hang(Uuid::TwoColumns) => {
+                    columns(&mut s, 2, &[vec![b"uuid-a".to_vec(), b"extra".to_vec()]]).await
+                }
+                Plan::Hang(Uuid::BadUtf8) => {
+                    one_column(&mut s, &[vec![0xFF, 0xFE, 0x80, b'u']]).await
+                }
+                Plan::Hang(Uuid::Missing) => {
+                    let mut e = vec![0xFF];
+                    e.extend_from_slice(&1193u16.to_le_bytes());
+                    e.extend_from_slice(b"#HY000Unknown system variable 'server_uuid'");
+                    write_packet(&mut s, 1, &e).await;
+                }
+                _ => one_column(&mut s, &[b"uuid-same".to_vec()]).await,
+            },
+            Some(0x03) if p[1..].starts_with(b"SELECT @@hostname") => {
+                columns(
+                    &mut s,
+                    3,
+                    &[vec![b"db-a".to_vec(), b"3306".to_vec(), b"7".to_vec()]],
+                )
+                .await
+            }
+            Some(0x03) if plan == Plan::HugeCatalog && contains(&p, b"information_schema") => {
+                let rows: Vec<Vec<u8>> = (0..600).map(|_| vec![b'x'; 70_000]).collect();
+                one_column(&mut s, &rows).await;
+            }
+            Some(0x03) if p[1..].starts_with(b"SELECT 'trigger'") => match plan {
+                Plan::AskForFile => {
+                    let mut req = vec![0xFB];
+                    req.extend_from_slice(file.as_bytes());
+                    write_packet(&mut s, 1, &req).await;
+                }
+                Plan::HostileRows => {
+                    write_packet(&mut s, 1, &[3]).await;
+                    // VARCHAR utf8mb4, JSON, BIT(64)
+                    write_packet(&mut s, 2, &column("txt", 253, 255, 0)).await;
+                    write_packet(&mut s, 3, &column("doc", 245, 63, 0x90)).await;
+                    write_packet(&mut s, 4, &column("bits", 16, 63, 0x20)).await;
+                    // Row 1: invalid UTF-8, JSON nested 300 deep, a 9-byte BIT.
+                    let mut row = Vec::new();
+                    lenenc_str(&mut row, &[0x61, 0xFF, 0xFE, 0x62]);
+                    let deep = format!("{}{}", "[".repeat(120), "]".repeat(120));
+                    lenenc_str(&mut row, deep.as_bytes());
+                    lenenc_str(&mut row, &[0xFF; 9]);
+                    write_packet(&mut s, 5, &row).await;
+                    // Row 2: NULLs.
+                    write_packet(&mut s, 6, &[0xFB, 0xFB, 0xFB]).await;
+                    // Row 3: claims a 200-byte value but sends 3 bytes.
+                    write_packet(&mut s, 7, &[200, b'a', b'b', b'c']).await;
+                    write_packet(&mut s, 8, END).await;
+                }
+                Plan::HugeColumnCount => {
+                    let mut h = vec![0xFE];
+                    h.extend_from_slice(&(1u64 << 40).to_le_bytes());
+                    write_packet(&mut s, 1, &h).await;
+                }
+                // No answer: the statement "runs" until it is killed or the socket closes.
+                Plan::Hang(_) => {}
+                Plan::FatColumns => {
+                    write_packet(&mut s, 1, &[3]).await;
+                    for i in 0..3u8 {
+                        let fat = "n".repeat(6 * 1024 * 1024);
+                        write_packet(&mut s, 2 + i, &column(&fat, 253, 255, 0)).await;
+                    }
+                    write_packet(&mut s, 5, END).await;
+                }
+                Plan::UnknownType => {
+                    write_packet(&mut s, 1, &[1]).await;
+                    write_packet(&mut s, 2, &column("x", 0x77, 255, 0)).await;
+                    let mut row = Vec::new();
+                    lenenc_str(&mut row, b"1");
+                    write_packet(&mut s, 3, &row).await;
+                    write_packet(&mut s, 4, END).await;
+                }
+                _ => write_packet(&mut s, 1, OK).await,
+            },
+            // Session setup, resets, USE, pings: all fine.
+            _ => write_packet(&mut s, 1, OK).await,
+        }
+    }
+}
+
+struct Fake {
+    port: u16,
+    seen: Arc<Mutex<Seen>>,
+}
+
+async fn fake(plan: Plan, file: &str) -> Fake {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let (seen2, file) = (seen.clone(), file.to_string());
+    tokio::spawn(async move {
+        while let Ok((s, _)) = l.accept().await {
+            tokio::spawn(serve(s, plan, file.clone(), seen2.clone()));
+        }
+    });
+    Fake { port, seen }
+}
+
+fn params(port: u16, cleartext_plugin: bool) -> MysqlConnectParams {
+    MysqlConnectParams {
+        host: "127.0.0.1".into(),
+        port,
+        tls_server_name: "127.0.0.1".into(),
+        database: "fake".into(),
+        tls: TlsConfig {
+            mode: TlsMode::Disable,
+            ..Default::default()
+        },
+        options: MysqlOptions {
+            connect_timeout_secs: 5,
+            max_pool_size: 1,
+            ..Default::default()
+        },
+        cleartext_plugin,
+    }
+}
+
+fn creds() -> CredentialFn {
+    Arc::new(|| {
+        let c = ResolvedCredentials {
+            username: Some("app".into()),
+            password: Some(SecretString::from(PASSWORD)),
+            ..ResolvedCredentials::anonymous()
+        };
+        async move { Ok(c) }.boxed()
+    })
+}
+
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// The server asks for the full password on a connection without TLS. A vulnerable client
+/// asks the server for its RSA public key (0x02) and encrypts the password with it, which an
+/// attacker in the path can answer with their own key. Nothing may be sent.
+#[tokio::test]
+async fn no_password_and_no_rsa_key_request_without_tls() {
+    let f = fake(Plan::DemandFullAuth, "").await;
+    let e = MysqlHandle::connect(params(f.port, false), creds())
+        .await
+        .err()
+        .expect("refused");
+    assert!(
+        matches!(&e, CoreError::Auth(m) if m.contains("full authentication")),
+        "{e:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let seen = f.seen.lock().unwrap();
+    assert!(
+        seen.packets.iter().all(|p| p.as_slice() != [0x02]),
+        "the client asked the server for its RSA key"
+    );
+    assert!(!contains(&seen.all_bytes(), PASSWORD.as_bytes()));
+}
+
+/// An attacker switches the client to the cleartext plugin. Even with the plugin enabled (as it
+/// is for RDS IAM), it is not answered without TLS.
+#[tokio::test]
+async fn no_cleartext_password_without_tls_even_when_enabled() {
+    for enabled in [false, true] {
+        let f = fake(Plan::SwitchToCleartext, "").await;
+        let e = MysqlHandle::connect(params(f.port, enabled), creds())
+            .await
+            .err()
+            .expect("refused");
+        assert!(matches!(&e, CoreError::Auth(_)), "{e:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let seen = f.seen.lock().unwrap();
+        assert!(
+            !contains(&seen.all_bytes(), PASSWORD.as_bytes()),
+            "cleartext password sent (plugin enabled: {enabled})"
+        );
+    }
+}
+
+/// The client never offers to send local files or to run several statements per query, even
+/// when the server offers both.
+#[tokio::test]
+async fn the_client_takes_up_neither_local_files_nor_multi_statements() {
+    let f = fake(Plan::HostileRows, "").await;
+    let h = MysqlHandle::connect(params(f.port, false), creds())
+        .await
+        .expect("login");
+    drop(h);
+    let seen = f.seen.lock().unwrap();
+    assert!(!seen.client_caps.is_empty());
+    for caps in &seen.client_caps {
+        assert_eq!(caps & LOCAL_FILES, 0, "CLIENT_LOCAL_FILES advertised");
+        assert_eq!(
+            caps & MULTI_STATEMENTS,
+            0,
+            "CLIENT_MULTI_STATEMENTS advertised"
+        );
+    }
+}
+
+/// A server answers a plain SELECT with a LOCAL INFILE request for a file on this machine. No
+/// byte of it is sent, and the connection is dropped.
+#[tokio::test]
+async fn a_local_infile_request_gets_no_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("secret.txt");
+    let secret = format!("vg-secret-{}", uuid::Uuid::new_v4().simple());
+    std::fs::write(&path, &secret).unwrap();
+    let f = fake(Plan::AskForFile, &path.display().to_string()).await;
+    let h = MysqlHandle::connect(params(f.port, false), creds())
+        .await
+        .expect("login");
+    let e = h
+        .execute_collect(
+            "SELECT 'trigger'",
+            ExecOptions::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&e, CoreError::PolicyDenied(m) if m.contains("LOCAL INFILE")),
+        "{e:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let seen = f.seen.lock().unwrap();
+    assert!(
+        !contains(&seen.all_bytes(), secret.as_bytes()),
+        "the file was sent to the server"
+    );
+    // Nothing at all followed the request on that connection: the last packet the server got
+    // is the query itself (or a later connection's setup).
+    let after: Vec<&Vec<u8>> = seen
+        .packets
+        .iter()
+        .skip_while(|p| !p.ends_with(b"SELECT 'trigger'"))
+        .skip(1)
+        .collect();
+    assert!(
+        after.iter().all(|p| !p.is_empty()),
+        "an (empty) file-data packet was sent"
+    );
+}
+
+/// Invalid UTF-8 in a text column, JSON deeper than the parser allows, an over-long BIT, NULLs
+/// and a row that lies about its own length: mapped or refused, never a panic.
+#[tokio::test]
+async fn hostile_rows_are_mapped_or_refused_without_panicking() {
+    let f = fake(Plan::HostileRows, "").await;
+    let h = MysqlHandle::connect(params(f.port, false), creds())
+        .await
+        .expect("login");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    h.execute_stream(
+        "q".into(),
+        "SELECT 'trigger'",
+        // One row per page, so the rows before the malformed one reach the receiver.
+        ExecOptions {
+            page_size: 1,
+            ..Default::default()
+        },
+        CancellationToken::new(),
+        tx,
+    )
+    .await
+    .unwrap();
+    let mut rows = Vec::new();
+    let mut failed = None;
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            QueryEvent::Rows { rows: r, .. } => rows.extend(r),
+            QueryEvent::Failed { error, .. } => failed = Some(error),
+            _ => {}
+        }
+    }
+    // The third row is malformed: the statement fails, after the good rows were mapped.
+    assert!(failed.is_some(), "a malformed row was accepted");
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0][0], json!({"$bytes": "Yf/+Yg==", "len": 4}));
+    assert!(rows[0][1].is_array(), "{}", rows[0][1]);
+    assert_eq!(rows[0][2]["len"], json!(9));
+    assert_eq!(rows[1], vec![json!(null), json!(null), json!(null)]);
+}
+
+#[tokio::test]
+async fn an_unknown_column_type_is_an_error_not_a_panic() {
+    let f = fake(Plan::UnknownType, "").await;
+    let h = MysqlHandle::connect(params(f.port, false), creds())
+        .await
+        .expect("login");
+    let r = h
+        .execute_collect(
+            "SELECT 'trigger'",
+            ExecOptions::default(),
+            CancellationToken::new(),
+        )
+        .await;
+    // Either the driver refuses the type, or it is shown as text; it must not panic.
+    if let Ok(q) = r {
+        assert_eq!(q.rows.len(), 1);
+    }
+}
+
+// ---- audit findings ------------------------------------------------------------------------
+
+/// Audit finding 3a/3b: MariaDB's ed25519 and parsec plugins reached a panic (an abort in a
+/// release build). They are refused like any unknown plugin, and nothing is sent.
+#[tokio::test]
+async fn ed25519_and_parsec_switches_are_refused_not_panics() {
+    for plugin in ["client_ed25519", "parsec"] {
+        let f = fake(Plan::SwitchTo(plugin), "").await;
+        let e = MysqlHandle::connect(params(f.port, false), creds())
+            .await
+            .err()
+            .expect("refused");
+        assert!(
+            matches!(&e, CoreError::Auth(m) if m.contains(plugin)),
+            "{plugin}: {e:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!contains(
+            &f.seen.lock().unwrap().all_bytes(),
+            PASSWORD.as_bytes()
+        ));
+    }
+}
+
+/// A greeting whose version uses non-ASCII decimal digits ("٣.٣.٣") reached `btoi(..).unwrap()`
+/// in mysql_common: a panic, before TLS. The driver refuses it.
+#[tokio::test]
+async fn a_non_ascii_version_in_the_greeting_is_refused_not_a_panic() {
+    for suffix in ["", "-MariaDB"] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let tail = suffix.to_string();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut p = handshake("mysql_native_password");
+            let nul = p.iter().skip(1).position(|&b| b == 0).unwrap() + 1;
+            let mut version = "٣.٣.٣".as_bytes().to_vec();
+            version.extend_from_slice(tail.as_bytes());
+            p.splice(1..nul, version);
+            write_packet(&mut s, 0, &p).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        });
+        let r = tokio::spawn(MysqlHandle::connect(params(port, false), creds())).await;
+        assert!(r.expect("no panic").is_err(), "refused ({suffix:?})");
+    }
+}
+
+/// Audit finding 3b: a second auth switch is an error.
+#[tokio::test]
+async fn a_second_auth_switch_is_an_error() {
+    let f = fake(Plan::DoubleSwitch, "").await;
+    let r = MysqlHandle::connect(params(f.port, false), creds()).await;
+    assert!(r.is_err());
+}
+
+/// Audit finding 3c: a result header announcing 2^40 columns used to size an allocation.
+#[tokio::test]
+async fn a_huge_column_count_is_refused_before_allocating() {
+    let f = fake(Plan::HugeColumnCount, "").await;
+    let h = MysqlHandle::connect(params(f.port, false), creds())
+        .await
+        .expect("login");
+    let r = h
+        .execute_collect(
+            "SELECT 'trigger'",
+            ExecOptions::default(),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(r.is_err(), "{r:?}");
+}
+
+/// Audit finding 7: catalog values are cut and a catalog listing stops at its byte budget.
+#[tokio::test]
+async fn catalog_listings_are_bounded_per_value_and_in_total() {
+    let f = fake(Plan::HugeCatalog, "").await;
+    let h = MysqlHandle::connect(params(f.port, false), creds())
+        .await
+        .expect("login");
+    let dbs = h.list_databases().await.unwrap();
+    assert!(!dbs.is_empty());
+    assert!(
+        dbs.iter().all(|d| d.len() <= 64 * 1024 + 16),
+        "a value was kept whole"
+    );
+    let total: usize = dbs.iter().map(String::len).sum();
+    assert!(total <= 33 * 1024 * 1024, "{total}");
+    assert!(dbs.len() < 600, "the byte budget did not stop the listing");
+}
+
+/// Audit finding 11: an oversized table cap from IPC does not overflow.
+#[tokio::test]
+async fn an_oversized_table_cap_does_not_overflow() {
+    let f = fake(Plan::Plain, "").await;
+    let h = MysqlHandle::connect(params(f.port, false), creds())
+        .await
+        .expect("login");
+    let meta = h.schema_metadata(None, usize::MAX).await.unwrap();
+    assert!(meta.tables.is_empty());
+}
+
+/// Audit finding 8: a `KILL QUERY` goes only to the server the statement runs on. Behind a
+/// reader endpoint the kill connection may land on another instance, where the same id is
+/// someone else's session.
+#[tokio::test]
+async fn kill_query_is_sent_only_to_the_same_server() {
+    // Re-audit item 1: replies of the wrong shape must not abort the process; item 6: without
+    // `@@server_uuid` the identity falls back to `@@hostname, @@port, @@server_id`.
+    for uuid in [
+        Uuid::Same,
+        Uuid::Moving,
+        Uuid::TwoColumns,
+        Uuid::BadUtf8,
+        Uuid::Missing,
+    ] {
+        let moving = uuid == Uuid::Moving;
+        let f = fake(Plan::Hang(uuid), "").await;
+        let h = MysqlHandle::connect(params(f.port, false), creds())
+            .await
+            .expect("login");
+        let cancel = CancellationToken::new();
+        let run = tokio::spawn({
+            let (h, c) = (h.clone(), cancel.clone());
+            async move {
+                h.execute_collect("SELECT 'trigger'", ExecOptions::default(), c)
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        cancel.cancel();
+        assert!(matches!(run.await.unwrap(), Err(CoreError::Cancelled)));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let kills = f
+            .seen
+            .lock()
+            .unwrap()
+            .packets
+            .iter()
+            .filter(|p| p.len() > 1 && p[1..].starts_with(b"KILL QUERY"))
+            .count();
+        if moving {
+            assert_eq!(kills, 0, "a kill was sent to another instance");
+        } else {
+            assert_eq!(kills, 1, "the kill was not sent to the same instance");
+        }
+        // Every new connection still works after the odd identity reply.
+        assert!(
+            MysqlHandle::connect(params(f.port, false), creds())
+                .await
+                .is_ok()
+        );
+    }
+}
+
+/// Audit finding 10: each database name opens its own pool; a connection holds a bounded
+/// number, so `shop`, `Shop`, `sHop` … cannot open pools without end.
+#[tokio::test]
+async fn database_pools_per_connection_are_capped() {
+    use async_trait::async_trait;
+    use vibelens_core::connections::{ConnectionManager, MAX_MYSQL_POOLS_PER_PROFILE};
+    use vibelens_core::ports::{CredentialSource, ProfileStore, TunnelHandle, TunnelProvider};
+    use vibelens_core::profiles::JsonProfileStore;
+
+    struct C;
+    #[async_trait]
+    impl CredentialSource for C {
+        async fn resolve(
+            &self,
+            _: &ConnectionProfile,
+        ) -> vibelens_core::Result<ResolvedCredentials> {
+            Ok(ResolvedCredentials {
+                username: Some("app".into()),
+                password: Some(SecretString::from(PASSWORD)),
+                ..ResolvedCredentials::anonymous()
+            })
+        }
+    }
+    struct T;
+    #[async_trait]
+    impl TunnelProvider for T {
+        async fn open(
+            &self,
+            _: &str,
+            _: &TunnelConfig,
+            _: &str,
+            _: u16,
+        ) -> vibelens_core::Result<TunnelHandle> {
+            Err(CoreError::Tunnel("none".into()))
+        }
+    }
+    let f = fake(Plan::Plain, "").await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(JsonProfileStore::new(dir.path().to_path_buf()).unwrap());
+    let mgr = ConnectionManager::new(store.clone(), Arc::new(C), Arc::new(T));
+    let p = store
+        .upsert(ConnectionProfile {
+            id: String::new(),
+            name: "fake".into(),
+            engine: EngineKind::Mysql,
+            host: "127.0.0.1".into(),
+            port: f.port,
+            database: Some("shop".into()),
+            auth: AuthMethod::Password {
+                username: "app".into(),
+            },
+            tls: TlsConfig {
+                mode: TlsMode::Disable,
+                ..Default::default()
+            },
+            tunnel: None,
+            environment: Environment::Dev,
+            ai_data_access: AiDataAccess::Results,
+            color: None,
+            pg: Default::default(),
+            valkey: Default::default(),
+            created_at: None,
+            updated_at: None,
+            iceberg: None,
+            redshift: None,
+            mysql: MysqlOptions {
+                connect_timeout_secs: 5,
+                max_pool_size: 1,
+                ..Default::default()
+            },
+        })
+        .unwrap();
+    let names: Vec<String> = (0..MAX_MYSQL_POOLS_PER_PROFILE)
+        .map(|i| {
+            // shop, Shop, sHop, …: case variants of one name.
+            "shop"
+                .chars()
+                .enumerate()
+                .map(|(j, c)| {
+                    if (i >> j) & 1 == 1 {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    let mut handles = Vec::new();
+    for n in &names {
+        handles.push(mgr.mysql(&p.id, Some(n)).await.expect(n));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(mgr.mysql_pool_count(&p.id), MAX_MYSQL_POOLS_PER_PROFILE);
+    // Third review, item D: a pool someone holds (a statement about to start) is never
+    // evicted; with every pool held, a new database is refused instead.
+    let e = mgr
+        .mysql(&p.id, Some("SHOP"))
+        .await
+        .err()
+        .expect("all held");
+    assert!(
+        matches!(&e, CoreError::Invalid(m) if m.contains("in use")),
+        "{e:?}"
+    );
+    for h in &handles {
+        assert!(
+            h.execute_collect("SELECT 1", ExecOptions::default(), CancellationToken::new())
+                .await
+                .is_ok()
+        );
+    }
+    let weak: Vec<std::sync::Weak<MysqlHandle>> = handles.iter().map(Arc::downgrade).collect();
+    // Re-audit item 5 / third review item D: keep only the first (also the most recently
+    // used); the least recently used of the unheld pools makes room.
+    let first = handles.remove(0);
+    handles.clear();
+    first
+        .execute_collect("SELECT 1", ExecOptions::default(), CancellationToken::new())
+        .await
+        .unwrap();
+    let shop = mgr
+        .mysql(&p.id, Some("SHOP"))
+        .await
+        .expect("evicts an unheld pool");
+    assert_eq!(mgr.mysql_pool_count(&p.id), MAX_MYSQL_POOLS_PER_PROFILE);
+    assert!(weak[0].upgrade().is_some(), "the held pool was evicted");
+    assert_eq!(
+        weak.iter().filter(|w| w.upgrade().is_none()).count(),
+        1,
+        "exactly one unheld pool was evicted"
+    );
+    drop((first, shop));
+    // Count, dial and insert are one step: concurrent opens never exceed the cap.
+    mgr.disconnect(&p.id).await.unwrap();
+    let mut tasks = Vec::new();
+    for i in 0..20 {
+        let (mgr, id) = (mgr.clone(), p.id.clone());
+        tasks.push(tokio::spawn(async move {
+            let _ = mgr.mysql(&id, Some(&format!("db{i}"))).await;
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    assert!(mgr.mysql_pool_count(&p.id) <= MAX_MYSQL_POOLS_PER_PROFILE);
+}
+
+/// Item answered with the re-audit: column definitions are bounded in total, not just per
+/// packet (4096 columns of up to 64 MiB each).
+#[tokio::test]
+async fn fat_column_definitions_are_refused() {
+    let f = fake(Plan::FatColumns, "").await;
+    let h = MysqlHandle::connect(params(f.port, false), creds())
+        .await
+        .expect("login");
+    let r = h
+        .execute_collect(
+            "SELECT 'trigger'",
+            ExecOptions::default(),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(r.is_err(), "18 MiB of column definitions were accepted");
+}
+
+// ---- fuzz: a server that corrupts the conversation at every stage ---------------------------
+
+/// A seeded, deterministic fake server that follows the protocol up to a randomly chosen
+/// packet and then corrupts it (and, sometimes, everything after it): empty or truncated
+/// packets, wrong sequence ids, oversized length-encoded values, random bytes, a valid prefix
+/// followed by garbage, a header that promises more than is sent, or a premature close. The
+/// conversation covers the handshake, authentication and auth switches, result-set headers,
+/// column definitions, rows and terminators, and every command the engine sends (identity
+/// queries, COM_RESET_CONNECTION, USE, session setup, the statement, KILL QUERY, COM_QUIT).
+///
+/// Each iteration runs a real connect, a statement and a catalog read through the engine's
+/// own entry points in a spawned task. The test fails when any task panics (seen through the
+/// `JoinError` and, for tasks the engine spawns itself, through a panic hook) or does not
+/// finish within the time limit. `VG_FUZZ_SEED` and `VG_FUZZ_ITERS` choose the run; a failure
+/// prints the seed and the iteration to replay it.
+mod fuzz {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    /// xorshift64*: small, deterministic, good enough to pick mutations.
+    #[derive(Clone)]
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+        }
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            if n == 0 { 0 } else { self.next() % n }
+        }
+        fn chance(&mut self, percent: u64) -> bool {
+            self.below(100) < percent
+        }
+        fn bytes(&mut self, max: usize) -> Vec<u8> {
+            let n = self.below(max as u64 + 1) as usize;
+            (0..n).map(|_| self.next() as u8).collect()
+        }
+    }
+
+    /// Writes packets, corrupting the `corrupt_at`-th one (and every later one in chaos mode).
+    struct Wire {
+        s: TcpStream,
+        rng: Rng,
+        sent: usize,
+        corrupt_at: usize,
+        chaos: bool,
+        closed: bool,
+    }
+
+    impl Wire {
+        async fn raw(&mut self, bytes: &[u8]) {
+            if !self.closed && self.s.write_all(bytes).await.is_err() {
+                self.closed = true;
+            }
+        }
+
+        async fn send(&mut self, seq: u8, payload: &[u8]) {
+            if self.closed {
+                return;
+            }
+            let n = self.sent;
+            self.sent += 1;
+            let corrupt = n == self.corrupt_at || (self.chaos && n > self.corrupt_at);
+            if !corrupt {
+                return self.frame(seq, payload).await;
+            }
+            let r = &mut self.rng;
+            match r.below(10) {
+                0 => self.frame(seq, &[]).await,
+                1 => {
+                    let k = r.below(payload.len() as u64) as usize;
+                    let p = payload[..k].to_vec();
+                    self.frame(seq, &p).await
+                }
+                2 => {
+                    let bad = seq.wrapping_add(1 + r.below(250) as u8);
+                    self.frame(bad, payload).await
+                }
+                3 => {
+                    let p = r.bytes(64);
+                    self.frame(seq, &p).await
+                }
+                4 => {
+                    // An oversized length-encoded integer where a value or count goes.
+                    let mut p = payload.first().map(|b| vec![*b]).unwrap_or_default();
+                    match r.below(3) {
+                        0 => {
+                            p.push(0xFE);
+                            p.extend_from_slice(&r.next().to_le_bytes());
+                        }
+                        1 => p.extend_from_slice(&[0xFD, 0xFF, 0xFF, 0xFF]),
+                        _ => p.extend_from_slice(&[0xFC, 0xFF, 0xFF]),
+                    }
+                    let tail = r.bytes(8);
+                    p.extend_from_slice(&tail);
+                    if r.chance(50) && !p.is_empty() {
+                        p.remove(0);
+                    }
+                    self.frame(seq, &p).await
+                }
+                5 => self.close().await,
+                6 => {
+                    let k = r.below(payload.len() as u64 + 1) as usize;
+                    let mut p = payload[..k].to_vec();
+                    let g = r.bytes(32);
+                    p.extend_from_slice(&g);
+                    self.frame(seq, &p).await
+                }
+                7 => {
+                    let mut p = payload.to_vec();
+                    for _ in 0..=r.below(4) {
+                        if !p.is_empty() {
+                            let i = r.below(p.len() as u64) as usize;
+                            p[i] = r.next() as u8;
+                        }
+                    }
+                    self.frame(seq, &p).await
+                }
+                8 => {
+                    // The header promises more than follows; then the socket closes.
+                    let len = (payload.len() + 1 + r.below(1 << 20) as usize).min(0xFF_FFFF);
+                    let h = [len as u8, (len >> 8) as u8, (len >> 16) as u8, seq];
+                    self.raw(&h).await;
+                    self.raw(payload).await;
+                    self.close().await
+                }
+                _ => {
+                    // A packet the client does not expect at this point.
+                    let p = match r.below(4) {
+                        0 => OK.to_vec(),
+                        1 => END.to_vec(),
+                        2 => vec![0xFF, 0x10, 0x04, b'#', b'H', b'Y', b'0', b'0', b'0', b'x'],
+                        _ => vec![0xFB, b'/', b'e', b't', b'c'],
+                    };
+                    self.frame(seq, &p).await
+                }
+            }
+        }
+
+        async fn frame(&mut self, seq: u8, payload: &[u8]) {
+            let len = payload.len().min(0xFF_FFFF);
+            let mut out = vec![len as u8, (len >> 8) as u8, (len >> 16) as u8, seq];
+            out.extend_from_slice(&payload[..len]);
+            self.raw(&out).await;
+        }
+
+        async fn close(&mut self) {
+            self.closed = true;
+            let _ = self.s.shutdown().await;
+        }
+    }
+
+    const PLUGINS: &[&str] = &[
+        "mysql_native_password",
+        "caching_sha2_password",
+        "mysql_clear_password",
+        "client_ed25519",
+        "parsec",
+        "sha256_password",
+        "mysql_old_password",
+        "",
+        "x\u{1}weird",
+    ];
+
+    /// Column types the fake declares, valid and not.
+    const TYPES: &[u8] = &[
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0f, 0x10,
+        0x11, 0x12, 0x13, 0xf2, 0xf5, 0xf6, 0xf7, 0xf8, 0xfc, 0xfd, 0xfe, 0xff, 0x77,
+    ];
+
+    fn rand_column(r: &mut Rng) -> Vec<u8> {
+        let ty = TYPES[r.below(TYPES.len() as u64) as usize];
+        let charset = [63u16, 255, 8, 33, 0][r.below(5) as usize];
+        column("c", ty, charset, r.next() as u16)
+    }
+
+    fn rand_value(r: &mut Rng, out: &mut Vec<u8>) {
+        match r.below(6) {
+            0 => out.push(0xFB),
+            1 => lenenc_str(out, b"0000-00-00 00:00:00"),
+            2 => lenenc_str(out, b"18446744073709551615"),
+            3 => lenenc_str(out, &[0xFF, 0xFE, 0x00, 0x80]),
+            4 => lenenc_str(out, b"[[[[{\"a\":1}]]]]"),
+            _ => {
+                let b = r.bytes(300);
+                lenenc_str(out, &b)
+            }
+        }
+    }
+
+    /// A result set: header, column definitions, rows, terminator.
+    async fn result_set(w: &mut Wire, r: &mut Rng) {
+        let n = 1 + r.below(4) as u8;
+        w.send(1, &[n]).await;
+        let mut seq = 2u8;
+        for _ in 0..n {
+            let c = rand_column(r);
+            w.send(seq, &c).await;
+            seq = seq.wrapping_add(1);
+        }
+        for _ in 0..r.below(4) {
+            let mut row = Vec::new();
+            for _ in 0..n {
+                rand_value(r, &mut row);
+            }
+            w.send(seq, &row).await;
+            seq = seq.wrapping_add(1);
+        }
+        w.send(seq, END).await;
+    }
+
+    async fn serve(s: TcpStream, mut r: Rng) {
+        let corrupt_at = r.below(14) as usize;
+        let chaos = r.chance(15);
+        let mut w = Wire {
+            s,
+            rng: Rng::new(r.next()),
+            sent: 0,
+            corrupt_at,
+            chaos,
+            closed: false,
+        };
+        let plugin = PLUGINS[r.below(PLUGINS.len() as u64) as usize];
+        let mut hs = handshake(plugin);
+        // Sometimes offer TLS: a client that asks for it then gets garbage instead of a TLS
+        // handshake (random bytes, a truncated record, or nothing).
+        let offer_tls = r.chance(30);
+        if offer_tls {
+            // CLIENT_SSL is bit 11, in the lower capability half at offset 1 + 12 + 4 + 8 + 1.
+            let at = 1 + "8.0.99-fake".len() + 1 + 4 + 8 + 1;
+            if let Some(b) = hs.get_mut(at + 1) {
+                *b |= 0x08;
+            }
+        }
+        if r.chance(3) {
+            // A handshake whose auth-data length has the high bit set.
+            let at = 1 + "8.0.99-fake".len() + 1 + 20;
+            if let Some(b) = hs.get_mut(at) {
+                *b = 0x80 | (r.next() as u8 & 0x07);
+            }
+        }
+        w.send(0, &hs).await;
+        let Some((_, first)) = read_packet_within(&mut w.s, WAIT).await else {
+            return;
+        };
+        if offer_tls && first.len() == 32 {
+            // An SSLRequest: answer it with something that is not TLS.
+            match r.below(3) {
+                0 => {
+                    let g = r.bytes(200);
+                    w.raw(&g).await;
+                }
+                1 => w.raw(&[0x16, 0x03, 0x03, 0xFF, 0xFF, 0x02]).await,
+                _ => {}
+            }
+            w.close().await;
+            return;
+        }
+        // Authentication: OK, fast-auth success, full auth demanded, a switch, or an error.
+        let mut seq = 2u8;
+        match r.below(6) {
+            0 | 1 => w.send(seq, OK).await,
+            2 => {
+                w.send(seq, &[0x01, 0x03]).await;
+                w.send(seq + 1, OK).await;
+            }
+            3 => w.send(seq, &[0x01, 0x04]).await,
+            4 => {
+                let mut sw = vec![0xFE];
+                sw.extend_from_slice(PLUGINS[r.below(PLUGINS.len() as u64) as usize].as_bytes());
+                sw.push(0);
+                let salt = r.bytes(40);
+                sw.extend_from_slice(&salt);
+                w.send(seq, &sw).await;
+                if read_packet_within(&mut w.s, WAIT).await.is_some() {
+                    seq += 2;
+                    if r.chance(50) {
+                        w.send(seq, &sw).await;
+                    } else {
+                        w.send(seq, OK).await;
+                    }
+                }
+            }
+            _ => {
+                let mut e = vec![0xFF, 0x15, 0x04, b'#'];
+                e.extend_from_slice(b"28000Access denied");
+                w.send(seq, &e).await;
+            }
+        }
+        // Commands, at most a dozen, then the socket closes.
+        for _ in 0..12 {
+            if w.closed {
+                return;
+            }
+            let Some((_, p)) = read_packet_within(&mut w.s, WAIT).await else {
+                return;
+            };
+            match p.first() {
+                Some(0x01) | None => break,
+                Some(0x03) if p.len() > 7 && p[1..].starts_with(b"SELECT") => {
+                    if r.chance(15) {
+                        w.send(1, OK).await;
+                    } else {
+                        result_set(&mut w, &mut r).await;
+                    }
+                }
+                _ => {
+                    if r.chance(10) {
+                        // A result set where an OK is expected.
+                        result_set(&mut w, &mut r).await;
+                    } else {
+                        w.send(1, OK).await;
+                    }
+                }
+            }
+        }
+        w.close().await;
+    }
+
+    /// How long the fake waits for the client before it hangs up: a client waiting for bytes
+    /// a corrupted packet promised is the server stalling, not the engine hanging.
+    const WAIT: Duration = Duration::from_millis(250);
+
+    static PANICS: AtomicUsize = AtomicUsize::new(0);
+    static PANIC_ITER: AtomicU64 = AtomicU64::new(u64::MAX);
+    static CURRENT_ITER: AtomicU64 = AtomicU64::new(0);
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_corrupting_server_never_panics_or_hangs_the_engine() {
+        let seed: u64 = std::env::var("VG_FUZZ_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0x5EED_2026);
+        let iters: u64 = std::env::var("VG_FUZZ_ITERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3000);
+        // Panics in tasks the engine spawns itself (kills, resets) are not joined here.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // Only this test's runtime workers run engine tasks; other tests in this binary
+            // run on their own threads, and their failures are theirs.
+            if std::thread::current().name() != Some("tokio-rt-worker") {
+                prev(info);
+                return;
+            }
+            PANICS.fetch_add(1, Ordering::SeqCst);
+            let _ = PANIC_ITER.compare_exchange(
+                u64::MAX,
+                CURRENT_ITER.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+            prev(info);
+        }));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let conns = Arc::new(AtomicU64::new(0));
+        tokio::spawn({
+            let conns = conns.clone();
+            async move {
+                while let Ok((s, _)) = listener.accept().await {
+                    let n = conns.fetch_add(1, Ordering::SeqCst);
+                    let r = Rng::new(seed ^ n.wrapping_mul(0xA24B_AED4_963E_E407));
+                    tokio::spawn(serve(s, r));
+                }
+            }
+        });
+
+        let started = std::time::Instant::now();
+        for i in 0..iters {
+            CURRENT_ITER.store(i, Ordering::SeqCst);
+            let mut rr = Rng::new(seed ^ i);
+            let cleartext = rr.chance(20);
+            let tls = rr.chance(25);
+            let task = tokio::spawn(async move {
+                let mut p = params(port, cleartext);
+                if tls {
+                    p.tls.mode = TlsMode::Require;
+                }
+                p.options.connect_timeout_secs = 3;
+                if let Ok(h) = MysqlHandle::connect(p, creds()).await {
+                    let opts = ExecOptions {
+                        timeout_ms: Some(1500),
+                        max_rows: 2,
+                        page_size: 1,
+                        read_only: i % 3 == 0,
+                    };
+                    let _ = h
+                        .execute_collect("SELECT 'trigger'", opts, CancellationToken::new())
+                        .await;
+                    let _ = h.list_databases().await;
+                    h.close().await;
+                }
+            });
+            let t0 = std::time::Instant::now();
+            let res = tokio::time::timeout(Duration::from_secs(20), task).await;
+            if std::env::var("VG_FUZZ_TRACE").is_ok() && t0.elapsed() > Duration::from_millis(500) {
+                eprintln!("fuzz: iteration {i} took {:?}", t0.elapsed());
+            }
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => panic!(
+                    "seed {seed}, iteration {i}: the engine task {}",
+                    if e.is_panic() {
+                        "panicked"
+                    } else {
+                        "was cancelled"
+                    }
+                ),
+                Err(_) => panic!("seed {seed}, iteration {i}: the engine hung"),
+            }
+            if PANICS.load(Ordering::SeqCst) > 0 {
+                panic!(
+                    "seed {seed}: a task spawned by the engine panicked during iteration {}",
+                    PANIC_ITER.load(Ordering::SeqCst)
+                );
+            }
+        }
+        // Let background kills and resets finish, then check once more.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            PANICS.load(Ordering::SeqCst),
+            0,
+            "seed {seed}: a background task panicked (iteration {})",
+            PANIC_ITER.load(Ordering::SeqCst)
+        );
+        eprintln!(
+            "fuzz: seed {seed}, {iters} iterations, {} server connections, {:?}",
+            conns.load(Ordering::SeqCst),
+            started.elapsed()
+        );
+    }
+}
+
+/// Third review, item B: an identity query that times out leaves the connection one reply
+/// behind; it must be closed, not handed out (its next statement would read the late reply).
+#[tokio::test]
+async fn a_timed_out_identity_query_closes_the_connection() {
+    let f = fake(Plan::SlowUuid, "").await;
+    let t0 = std::time::Instant::now();
+    let e = MysqlHandle::connect(params(f.port, false), creds())
+        .await
+        .err()
+        .expect("the connection is refused, not returned out of step");
+    assert!(e.to_string().contains("did not answer"), "{e}");
+    assert!(t0.elapsed() < Duration::from_secs(20));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // After the timeout nothing else was asked on that connection.
+    let seen = f.seen.lock().unwrap();
+    assert!(
+        !seen
+            .packets
+            .iter()
+            .any(|p| p.len() > 1 && p[1..].starts_with(b"SELECT @@hostname")),
+        "the next query was sent on a connection one reply behind"
+    );
+}
+
+/// Third review, item G: a database whose server answers slowly does not hold up opening
+/// another database on the same connection.
+#[tokio::test]
+async fn one_slow_database_does_not_block_another() {
+    use async_trait::async_trait;
+    use vibelens_core::connections::ConnectionManager;
+    use vibelens_core::ports::{CredentialSource, ProfileStore, TunnelHandle, TunnelProvider};
+    use vibelens_core::profiles::JsonProfileStore;
+
+    struct C;
+    #[async_trait]
+    impl CredentialSource for C {
+        async fn resolve(
+            &self,
+            _: &ConnectionProfile,
+        ) -> vibelens_core::Result<ResolvedCredentials> {
+            Ok(ResolvedCredentials {
+                username: Some("app".into()),
+                password: Some(SecretString::from(PASSWORD)),
+                ..ResolvedCredentials::anonymous()
+            })
+        }
+    }
+    struct T;
+    #[async_trait]
+    impl TunnelProvider for T {
+        async fn open(
+            &self,
+            _: &str,
+            _: &TunnelConfig,
+            _: &str,
+            _: u16,
+        ) -> vibelens_core::Result<TunnelHandle> {
+            Err(CoreError::Tunnel("none".into()))
+        }
+    }
+    let f = fake(Plan::Plain, "").await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(JsonProfileStore::new(dir.path().to_path_buf()).unwrap());
+    let mgr = ConnectionManager::new(store.clone(), Arc::new(C), Arc::new(T));
+    let p = store
+        .upsert(ConnectionProfile {
+            id: String::new(),
+            name: "fake".into(),
+            engine: EngineKind::Mysql,
+            host: "127.0.0.1".into(),
+            port: f.port,
+            database: Some("shop".into()),
+            auth: AuthMethod::Password {
+                username: "app".into(),
+            },
+            tls: TlsConfig {
+                mode: TlsMode::Disable,
+                ..Default::default()
+            },
+            tunnel: None,
+            environment: Environment::Dev,
+            ai_data_access: AiDataAccess::Results,
+            color: None,
+            pg: Default::default(),
+            valkey: Default::default(),
+            created_at: None,
+            updated_at: None,
+            iceberg: None,
+            redshift: None,
+            mysql: MysqlOptions {
+                connect_timeout_secs: 10,
+                max_pool_size: 1,
+                ..Default::default()
+            },
+        })
+        .unwrap();
+    let slow = tokio::spawn({
+        let (mgr, id) = (mgr.clone(), p.id.clone());
+        async move { mgr.mysql(&id, Some("slow_db")).await.map(|_| ()) }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let t0 = std::time::Instant::now();
+    mgr.mysql(&p.id, Some("fast_db")).await.expect("fast");
+    assert!(
+        t0.elapsed() < Duration::from_millis(1500),
+        "waited for the slow database: {:?}",
+        t0.elapsed()
+    );
+    assert!(
+        !slow.is_finished(),
+        "precondition: the slow one is still dialing"
+    );
+    slow.await.unwrap().expect("slow eventually connects");
+    assert_eq!(mgr.mysql_pool_count(&p.id), 2);
+}

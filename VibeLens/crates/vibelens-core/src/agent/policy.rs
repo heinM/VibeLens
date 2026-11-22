@@ -24,12 +24,23 @@
 //! | valkey write | denied | approval (result withheld) | approval | approval |
 //! | list_connections, list_files, read_file | safe | safe | safe | safe |
 //! | write_file | approval | approval | approval | approval |
+//!
+//! MySQL connections get the Postgres semantics with MySQL's own classifier
+//! (`mysql::classify`, `mysql::check_read_only`), and some statements are refused at every
+//! access level, even with approval (`mysql::agent_refusal`: files on the server, server
+//! configuration, KILL, plugins and loadable functions, USE, DELIMITER, executable comments).
+//! The approval card names the host, port and user.
+//!
+//! Amazon Redshift connections get the Postgres semantics, with two differences: transaction
+//! control (`BEGIN`, `COMMIT`, …) is refused outright, because the Data API commits each statement
+//! on its own; and the approval card names the cluster or workgroup, database and region.
 
 use super::tools::ToolCall;
 use crate::model::{
-    AiDataAccess, ConnectionProfile, EngineKind, Environment, IcebergQueryEngine, ToolRisk,
+    AiDataAccess, ApprovalTarget, ConnectionProfile, EngineKind, Environment, IcebergQueryEngine,
+    RedshiftOptions, ToolRisk, effective_database,
 };
-use crate::sql::{SqlClassification, StatementClass, classify};
+use crate::sql::{SqlClassification, StatementClass};
 
 /// The facts about a connection that policy needs. Never includes host or credentials.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +52,30 @@ pub(super) struct ProfileFacts {
     /// Iceberg connection whose SQL runs on Amazon Athena (billed per TB scanned, full DML)
     /// rather than the embedded engine (append-only). `false` for every other engine.
     pub athena: bool,
+    /// Iceberg connection whose SQL runs on Trino or Spark: where, as
+    /// `remote::config::engine_target` names it (engine, endpoint host and port, catalog; no
+    /// credentials). Shown in approval text. `None` for every other engine.
+    pub remote_engine: Option<String>,
+    /// Iceberg connection on Trino or Spark: its engine (whose own read-only check corrects
+    /// the PostgreSQL classifier, see `remote::classify_on`) and the approval card's detail
+    /// line. `None` for every other engine.
+    pub remote: Option<RemoteFacts>,
+    /// The profile's configured database (Postgres and Redshift; `None` when unset or another
+    /// engine). Always resolved through [`effective_database`], the rule execution uses.
+    pub database: Option<String>,
+    /// Redshift connection options (cluster or workgroup, region; identifiers, no secret), for
+    /// the approval card's target line. `None` for every other engine.
+    pub redshift: Option<RedshiftOptions>,
+    /// MySQL connection: the approval card's detail line (`MySQL · host:port · as user`, from
+    /// the profile). `None` for every other engine.
+    pub mysql_detail: Option<String>,
+}
+
+/// See [`ProfileFacts::remote`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RemoteFacts {
+    pub engine: IcebergQueryEngine,
+    pub detail: Option<String>,
 }
 
 impl From<&ConnectionProfile> for ProfileFacts {
@@ -54,7 +89,119 @@ impl From<&ConnectionProfile> for ProfileFacts {
                 && p.iceberg
                     .as_ref()
                     .is_some_and(|o| matches!(o.query_engine, IcebergQueryEngine::Athena { .. })),
+            remote_engine: p
+                .iceberg
+                .as_ref()
+                .filter(|_| p.engine == EngineKind::Iceberg)
+                .and_then(|o| crate::remote::config::engine_target(&o.query_engine)),
+            remote: p
+                .iceberg
+                .as_ref()
+                .filter(|o| {
+                    p.engine == EngineKind::Iceberg
+                        && matches!(
+                            o.query_engine,
+                            IcebergQueryEngine::Trino { .. } | IcebergQueryEngine::Spark { .. }
+                        )
+                })
+                .map(|o| RemoteFacts {
+                    engine: o.query_engine.clone(),
+                    detail: crate::remote::config::engine_detail(o),
+                }),
+            database: match p.engine {
+                EngineKind::Redshift => p.redshift.as_ref().map(|o| o.database.clone()),
+                _ => p
+                    .database
+                    .clone()
+                    .filter(|_| matches!(p.engine, EngineKind::Postgres | EngineKind::Mysql)),
+            },
+            redshift: p
+                .redshift
+                .clone()
+                .filter(|_| p.engine == EngineKind::Redshift),
+            mysql_detail: (p.engine == EngineKind::Mysql).then(|| crate::mysql::approval_detail(p)),
         }
+    }
+}
+
+/// Where `call` will run, for the approval card's fixed header: the connection, its environment
+/// and the Postgres database or Valkey db number. The model chooses the database and the db
+/// number, so they are resolved here exactly as execution resolves them
+/// ([`effective_database`]) and shown apart from anything the model wrote. `None` for tools
+/// that touch no connection.
+pub(super) fn approval_target(call: &ToolCall, f: &ProfileFacts) -> Option<ApprovalTarget> {
+    call.profile_id()?;
+    // Redshift resolves its database with the same rule (the profile's database is never empty).
+    let postgres = has_databases(f.engine);
+    let requested = match call {
+        ToolCall::RunSql { database, .. }
+        | ToolCall::GetSchema { database, .. }
+        | ToolCall::DescribeTable { database, .. } => database.as_deref(),
+        _ => None,
+    };
+    let valkey_db = match call {
+        ToolCall::ValkeyScan { db, .. }
+        | ToolCall::ValkeyGet { db, .. }
+        | ToolCall::ValkeyCommand { db, .. } => Some(*db),
+        _ => None,
+    };
+    Some(ApprovalTarget {
+        connection: f.name.clone(),
+        engine: f.engine,
+        environment: f.environment,
+        database: postgres.then(|| effective_database(f.database.as_deref(), requested)),
+        default_database: postgres.then(|| effective_database(f.database.as_deref(), None)),
+        valkey_db: valkey_db.filter(|_| f.engine == EngineKind::Valkey),
+        // Redshift: cluster or workgroup, the database this call resolves to, region and who it
+        // runs as. Trino and Spark: endpoint, catalog, namespace and acting user.
+        detail: match &f.redshift {
+            Some(o) => Some(crate::redshift::approval_detail(o, requested)),
+            None => f
+                .mysql_detail
+                .clone()
+                .or_else(|| f.remote.as_ref().and_then(|r| r.detail.clone())),
+        },
+    })
+}
+
+/// Engines whose connections hold several databases chosen with the `database` argument.
+fn has_databases(e: EngineKind) -> bool {
+    matches!(
+        e,
+        EngineKind::Postgres | EngineKind::Redshift | EngineKind::Mysql
+    )
+}
+
+/// `'orders-db', database 'payments' (not this connection's default database 'shop')` for
+/// Postgres, just the quoted connection name for Iceberg (which has no database to choose).
+fn sql_target_text(f: &ProfileFacts, requested: Option<&str>) -> String {
+    if let Some(remote) = &f.remote_engine {
+        return format!("'{}' ({remote})", f.name);
+    }
+    if !has_databases(f.engine) {
+        return format!("'{}'", f.name);
+    }
+    let database = effective_database(f.database.as_deref(), requested);
+    let default = effective_database(f.database.as_deref(), None);
+    if let Some(o) = &f.redshift {
+        // `Redshift · {cluster or workgroup} · {database} · {region}`, from the profile.
+        let target = crate::redshift::describe_target(o, &database);
+        return if database == default {
+            format!("'{}' ({target})", f.name)
+        } else {
+            format!(
+                "'{}' ({target}; not this connection's default database '{default}')",
+                f.name
+            )
+        };
+    }
+    if database == default {
+        format!("'{}', database '{database}'", f.name)
+    } else {
+        format!(
+            "'{}', database '{database}' (not this connection's default database '{default}')",
+            f.name
+        )
     }
 }
 
@@ -127,7 +274,6 @@ fn prod_prefix(f: &ProfileFacts) -> String {
 /// Valkey commands that are never allowed from the agent, at any access level.
 fn valkey_blocked(argv: &[String]) -> Option<&'static str> {
     let cmd = argv.first()?.to_ascii_uppercase();
-    let has = |word: &str| argv.iter().skip(1).any(|a| a.eq_ignore_ascii_case(word));
     Some(match cmd.as_str() {
         "KEYS" => "KEYS blocks the server on large keyspaces; use valkey_scan instead",
         "CONFIG" | "ACL" | "DEBUG" | "MODULE" | "SLOWLOG" | "LATENCY" => {
@@ -142,9 +288,10 @@ fn valkey_blocked(argv: &[String]) -> Option<&'static str> {
         "SUBSCRIBE" | "PSUBSCRIBE" | "SSUBSCRIBE" | "MONITOR" | "SYNC" | "PSYNC" => {
             "streaming commands would hang the connection"
         }
-        "BLPOP" | "BRPOP" | "BRPOPLPUSH" | "BLMOVE" | "BLMPOP" | "BZPOPMIN" | "BZPOPMAX"
-        | "BZMPOP" | "WAIT" | "WAITAOF" => "blocking commands would hang the connection",
-        "XREAD" | "XREADGROUP" if has("BLOCK") => "blocking commands would hang the connection",
+        // The list is the Valkey module's: the console refuses the same commands.
+        _ if crate::valkey::is_blocking_command(argv) => {
+            "blocking commands would hang the connection"
+        }
         "SHUTDOWN" | "REPLICAOF" | "SLAVEOF" | "FAILOVER" | "MIGRATE" | "SAVE" | "BGSAVE"
         | "BGREWRITEAOF" => "server administration is not available to the agent",
         _ => return None,
@@ -227,9 +374,11 @@ pub(super) fn assess(
             return Assessment::safe();
         }
         ToolCall::WriteFile { path, .. } => {
+            // The diff, and what it leaves out, are added where the file is read (session.rs).
             return Assessment::approval(
                 format!(
-                    "The agent wants to create or overwrite '{path}' in your workspace. Review the diff before approving."
+                    "The agent wants to create or overwrite '{}' in your workspace. Review the diff before approving.",
+                    super::diff::visible(path)
                 ),
                 None,
             );
@@ -244,10 +393,28 @@ pub(super) fn assess(
     if f.access == AiDataAccess::None {
         return access_none(&f.name);
     }
-    // The SQL tools serve every SQL engine (Postgres, Iceberg); the rest are Valkey-only.
+    // The SQL tools serve every SQL engine (Postgres, Iceberg, Redshift); list_databases only
+    // those with databases to choose from; the rest are Valkey-only.
+    if matches!(call, ToolCall::ListDatabases { .. }) && !has_databases(f.engine) {
+        let hint = match f.engine {
+            EngineKind::Iceberg => "it has namespaces, not databases: use get_schema to list them",
+            _ => "use valkey_scan, valkey_get or valkey_command for it",
+        };
+        return Assessment::denied(format!(
+            "list_databases works on Postgres, MySQL and Redshift connections; '{}' is not one: {hint}",
+            f.name
+        ));
+    }
     let engine_fits = match call {
+        ToolCall::ListDatabases { .. } => true,
         ToolCall::GetSchema { .. } | ToolCall::DescribeTable { .. } | ToolCall::RunSql { .. } => {
-            matches!(f.engine, EngineKind::Postgres | EngineKind::Iceberg)
+            matches!(
+                f.engine,
+                EngineKind::Postgres
+                    | EngineKind::Iceberg
+                    | EngineKind::Redshift
+                    | EngineKind::Mysql
+            )
         }
         _ => f.engine == EngineKind::Valkey,
     };
@@ -256,6 +423,8 @@ pub(super) fn assess(
             EngineKind::Postgres => ("a Postgres", "use run_sql, get_schema or describe_table"),
             EngineKind::Valkey => ("a Valkey", "use valkey_scan, valkey_get or valkey_command"),
             EngineKind::Iceberg => ("an Iceberg", "use run_sql, get_schema or describe_table"),
+            EngineKind::Redshift => ("a Redshift", "use run_sql, get_schema or describe_table"),
+            EngineKind::Mysql => ("a MySQL", "use run_sql, get_schema or describe_table"),
         };
         return Assessment::denied(format!(
             "connection '{}' is {have} connection; {hint} for it",
@@ -264,18 +433,26 @@ pub(super) fn assess(
     }
 
     match call {
-        ToolCall::GetSchema { .. } | ToolCall::ValkeyScan { .. } => Assessment::safe(),
+        // Names only, like the schema listing: structure, never data.
+        ToolCall::ListDatabases { .. }
+        | ToolCall::GetSchema { .. }
+        | ToolCall::ValkeyScan { .. } => Assessment::safe(),
         // Column defaults and index predicates can hold literal values.
         ToolCall::DescribeTable { .. } => Assessment {
             redact_values: f.access != AiDataAccess::Results,
             ..Assessment::safe()
         },
-        ToolCall::RunSql { sql, purpose, .. } => assess_sql(f, sql, purpose),
-        ToolCall::ValkeyGet { key, .. } => match f.access {
+        ToolCall::RunSql {
+            database,
+            sql,
+            purpose,
+            ..
+        } => assess_sql(f, database.as_deref(), sql, purpose),
+        ToolCall::ValkeyGet { db, key, .. } => match f.access {
             AiDataAccess::Results => Assessment::safe(),
             AiDataAccess::ResultsWithApproval => Assessment::approval(
                 format!(
-                    "Reading the value of '{key}' on '{}' sends stored data to the LLM provider; this connection requires approval for that.",
+                    "Reading the value of '{key}' on '{}' (db {db}) sends stored data to the LLM provider; this connection requires approval for that.",
                     f.name
                 ),
                 Some(format!("GET {key}")),
@@ -285,13 +462,31 @@ pub(super) fn assess(
                 f.name
             )),
         },
-        ToolCall::ValkeyCommand { argv, .. } => assess_valkey_command(f, argv, valkey_write),
+        ToolCall::ValkeyCommand { db, argv, .. } => {
+            assess_valkey_command(f, *db, argv, valkey_write)
+        }
         // Handled above.
         ToolCall::ListConnections
         | ToolCall::ListFiles
         | ToolCall::ReadFile { .. }
         | ToolCall::WriteFile { .. } => Assessment::safe(),
     }
+}
+
+/// Redshift runs every statement of a script in its own Data API session, so `SET`/`RESET` lasts
+/// only for itself: alone it does nothing, and in a script it does not apply to the statements
+/// after it. Either way the call is denied with advice that works on Redshift.
+fn redshift_session_statements(sql: &str) -> Option<Assessment> {
+    let c = crate::sql::classify(sql);
+    if !c.statements.contains(&StatementClass::Session) {
+        return None;
+    }
+    Some(Assessment::denied(
+        "on Redshift, SET and RESET last only for their own statement: the Data API runs each \
+         statement of a script in its own session, so a setting never applies to the next \
+         statement. Leave them out and qualify names instead (schema.table rather than a \
+         search_path); there is no SET LOCAL or BEGIN … COMMIT to wrap them in.",
+    ))
 }
 
 /// Extra approval-card text for Iceberg statements that change something.
@@ -302,7 +497,8 @@ fn iceberg_write_note(f: &ProfileFacts, c: &SqlClassification) -> String {
     let mut note = String::from(" Iceberg writes create a new table snapshot.");
     if f.athena {
         note.push_str(" Athena is billed per TB scanned.");
-    } else {
+    } else if f.remote_engine.is_none() {
+        // The embedded engine; Trino and Spark run full DML on Iceberg.
         let summary = c.summary.to_ascii_uppercase();
         if ["UPDATE", "DELETE", "MERGE"]
             .iter()
@@ -316,17 +512,67 @@ fn iceberg_write_note(f: &ProfileFacts, c: &SqlClassification) -> String {
     note
 }
 
-fn assess_sql(f: &ProfileFacts, sql: &str, purpose: &str) -> Assessment {
-    let c = classify(sql);
+/// `database` is what the model asked for; the reason names the database that results from it.
+/// The target always comes before the statement summary and the model's `purpose`, so neither
+/// can push it out of view. The preview is exactly the text that is executed.
+fn assess_sql(f: &ProfileFacts, database: Option<&str>, sql: &str, purpose: &str) -> Assessment {
+    // The engine refuses these too; refusing here tells the model why before the user is asked,
+    // and keeps the classification below honest (a backslash in a literal means Redshift and the
+    // classifier would read the statement differently).
+    if f.engine == EngineKind::Redshift {
+        if let Err(e) = crate::redshift::check_script(sql) {
+            return Assessment::denied(e.to_string());
+        }
+        if let Some(denied) = redshift_session_statements(sql) {
+            return denied;
+        }
+    }
+    // MySQL: what reaches outside the database, or would read differently on the card than it
+    // runs, is refused at every access level; everything else is classified by MySQL's rules.
+    if f.engine == EngineKind::Mysql
+        && let Some(why) = crate::mysql::agent_refusal(sql)
+    {
+        return Assessment::denied(format!(
+            "{why}. This is not available to the agent on MySQL"
+        ));
+    }
+    let (mut c, engine_refusal) = if f.engine == EngineKind::Mysql {
+        (crate::mysql::classify(sql), None)
+    } else {
+        crate::remote::classify_on_explained(f.remote.as_ref().map(|r| &r.engine), sql)
+    };
+    // A statement the PostgreSQL classifier calls a read but the Trino or Spark read-only check
+    // refuses (`java_method(…)`, `TABLE(pg.system.query(…))`) is refused outright with the
+    // engine's reason. Asking for approval instead would run it with read_only = false, which
+    // skips that very check.
+    if let Some(reason) = engine_refusal {
+        return Assessment::denied(format!(
+            "{reason}. This connection's query engine refuses it in a read-only run, and the agent \
+             does not run it as a write either"
+        ));
+    }
+    // A Redshift query that calls a function that is not a read-only built-in is not run
+    // read-only (the engine would refuse it): it is shown for approval like any unverified
+    // statement.
+    if f.engine == EngineKind::Redshift
+        && c.overall == StatementClass::ReadOnly
+        && let Some(func) = crate::redshift::unknown_function(sql)
+    {
+        c.overall = StatementClass::Unknown;
+        c.summary = format!(
+            "{} (calls {func}, not a read-only Redshift built-in)",
+            c.summary
+        );
+    }
     let preview = Some(sql.to_string());
+    let target = sql_target_text(f, database);
     match c.overall {
         StatementClass::ReadOnly => match f.access {
             AiDataAccess::Results => Assessment::safe(),
             AiDataAccess::ResultsWithApproval => Assessment::approval(
                 format!(
-                    "Read-only query ({}) on '{}'. The rows it returns will be sent to the LLM provider.{} Purpose: {purpose}",
+                    "Read-only query on {target} ({}). The rows it returns will be sent to the LLM provider.{} Purpose: {purpose}",
                     c.summary,
-                    f.name,
                     if f.athena {
                         " Athena is billed per TB scanned."
                     } else {
@@ -344,6 +590,9 @@ fn assess_sql(f: &ProfileFacts, sql: &str, purpose: &str) -> Assessment {
         StatementClass::Session if c.statements.iter().all(|s| *s == StatementClass::Session) => {
             Assessment::denied(if f.engine == EngineKind::Iceberg {
                 "session-only statements (SET, BEGIN, COMMIT, RESET …) have no lasting effect because each run_sql call uses its own session."
+            } else if f.engine == EngineKind::Mysql {
+                "session-only statements (SET, START TRANSACTION, COMMIT, LOCK TABLES …) have no lasting effect because each run_sql call uses its own session. \
+             To change a setting for one query, send it in the same script, e.g. `SET SESSION sort_buffer_size = 1048576; SELECT …`."
             } else {
                 "session-only statements (SET, BEGIN, COMMIT, RESET …) have no lasting effect because each run_sql call uses its own session. \
              To change a setting for one query, send it in the same script, e.g. `SET LOCAL statement_timeout = '5s'; SELECT …` inside BEGIN … COMMIT."
@@ -366,13 +615,15 @@ fn assess_sql(f: &ProfileFacts, sql: &str, purpose: &str) -> Assessment {
             };
             let note = if class == StatementClass::Session {
                 String::new()
+            } else if f.engine == EngineKind::Redshift {
+                " Redshift commits each statement on its own: a failure part-way leaves the earlier statements applied.".to_string()
             } else {
                 iceberg_write_note(f, &c)
             };
             Assessment::approval(
                 format!(
-                    "{prefix}{what} on '{}': {}{parse_note}.{note} Purpose: {purpose}",
-                    f.name, c.summary
+                    "{prefix}{what} on {target}: {}{parse_note}.{note} Purpose: {purpose}",
+                    c.summary
                 ),
                 preview,
             )
@@ -383,6 +634,7 @@ fn assess_sql(f: &ProfileFacts, sql: &str, purpose: &str) -> Assessment {
 
 fn assess_valkey_command(
     f: &ProfileFacts,
+    db: u8,
     argv: &[String],
     backend_says_write: bool,
 ) -> Assessment {
@@ -398,7 +650,7 @@ fn assess_valkey_command(
         let prefix = prod_prefix(f);
         return Assessment::approval(
             format!(
-                "{prefix}This command modifies data or runs code on '{}': {}",
+                "{prefix}This command modifies data or runs code on '{}' (db {db}): {}",
                 f.name,
                 command_line(argv)
             ),
@@ -413,7 +665,7 @@ fn assess_valkey_command(
         AiDataAccess::Results => Assessment::safe(),
         AiDataAccess::ResultsWithApproval => Assessment::approval(
             format!(
-                "Read command on '{}' returns stored values, which will be sent to the LLM provider: {}",
+                "Read command on '{}' (db {db}) returns stored values, which will be sent to the LLM provider: {}",
                 f.name,
                 command_line(argv)
             ),
@@ -439,6 +691,11 @@ mod tests {
             environment: env,
             access,
             athena: false,
+            remote_engine: None,
+            remote: None,
+            mysql_detail: None,
+            database: Some("shop".into()),
+            redshift: None,
         }
     }
     fn ice(access: AiDataAccess, env: Environment, athena: bool) -> ProfileFacts {
@@ -448,6 +705,11 @@ mod tests {
             environment: env,
             access,
             athena,
+            remote_engine: None,
+            remote: None,
+            mysql_detail: None,
+            database: None,
+            redshift: None,
         }
     }
     fn vk(access: AiDataAccess, env: Environment) -> ProfileFacts {
@@ -457,6 +719,36 @@ mod tests {
             environment: env,
             access,
             athena: false,
+            remote_engine: None,
+            remote: None,
+            mysql_detail: None,
+            database: None,
+            redshift: None,
+        }
+    }
+    fn rs(access: AiDataAccess, env: Environment) -> ProfileFacts {
+        use crate::model::{AwsIdentity, AwsTarget, RedshiftAuth, RedshiftTarget};
+        ProfileFacts {
+            name: "warehouse".into(),
+            engine: EngineKind::Redshift,
+            environment: env,
+            access,
+            athena: false,
+            remote_engine: None,
+            remote: None,
+            mysql_detail: None,
+            database: Some("dev".into()),
+            redshift: Some(RedshiftOptions {
+                target: RedshiftTarget::Serverless {
+                    workgroup_name: "analytics-wg".into(),
+                },
+                database: "dev".into(),
+                aws: AwsTarget {
+                    identity: AwsIdentity::DefaultChain,
+                    region: "eu-west-1".into(),
+                },
+                auth: RedshiftAuth::IamIdentity,
+            }),
         }
     }
     fn sql(s: &str) -> ToolCall {
@@ -758,6 +1050,38 @@ mod tests {
             false,
         );
         assert_eq!(r.risk, Denied);
+    }
+
+    #[test]
+    fn list_databases_is_safe_on_sql_servers_at_every_level_except_none() {
+        let call = ToolCall::ListDatabases {
+            profile_id: "p".into(),
+        };
+        for env in ENVS {
+            for a in [SchemaOnly, ResultsWithApproval, Results] {
+                for f in [pg(a, env), rs(a, env)] {
+                    let v = assess(&call, Some(&f), false);
+                    assert_eq!(v.risk, Safe, "{a:?} {env:?} {:?}", f.engine);
+                    assert!(!v.allow_write && !v.redact_values);
+                }
+            }
+            for f in [pg(NOTHING, env), rs(NOTHING, env)] {
+                let v = assess(&call, Some(&f), false);
+                assert_eq!(v.risk, Denied);
+                assert!(v.reason.unwrap().contains("aiDataAccess = none"));
+            }
+        }
+        let iceberg = assess(&call, Some(&ice(Results, Environment::Dev, false)), false);
+        assert_eq!(iceberg.risk, Denied);
+        assert!(iceberg.reason.unwrap().contains("get_schema"));
+        let valkey = assess(&call, Some(&vk(Results, Environment::Dev)), false);
+        assert_eq!(valkey.risk, Denied);
+        assert!(valkey.reason.unwrap().contains("valkey_scan"));
+        assert_eq!(
+            assess(&call, None, false).risk,
+            Denied,
+            "unknown connection"
+        );
     }
 
     #[test]
@@ -1270,6 +1594,8 @@ mod tests {
                 query_engine: IcebergQueryEngine::Local,
                 default_namespace: None,
             }),
+            redshift: None,
+            mysql: Default::default(),
         };
         assert!(!ProfileFacts::from(&p).athena);
         p.iceberg.as_mut().unwrap().query_engine = IcebergQueryEngine::Athena {
@@ -1281,6 +1607,326 @@ mod tests {
         assert!(f.athena && f.engine == EngineKind::Iceberg);
         // The facts never carry catalog details.
         assert!(!format!("{f:?}").contains("sqlite"));
+        assert_eq!(f.remote_engine, None);
+
+        // Trino and Spark: the approval text names engine, endpoint host and catalog (never a
+        // credential), has no per-TB note, and does not send the user to Athena for DML.
+        p.iceberg.as_mut().unwrap().query_engine = IcebergQueryEngine::Trino {
+            url: "https://trino.example:8443/".into(),
+            catalog: "lake".into(),
+            user: "ana".into(),
+            auth: crate::model::HttpEngineAuth::Basic {
+                username: "ana".into(),
+            },
+            ca_cert_path: None,
+        };
+        let f = ProfileFacts::from(&p);
+        assert!(!f.athena);
+        assert_eq!(
+            f.remote_engine.as_deref(),
+            Some("Trino at trino.example:8443, catalog 'lake'")
+        );
+        for s in ["delete from shop.t where id = 1", "select 1"] {
+            let mut g = f.clone();
+            g.access = ResultsWithApproval;
+            let r = assess(&sql(s), Some(&g), false).reason.unwrap();
+            assert!(
+                r.contains("'lake' (Trino at trino.example:8443, catalog 'lake')")
+                    && !r.contains("billed")
+                    && !r.contains("need an Athena")
+                    && !r.contains("ana"),
+                "{r}"
+            );
+        }
+        p.iceberg.as_mut().unwrap().query_engine = IcebergQueryEngine::Spark {
+            url: "https://livy.example".into(),
+            catalog: "glue".into(),
+            auth: crate::model::HttpEngineAuth::None,
+            ca_cert_path: None,
+            proxy_user: None,
+            session_conf: Default::default(),
+            session_start_timeout_secs: None,
+        };
+        assert_eq!(
+            ProfileFacts::from(&p).remote_engine.as_deref(),
+            Some("Spark (Livy) at livy.example, catalog 'glue'")
+        );
+
+        // Audit 2026-11-21, item 14: the approval card's detail line names engine, endpoint,
+        // catalog and namespace, never a credential.
+        p.iceberg.as_mut().unwrap().default_namespace = Some("shop".into());
+        let mut f = ProfileFacts::from(&p);
+        let t = approval_target(&sql("select 1"), &f).unwrap();
+        assert_eq!(
+            t.detail.as_deref(),
+            Some("Spark (Livy) · livy.example:443 · catalog glue · namespace shop")
+        );
+
+        // Item 13: Spark SQL the PostgreSQL parser cannot read is judged by the engine's own
+        // check. Without it an ordinary read showed a "may do anything" card and, once
+        // approved, ran with read_only = false, skipping the Spark scan.
+        f.access = Results;
+        for s in [
+            "SELECT `id` FROM lake.shop.orders VERSION AS OF 1 LIMIT 10",
+            "SHOW TABLES IN lake.shop",
+        ] {
+            let r = assess(&sql(s), Some(&f), false);
+            assert_eq!(r.risk, Safe, "{s}: {r:?}");
+        }
+        for s in [
+            // The PostgreSQL classifier calls this a read: it runs read-only, where the
+            // Spark check refuses it before submission (remote_spark tests).
+            "SELECT reflect('java.lang.Runtime', 'getRuntime')",
+            // Unknown to both: approval, as before.
+            "SELECT * FROM text.`/etc/passwd`",
+        ] {
+            let r = assess(&sql(s), Some(&f), false);
+            assert!(r.risk != Safe || !r.allow_write, "{s}: {r:?}");
+        }
+        // Re-audit item 6: a PostgreSQL "read" the Spark check refuses is refused outright with
+        // the engine's reason; approving it would run it with read_only = false and skip the
+        // check.
+        for s in [
+            "SELECT java_method('java.lang.Runtime', 'getRuntime')",
+            "SELECT reflect('java.lang.Runtime', 'getRuntime')",
+        ] {
+            let r = assess(&sql(s), Some(&f), false);
+            assert_eq!(r.risk, Denied, "{s}: {r:?}");
+            assert!(r.reason.unwrap().contains("read-only run"), "{s}");
+        }
+        for s in [
+            "DELETE FROM lake.shop.orders",
+            "INSERT INTO t SELECT * FROM `x`",
+        ] {
+            let r = assess(&sql(s), Some(&f), false);
+            assert_eq!(r.risk, NeedsApproval, "{s}");
+        }
+        // Never the other way round: a write the PostgreSQL classifier sees stays a write.
+        let r = assess(&sql("DELETE FROM t"), Some(&f), false);
+        assert!(r.allow_write && r.risk == NeedsApproval);
+
+        // Trino: same, with Athena's check.
+        p.iceberg.as_mut().unwrap().query_engine = IcebergQueryEngine::Trino {
+            url: "https://trino.example/".into(),
+            catalog: "lake".into(),
+            user: "ana".into(),
+            auth: crate::model::HttpEngineAuth::None,
+            ca_cert_path: None,
+        };
+        let mut f = ProfileFacts::from(&p);
+        f.access = Results;
+        let r = assess(
+            &sql("SELECT * FROM shop.orders FOR VERSION AS OF 1 LIMIT 5"),
+            Some(&f),
+            false,
+        );
+        assert_eq!(r.risk, Safe, "{r:?}");
+    }
+
+    // ---- The target the user approves (review finding M3) --------------------------------
+
+    fn sql_on(database: Option<&str>, s: &str) -> ToolCall {
+        ToolCall::RunSql {
+            profile_id: "p".into(),
+            database: database.map(String::from),
+            sql: s.into(),
+            purpose: "testing".into(),
+        }
+    }
+
+    /// The model chooses the database, so the approval text must name the one that will be used.
+    #[test]
+    fn sql_approval_reason_names_the_database_the_statement_runs_against() {
+        for (access, s) in [
+            (Results, "delete from t"),
+            (ResultsWithApproval, "select * from t"),
+        ] {
+            let r = assess(
+                &sql_on(Some("payments_prod"), s),
+                Some(&pg(access, Environment::Dev)),
+                false,
+            );
+            assert_eq!(r.risk, NeedsApproval, "{s}");
+            let reason = r.reason.unwrap();
+            assert!(reason.contains("payments_prod"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn sql_approval_reason_says_when_the_database_is_not_the_default() {
+        let facts = pg(Results, Environment::Prod);
+        let reason = |database: Option<&str>| {
+            assess(&sql_on(database, "delete from t"), Some(&facts), false)
+                .reason
+                .unwrap()
+        };
+        // Named or not, the connection's own database is shown without a warning.
+        for same in [None, Some("shop"), Some("  "), Some(" shop ")] {
+            let r = reason(same);
+            assert!(r.contains("on 'orders-db', database 'shop':"), "{r}");
+            assert!(!r.contains("not this connection's default"), "{r}");
+        }
+        let r = reason(Some("payments_prod"));
+        assert!(
+            r.contains(
+                "on 'orders-db', database 'payments_prod' (not this connection's default database 'shop'):"
+            ),
+            "{r}"
+        );
+        // The target comes before the statement summary and the model's purpose.
+        let (target_at, summary_at, purpose_at) = (
+            r.find("payments_prod").unwrap(),
+            r.find("1 statement").unwrap(),
+            r.find("Purpose:").unwrap(),
+        );
+        assert!(target_at < summary_at && summary_at < purpose_at, "{r}");
+
+        // A profile with no database set runs on `postgres`, like the connection manager.
+        let unset = ProfileFacts {
+            database: None,
+            ..pg(Results, Environment::Dev)
+        };
+        let r = assess(&sql_on(None, "delete from t"), Some(&unset), false)
+            .reason
+            .unwrap();
+        assert!(r.contains("database 'postgres'"), "{r}");
+        // Iceberg has no database to choose; the argument is ignored there.
+        let r = assess(
+            &sql_on(Some("ignored"), "insert into shop.t values (1)"),
+            Some(&ice(Results, Environment::Dev, false)),
+            false,
+        )
+        .reason
+        .unwrap();
+        assert!(r.contains("on 'lake':") && !r.contains("ignored"), "{r}");
+    }
+
+    #[test]
+    fn approval_target_resolves_the_database_like_execution() {
+        let facts = pg(Results, Environment::Staging);
+        let t = approval_target(&sql_on(Some("payments_prod"), "select 1"), &facts).unwrap();
+        assert_eq!(
+            t,
+            ApprovalTarget {
+                connection: "orders-db".into(),
+                engine: EngineKind::Postgres,
+                environment: Environment::Staging,
+                database: Some("payments_prod".into()),
+                default_database: Some("shop".into()),
+                valkey_db: None,
+                detail: None,
+            }
+        );
+        let t = approval_target(&sql_on(None, "select 1"), &facts).unwrap();
+        assert_eq!(t.database.as_deref(), Some("shop"));
+        assert_eq!(t.database, t.default_database);
+
+        // Same rule as `ConnectionProfile::effective_database`, for every combination.
+        for configured in [None, Some("shop"), Some(""), Some("  ")] {
+            for requested in [None, Some("other"), Some(""), Some(" other ")] {
+                let facts = ProfileFacts {
+                    database: configured.map(String::from),
+                    ..pg(Results, Environment::Dev)
+                };
+                let t = approval_target(&sql_on(requested, "select 1"), &facts).unwrap();
+                assert_eq!(
+                    t.database,
+                    Some(effective_database(configured, requested)),
+                    "{configured:?} / {requested:?}"
+                );
+            }
+        }
+
+        let v = approval_target(
+            &ToolCall::ValkeyCommand {
+                profile_id: "v".into(),
+                db: 3,
+                argv: vec!["DEL".into(), "k".into()],
+            },
+            &vk(Results, Environment::Prod),
+        )
+        .unwrap();
+        assert_eq!((v.valkey_db, v.database.as_deref()), (Some(3), None));
+        assert_eq!(v.environment, Environment::Prod);
+
+        let i = approval_target(
+            &sql_on(Some("ignored"), "select 1"),
+            &ice(Results, Environment::Dev, true),
+        )
+        .unwrap();
+        assert_eq!(
+            (i.database, i.default_database, i.valkey_db),
+            (None, None, None)
+        );
+
+        // Workspace tools touch no connection.
+        let w = ToolCall::WriteFile {
+            path: "a.sql".into(),
+            contents: "x".into(),
+        };
+        assert!(approval_target(&w, &facts).is_none());
+    }
+
+    #[test]
+    fn facts_carry_the_configured_database_for_postgres_only() {
+        let mut p = ConnectionProfile {
+            id: "p".into(),
+            name: "orders-db".into(),
+            engine: EngineKind::Postgres,
+            host: "h".into(),
+            port: 5432,
+            database: Some("shop".into()),
+            auth: crate::model::AuthMethod::None,
+            tls: Default::default(),
+            tunnel: None,
+            environment: Environment::Dev,
+            ai_data_access: Results,
+            color: None,
+            pg: Default::default(),
+            valkey: Default::default(),
+            created_at: None,
+            updated_at: None,
+            iceberg: None,
+            redshift: None,
+            mysql: Default::default(),
+        };
+        assert_eq!(ProfileFacts::from(&p).database.as_deref(), Some("shop"));
+        p.engine = EngineKind::Valkey;
+        assert_eq!(ProfileFacts::from(&p).database, None);
+    }
+
+    #[test]
+    fn valkey_approval_reason_names_the_logical_database() {
+        let on_db3 = |argv: &[&str]| ToolCall::ValkeyCommand {
+            profile_id: "v".into(),
+            db: 3,
+            argv: argv.iter().map(|s| s.to_string()).collect(),
+        };
+        let write = assess(
+            &on_db3(&["DEL", "k"]),
+            Some(&vk(Results, Environment::Dev)),
+            true,
+        );
+        assert!(
+            write.reason.as_deref().unwrap().contains("db 3"),
+            "{write:?}"
+        );
+        let read = assess(
+            &on_db3(&["HGETALL", "h"]),
+            Some(&vk(ResultsWithApproval, Environment::Dev)),
+            false,
+        );
+        assert!(read.reason.as_deref().unwrap().contains("db 3"), "{read:?}");
+        let get = assess(
+            &ToolCall::ValkeyGet {
+                profile_id: "v".into(),
+                db: 3,
+                key: "k".into(),
+            },
+            Some(&vk(ResultsWithApproval, Environment::Dev)),
+            false,
+        );
+        assert!(get.reason.as_deref().unwrap().contains("db 3"), "{get:?}");
     }
 
     #[test]
@@ -1316,5 +1962,387 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- Amazon Redshift -----------------------------------------------------------------
+
+    #[test]
+    fn redshift_uses_the_sql_tools_with_postgres_access_semantics() {
+        let get = ToolCall::GetSchema {
+            profile_id: "p".into(),
+            database: None,
+            schema: None,
+        };
+        for env in ENVS {
+            assert_eq!(assess(&get, Some(&rs(SchemaOnly, env)), false).risk, Safe);
+            assert_eq!(assess(&get, Some(&rs(NOTHING, env)), false).risk, Denied);
+            let q = sql("select * from sales limit 10");
+            assert_eq!(assess(&q, Some(&rs(SchemaOnly, env)), false).risk, Denied);
+            assert_eq!(
+                assess(&q, Some(&rs(ResultsWithApproval, env)), false).risk,
+                NeedsApproval
+            );
+            assert_eq!(assess(&q, Some(&rs(Results, env)), false).risk, Safe);
+            let w = assess(&sql("delete from sales"), Some(&rs(SchemaOnly, env)), false);
+            assert_eq!(w.risk, NeedsApproval);
+            assert!(w.allow_write && w.redact_values);
+            assert!(
+                w.reason
+                    .unwrap()
+                    .contains("commits each statement on its own"),
+                "a write says it is not transactional"
+            );
+        }
+        let v = assess(
+            &vcmd(&["GET", "k"]),
+            Some(&rs(Results, Environment::Dev)),
+            false,
+        );
+        assert_eq!(v.risk, Denied);
+        assert!(v.reason.unwrap().contains("a Redshift connection"));
+    }
+
+    #[test]
+    fn redshift_refuses_backslash_literals_before_anyone_is_asked() {
+        // Audit HIGH 1: the classifier reads these as plain SELECTs of two literals; Redshift
+        // runs `SELECT … INTO public.pwned` and `pg_terminate_backend(123)`.
+        for s in [
+            r"SELECT '\' , ' AS x INTO public.pwned FROM secrets -- '",
+            r"SELECT '\' , ' , pg_terminate_backend(123) -- '",
+        ] {
+            for a in [SchemaOnly, ResultsWithApproval, Results] {
+                for env in ENVS {
+                    let r = assess(&sql(s), Some(&rs(a, env)), false);
+                    assert_eq!(r.risk, Denied, "{s}");
+                    assert!(r.reason.unwrap().contains("backslash"), "{s}");
+                }
+            }
+            // On Postgres (standard strings) the same text stays a plain query.
+            assert_eq!(
+                assess(&sql(s), Some(&pg(Results, Environment::Dev)), false).risk,
+                Safe
+            );
+        }
+    }
+
+    #[test]
+    fn redshift_unknown_functions_need_approval_instead_of_running_read_only() {
+        for s in [
+            "SELECT f_notify(card_number) FROM payments",
+            "SELECT public.f(x) FROM t",
+            "SELECT change_query_priority(1, 'high')",
+        ] {
+            let r = assess(&sql(s), Some(&rs(Results, Environment::Dev)), false);
+            assert_eq!(r.risk, NeedsApproval, "{s}");
+            assert!(
+                r.allow_write,
+                "approved, it runs without the read-only check"
+            );
+            // The admin functions are on the general deny-list, so the classifier names them.
+            let m = r.reason.unwrap();
+            assert!(
+                m.contains("not a read-only Redshift built-in")
+                    || m.contains("change_query_priority()"),
+                "{m}"
+            );
+        }
+        let r = assess(
+            &sql("SELECT lower(name), count(*) FROM t GROUP BY 1"),
+            Some(&rs(Results, Environment::Dev)),
+            false,
+        );
+        assert_eq!(r.risk, Safe);
+    }
+
+    #[test]
+    fn redshift_session_statements_get_redshift_advice() {
+        for s in [
+            "SET search_path TO x",
+            "SET search_path TO x; SELECT * FROM t",
+            "SELECT 1; RESET search_path",
+        ] {
+            let r = assess(&sql(s), Some(&rs(Results, Environment::Dev)), false);
+            assert_eq!(r.risk, Denied, "{s}");
+            let m = r.reason.unwrap();
+            assert!(
+                m.contains("qualify names") && !m.contains("SET LOCAL statement_timeout"),
+                "{m}"
+            );
+        }
+    }
+
+    #[test]
+    fn redshift_refuses_transaction_control_at_every_access_level() {
+        for a in [SchemaOnly, ResultsWithApproval, Results] {
+            for s in [
+                "BEGIN",
+                "begin; delete from t; commit",
+                "START TRANSACTION",
+                "delete from t; ROLLBACK",
+                "END",
+                "ABORT",
+            ] {
+                let r = assess(&sql(s), Some(&rs(a, Environment::Dev)), false);
+                assert_eq!(r.risk, Denied, "{s}");
+                assert!(
+                    r.reason
+                        .unwrap()
+                        .contains("commits each statement on its own"),
+                    "{s}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn redshift_approval_names_workgroup_database_and_region() {
+        let f = rs(ResultsWithApproval, Environment::Prod);
+        let r = assess(&sql_on(None, "select 1"), Some(&f), false)
+            .reason
+            .unwrap();
+        assert!(
+            r.contains(
+                "'warehouse' (Redshift · analytics-wg · dev · eu-west-1 · as the IAM identity)"
+            ),
+            "{r}"
+        );
+        let r = assess(&sql_on(Some("sales"), "delete from t"), Some(&f), false)
+            .reason
+            .unwrap();
+        assert!(
+            r.contains("Redshift · analytics-wg · sales · eu-west-1")
+                && r.contains("not this connection's default database 'dev'")
+                && r.starts_with("PRODUCTION connection 'warehouse'"),
+            "{r}"
+        );
+        let t = approval_target(&sql_on(Some(" sales "), "select 1"), &f).unwrap();
+        assert_eq!(t.engine, EngineKind::Redshift);
+        assert_eq!(
+            (t.database.as_deref(), t.default_database.as_deref()),
+            (Some("sales"), Some("dev"))
+        );
+        let t = approval_target(&sql_on(None, "select 1"), &f).unwrap();
+        assert_eq!(t.database.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn facts_carry_the_redshift_database_and_target() {
+        use crate::model::{AwsIdentity, AwsTarget, RedshiftAuth, RedshiftTarget};
+        let opts = RedshiftOptions {
+            target: RedshiftTarget::Provisioned {
+                cluster_identifier: "dw".into(),
+            },
+            database: "analytics".into(),
+            aws: AwsTarget {
+                identity: AwsIdentity::DefaultChain,
+                region: "us-east-1".into(),
+            },
+            auth: RedshiftAuth::IamIdentity,
+        };
+        let p = ConnectionProfile {
+            id: "r".into(),
+            name: "dw".into(),
+            engine: EngineKind::Redshift,
+            host: String::new(),
+            port: 0,
+            // A stale Postgres field is not the Redshift database.
+            database: Some("ignored".into()),
+            auth: crate::model::AuthMethod::None,
+            tls: Default::default(),
+            tunnel: None,
+            environment: Environment::Dev,
+            ai_data_access: Results,
+            color: None,
+            pg: Default::default(),
+            valkey: Default::default(),
+            created_at: None,
+            updated_at: None,
+            iceberg: None,
+            redshift: Some(opts.clone()),
+            mysql: Default::default(),
+        };
+        let f = ProfileFacts::from(&p);
+        assert_eq!(f.database.as_deref(), Some("analytics"));
+        assert_eq!(f.redshift, Some(opts));
+        let mut pg = p.clone();
+        pg.engine = EngineKind::Postgres;
+        assert_eq!(ProfileFacts::from(&pg).redshift, None);
+    }
+
+    fn my(access: AiDataAccess, env: Environment) -> ProfileFacts {
+        ProfileFacts {
+            name: "orders-mysql".into(),
+            engine: EngineKind::Mysql,
+            environment: env,
+            access,
+            athena: false,
+            remote_engine: None,
+            remote: None,
+            mysql_detail: Some("MySQL · db.internal:3306 · as app".into()),
+            database: Some("shop".into()),
+            redshift: None,
+        }
+    }
+
+    #[test]
+    fn mysql_reads_follow_the_access_matrix() {
+        let read = "SELECT id FROM orders LIMIT 5";
+        assert_eq!(
+            assess(&sql(read), Some(&my(Results, Environment::Dev)), false).risk,
+            Safe
+        );
+        assert_eq!(
+            assess(
+                &sql(read),
+                Some(&my(ResultsWithApproval, Environment::Dev)),
+                false
+            )
+            .risk,
+            NeedsApproval
+        );
+        assert_eq!(
+            assess(&sql(read), Some(&my(SchemaOnly, Environment::Dev)), false).risk,
+            Denied
+        );
+        let r = assess(
+            &sql(read),
+            Some(&my(AiDataAccess::None, Environment::Dev)),
+            false,
+        );
+        assert_eq!(r.risk, Denied);
+        // A write needs approval and runs writable; on schema-only its rows are withheld.
+        let w = assess(
+            &sql("UPDATE orders SET status = 'paid' WHERE id = 1"),
+            Some(&my(SchemaOnly, Environment::Prod)),
+            false,
+        );
+        assert_eq!(w.risk, NeedsApproval);
+        assert!(w.allow_write && w.redact_values);
+        assert!(
+            w.reason
+                .unwrap()
+                .starts_with("PRODUCTION connection 'orders-mysql'")
+        );
+    }
+
+    /// What a READ ONLY transaction does not stop is not run as a read: a function outside the
+    /// built-in read-only list, a locking read or an executable comment goes to approval or is
+    /// refused, at every access level.
+    #[test]
+    fn mysql_reads_with_side_effects_are_not_safe() {
+        for s in [
+            "SELECT SLEEP(10)",
+            "SELECT GET_LOCK('x', 10)",
+            "SELECT shop.do_things()",
+            "SELECT * FROM orders FOR UPDATE",
+            "SELECT @a := 1",
+            "SELECT /*+ SET_VAR(sort_buffer_size = 1) */ 1",
+        ] {
+            let r = assess(&sql(s), Some(&my(Results, Environment::Dev)), false);
+            assert_eq!(r.risk, NeedsApproval, "{s}");
+            assert!(r.allow_write, "{s}");
+        }
+        for (s, needle) in [
+            ("SELECT * FROM orders INTO OUTFILE '/tmp/o'", "OUTFILE"),
+            ("SELECT LOAD_FILE('/etc/passwd')", "LOAD_FILE"),
+            (
+                "LOAD DATA INFILE '/var/lib/mysql-files/x' INTO TABLE t",
+                "LOAD DATA",
+            ),
+            ("SET GLOBAL general_log = 1", "SET GLOBAL"),
+            ("KILL 42", "KILL"),
+            ("USE other", "USE"),
+            ("SELECT 1 /*!50000 , SLEEP(5) */", "executable comment"),
+            ("DELIMITER //", "DELIMITER"),
+        ] {
+            for a in [SchemaOnly, ResultsWithApproval, Results] {
+                let r = assess(&sql(s), Some(&my(a, Environment::Dev)), false);
+                assert_eq!(r.risk, Denied, "{s}");
+                assert!(
+                    r.reason.as_deref().unwrap_or("").contains(needle),
+                    "{s}: {:?}",
+                    r.reason
+                );
+            }
+        }
+        let r = assess(
+            &sql("SET @x = 1"),
+            Some(&my(Results, Environment::Dev)),
+            false,
+        );
+        assert_eq!(r.risk, Denied);
+        assert!(r.reason.unwrap().contains("SET SESSION"));
+    }
+
+    /// Audit finding 4: statements that change the server or other sessions are not shown as
+    /// "session settings".
+    #[test]
+    fn mysql_server_changing_statements_are_not_session_settings() {
+        for s in [
+            "SET PASSWORD FOR 'app'@'%' = 'x'; SELECT 1",
+            "SET DEFAULT ROLE ALL TO 'app'@'%'",
+            "SET RESOURCE GROUP rg FOR 42",
+            "START REPLICA",
+            "XA ROLLBACK 'xid'",
+            "LOCK TABLES orders WRITE; SELECT 1",
+            "LOCK INSTANCE FOR BACKUP",
+        ] {
+            let r = assess(&sql(s), Some(&my(Results, Environment::Prod)), false);
+            assert_eq!(r.risk, NeedsApproval, "{s}");
+            let reason = r.reason.unwrap();
+            assert!(!reason.contains("Session settings"), "{s}: {reason}");
+            assert!(reason.starts_with("PRODUCTION"), "{s}: {reason}");
+        }
+    }
+
+    #[test]
+    fn mysql_approval_names_host_user_and_database() {
+        let f = my(ResultsWithApproval, Environment::Dev);
+        let t = approval_target(&sql_on(Some("archive"), "SELECT 1"), &f).unwrap();
+        assert_eq!(t.engine, EngineKind::Mysql);
+        assert_eq!(
+            (t.database.as_deref(), t.default_database.as_deref()),
+            (Some("archive"), Some("shop"))
+        );
+        assert_eq!(
+            t.detail.as_deref(),
+            Some("MySQL · db.internal:3306 · as app")
+        );
+        let r = assess(&sql_on(Some("archive"), "delete from t"), Some(&f), false)
+            .reason
+            .unwrap();
+        assert!(
+            r.contains(
+                "'orders-mysql', database 'archive' (not this connection's default database 'shop')"
+            ),
+            "{r}"
+        );
+        let r = assess(
+            &ToolCall::ListDatabases {
+                profile_id: "p".into(),
+            },
+            Some(&f),
+            false,
+        );
+        assert_eq!(r.risk, Safe);
+    }
+
+    #[test]
+    fn facts_carry_the_mysql_database_and_detail() {
+        let p: ConnectionProfile = serde_json::from_value(serde_json::json!({
+            "id": "p", "name": "orders-mysql", "engine": "mysql", "host": "db.internal",
+            "port": 3306, "database": "shop", "auth": {"kind": "password", "username": "app"},
+            "tunnel": null, "color": null, "createdAt": null, "updatedAt": null,
+        }))
+        .unwrap();
+        let f = ProfileFacts::from(&p);
+        assert_eq!(f.database.as_deref(), Some("shop"));
+        assert_eq!(
+            f.mysql_detail.as_deref(),
+            Some("MySQL · db.internal:3306 · as app")
+        );
+        let mut pg = p.clone();
+        pg.engine = EngineKind::Postgres;
+        assert_eq!(ProfileFacts::from(&pg).mysql_detail, None);
     }
 }

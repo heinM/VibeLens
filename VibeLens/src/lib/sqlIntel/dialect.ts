@@ -1,30 +1,87 @@
-// SQL dialects the editor can complete for. Postgres is the default; the two Iceberg query
-// engines have their own function vocabulary and a few dialect-only constructs (time travel,
-// metadata tables). Pure data plus small lookups, so it is unit-tested without Monaco.
+// SQL dialects the editor can complete for. Postgres is the default; the Iceberg query engines
+// have their own function vocabulary and a few dialect-only constructs (time travel, metadata
+// tables). Pure data plus small lookups, so it is unit-tested without Monaco.
+//
+//  * trino    = Iceberg through the user's Trino. Same vocabulary as Athena (Athena is Trino).
+//  * spark    = Iceberg through Spark SQL on Livy. Its own small table: Spark spells time travel
+//               `VERSION AS OF` and reaches metadata tables as `table.snapshots`, not `"table$snapshots"`.
+//  * mysql    = MySQL 8 (and Aurora / RDS MySQL). Backtick identifiers, `#` comments, its own function
+//               vocabulary; the catalog comes from my_schema_metadata (schema = database).
+//  * redshift = Amazon Redshift. Completes like Postgres (Redshift's SQL is Postgres-derived), but its
+//               catalog comes from the Redshift Data API, not from pg_catalog.
 import type { ConnectionProfile } from "../../ipc/types";
 import { FUNCTIONS, SNIPPETS, STATEMENT_START_KEYWORDS, TYPE_NAMES, type FunctionDef, type SnippetDef } from "./keywords";
 
 /** `datafusion` = Iceberg through the embedded local engine; `athena` = Iceberg through Amazon Athena (Trino). */
-export type SqlDialect = "postgres" | "datafusion" | "athena";
+export type SqlDialect = "postgres" | "datafusion" | "athena" | "trino" | "spark" | "redshift" | "mysql";
 
-export const isIcebergDialect = (d: SqlDialect | null | undefined): boolean => d === "datafusion" || d === "athena";
+export const isIcebergDialect = (d: SqlDialect | null | undefined): boolean => d === "datafusion" || d === "athena" || d === "trino" || d === "spark";
+
+/** Athena and Trino share a vocabulary (functions, types, time travel, `"table$snapshots"`). */
+export const isTrinoFamily = (d: SqlDialect | null | undefined): boolean => d === "athena" || d === "trino";
+
+/**
+ * Quotes an identifier the way the dialect reads one: backticks (a backtick doubled) for Spark SQL,
+ * where `"x"` is a string literal (`SELECT "user" FROM t` would return the text on every row); double
+ * quotes (a double quote doubled) everywhere else. Shared by completion, the palette and the Iceberg
+ * SQL helpers so they can never disagree.
+ */
+export function quoteIdentFor(name: string, dialect?: SqlDialect | null): string {
+  return dialect === "spark" || dialect === "mysql" ? `\`${name.replace(/`/g, "``")}\`` : `"${name.replace(/"/g, '""')}"`;
+}
+
+/**
+ * Trino (and Athena) address a nested Iceberg namespace as ONE schema: `"analytics.daily".orders`.
+ * Written level by level (`analytics.daily.orders`) Trino reads catalog.schema.table.
+ */
+export const nestedNamespaceIsOneIdent = (d: SqlDialect | null | undefined): boolean => isTrinoFamily(d);
 
 /** The catalog family a dialect reads its schema from. */
-export const catalogEngineOf = (d: SqlDialect | null | undefined): "postgres" | "iceberg" => (isIcebergDialect(d) ? "iceberg" : "postgres");
+export const catalogEngineOf = (d: SqlDialect | null | undefined): "postgres" | "iceberg" | "redshift" | "mysql" =>
+  isIcebergDialect(d) ? "iceberg" : d === "redshift" ? "redshift" : d === "mysql" ? "mysql" : "postgres";
+
+/** The dialect reads `#` as the start of a line comment (MySQL). */
+export const hashComments = (d: SqlDialect | null | undefined): boolean => d === "mysql";
 
 /** Which dialect SQL tabs on this profile are written in. Valkey has none (null). */
 export function dialectOf(profile: Pick<ConnectionProfile, "engine" | "iceberg"> | null | undefined): SqlDialect | null {
   if (!profile) return null;
-  if (profile.engine === "postgres") return "postgres";
-  if (profile.engine === "iceberg") return profile.iceberg?.queryEngine.kind === "athena" ? "athena" : "datafusion";
-  return null;
+  switch (profile.engine) {
+    case "postgres":
+      return "postgres";
+    case "redshift":
+      return "redshift";
+    case "mysql":
+      return "mysql";
+    case "iceberg": {
+      const k = profile.iceberg?.queryEngine.kind;
+      return k === "athena" ? "athena" : k === "trino" ? "trino" : k === "spark" ? "spark" : "datafusion";
+    }
+    case "valkey":
+      return null;
+  }
 }
+
+/** The engine name a dialect runs on, as the `stats` event spells it (`engine` field). */
+export const DIALECT_ENGINE: Record<SqlDialect, string> = {
+  postgres: "postgres",
+  datafusion: "datafusion",
+  athena: "athena",
+  trino: "trino",
+  spark: "spark",
+  redshift: "redshift",
+  mysql: "mysql",
+};
 
 /** How the dialect is named to people and to the AI assistant. */
 export const DIALECT_LABEL: Record<SqlDialect, string> = {
   postgres: "PostgreSQL",
   datafusion: "Apache DataFusion SQL",
   athena: "Amazon Athena (Trino) SQL",
+  trino: "Trino SQL",
+  spark: "Apache Spark SQL",
+  redshift: "Amazon Redshift SQL",
+  mysql: "MySQL 8 SQL",
 };
 
 /** One sentence for the AI prompts: what the engine can and cannot do. */
@@ -34,6 +91,14 @@ export const DIALECT_AI_NOTE: Record<SqlDialect, string> = {
     "The tables are Apache Iceberg tables queried through the embedded DataFusion engine. Namespaces play the role of schemas (a.b.table). INSERT INTO works; UPDATE, DELETE and MERGE are not supported. Time travel is written as \"table@<snapshot_id>\" (quoted).",
   athena:
     "The tables are Apache Iceberg tables queried through Amazon Athena (Trino dialect). Namespaces play the role of schemas. Time travel is written as FOR VERSION AS OF <snapshot_id> or FOR TIMESTAMP AS OF TIMESTAMP '...'. Athena bills by data scanned, so keep scans narrow.",
+  trino:
+    "The tables are Apache Iceberg tables queried through Trino. Namespaces play the role of schemas. Time travel is written as FOR VERSION AS OF <snapshot_id> or FOR TIMESTAMP AS OF TIMESTAMP '...'. Each statement runs on its own: USE, SET SESSION and transactions are not available.",
+  spark:
+    "The tables are Apache Iceberg tables queried through Spark SQL (Apache Livy). Namespaces play the role of schemas; quote identifiers with backticks. Time travel is written as VERSION AS OF <snapshot_id> or TIMESTAMP AS OF '...'; metadata tables are table.snapshots, table.history, table.files. Read-only runs refuse reflect/java_method and direct file reads such as parquet.`path`.",
+  redshift:
+    "The database is Amazon Redshift, queried through the Redshift Data API. The SQL is Redshift's Postgres-derived dialect: no RETURNING, no arrays or JSONB (use SUPER and PartiQL), no CREATE INDEX (use sort and distribution keys). Each statement commits on its own: BEGIN, COMMIT and ROLLBACK are refused. System views are SVV_*, SYS_* and STL_*.",
+  mysql:
+    "The database is MySQL 8. Quote identifiers with backticks, use LIMIT n, and remember a schema is a database (db.table). There is no RETURNING, no FULL OUTER JOIN, no ILIKE and no :: casts (use CAST). Each statement runs on its own; DELIMITER is not needed.",
 };
 
 // -- functions ------------------------------------------------------------------------------------
@@ -125,6 +190,88 @@ const TRINO_EXTRA: readonly FunctionDef[] = [
   fn("to_iso8601", "(date_or_timestamp)", "ISO 8601 text."),
 ];
 
+/** Postgres-only names MySQL does not have. */
+const NOT_MYSQL = new Set(["string_agg", "array_agg", "json_agg", "jsonb_agg", "jsonb_build_object", "jsonb_array_elements", "bool_and", "bool_or", "to_char", "to_date", "to_timestamp", "generate_series", "gen_random_uuid", "age", "date_trunc", "now", "nullif"]);
+
+const MYSQL_EXTRA: readonly FunctionDef[] = [
+  fn("group_concat", "(expr ORDER BY … SEPARATOR ',')", "Concatenates the group's values.", true),
+  fn("json_arrayagg", "(expr)", "The group's values as a JSON array.", true),
+  fn("json_objectagg", "(key, value)", "The group's pairs as a JSON object.", true),
+  fn("any_value", "(expr)", "Any value of the group (silences ONLY_FULL_GROUP_BY).", true),
+  fn("now", "()", "Current date and time."),
+  fn("curdate", "()", "Current date."),
+  fn("date_format", "(date, format)", "Formats a date ('%Y-%m-%d')."),
+  fn("str_to_date", "(text, format)", "Parses text into a date or datetime."),
+  fn("date_add", "(date, INTERVAL n unit)", "Adds an interval."),
+  fn("date_sub", "(date, INTERVAL n unit)", "Subtracts an interval."),
+  fn("datediff", "(end, start)", "Days between two dates."),
+  fn("timestampdiff", "(unit, start, end)", "Difference in a unit."),
+  fn("unix_timestamp", "(datetime)", "Seconds since the Unix epoch."),
+  fn("from_unixtime", "(seconds)", "Datetime from Unix seconds."),
+  fn("ifnull", "(expr, fallback)", "Fallback when the value is NULL."),
+  fn("if", "(condition, then, else)", "Inline conditional."),
+  fn("nullif", "(a, b)", "NULL when a = b."),
+  fn("concat_ws", "(separator, a, b, …)", "Concatenates with a separator, skipping NULLs."),
+  fn("substring_index", "(text, delimiter, count)", "Part before (or after) the nth delimiter."),
+  fn("locate", "(substring, text)", "1-based position of a substring (0 if absent)."),
+  fn("instr", "(text, substring)", "1-based position of a substring (0 if absent)."),
+  fn("lpad", "(text, length, fill)", "Left-pads to a length."),
+  fn("rpad", "(text, length, fill)", "Right-pads to a length."),
+  fn("json_extract", "(json, path)", "Value at a JSON path ('$.a.b'); also written json->'$.a'."),
+  fn("json_unquote", "(json)", "JSON string as text; json->>'$.a' combines both."),
+  fn("json_object", "(key, value, …)", "Builds a JSON object."),
+  fn("json_array", "(value, …)", "Builds a JSON array."),
+  fn("json_contains", "(json, candidate, path)", "True if the document contains the candidate."),
+  fn("json_table", "(json, path COLUMNS (…))", "Rows from a JSON document."),
+  fn("regexp_like", "(text, pattern)", "True if the regular expression matches."),
+  fn("regexp_replace", "(text, pattern, replacement)", "Replaces regular expression matches."),
+  fn("uuid", "()", "Random UUID text."),
+  fn("found_rows", "()", "Rows the previous SELECT would have returned without LIMIT."),
+  fn("database", "()", "The current database."),
+  fn("version", "()", "Server version."),
+];
+
+/** Postgres names Spark SQL does not have. */
+const NOT_SPARK = new Set(["string_agg", "bool_and", "bool_or", "to_char", "generate_series"]);
+
+const SPARK_EXTRA: readonly FunctionDef[] = [
+  fn("approx_count_distinct", "(expr)", "Approximate number of distinct values (HyperLogLog++).", true),
+  fn("percentile_approx", "(expr, percentage)", "Approximate percentile.", true),
+  fn("collect_list", "(expr)", "Values of the group as an array, with duplicates.", true),
+  fn("collect_set", "(expr)", "Distinct values of the group as an array.", true),
+  fn("count_if", "(condition)", "Number of rows where the condition is true.", true),
+  fn("max_by", "(value, key)", "Value at the row with the largest key.", true),
+  fn("min_by", "(value, key)", "Value at the row with the smallest key.", true),
+  fn("first", "(expr)", "First value of the group.", true),
+  fn("last", "(expr)", "Last value of the group.", true),
+  fn("date_format", "(timestamp, pattern)", "Formats a timestamp as text (Java pattern)."),
+  fn("date_add", "(date, days)", "Adds days to a date."),
+  fn("datediff", "(end, start)", "Days between two dates."),
+  fn("date_trunc", "(unit, timestamp)", "Truncates a timestamp to a unit."),
+  fn("from_unixtime", "(seconds)", "Text timestamp from Unix seconds."),
+  fn("unix_timestamp", "(timestamp)", "Seconds since the Unix epoch."),
+  fn("to_date", "(text, pattern)", "Parses text into a date."),
+  fn("to_timestamp", "(text, pattern)", "Parses text into a timestamp."),
+  fn("size", "(array_or_map)", "Number of elements."),
+  fn("element_at", "(array_or_map, key)", "Element at a 1-based index or map key."),
+  fn("array_contains", "(array, value)", "True if the array contains the value."),
+  fn("explode", "(array_or_map)", "One row per element."),
+  fn("get_json_object", "(json, path)", "Value at a JSONPath, as text."),
+  fn("from_json", "(json, schema)", "Parses JSON into a struct."),
+  fn("to_json", "(expr)", "JSON text of a struct, array or map."),
+  fn("named_struct", "(name, value)", "Builds a struct from name/value pairs."),
+  fn("map_keys", "(map)", "Keys of a map."),
+  fn("map_values", "(map)", "Values of a map."),
+  fn("regexp_extract", "(text, pattern, group)", "A group of the first regular expression match."),
+  fn("split", "(text, pattern)", "Splits text into an array."),
+  fn("instr", "(text, substring)", "1-based position of a substring (0 if absent)."),
+  fn("lpad", "(text, length, fill)", "Left-pads to a length."),
+  fn("rpad", "(text, length, fill)", "Right-pads to a length."),
+  fn("nvl", "(expr, fallback)", "Fallback when the value is NULL."),
+  fn("typeof", "(expr)", "Type of an expression."),
+  fn("uuid", "()", "Random v4 UUID."),
+];
+
 const unique = (list: readonly FunctionDef[]): FunctionDef[] => {
   const seen = new Set<string>();
   return list.filter((f) => (seen.has(f.name) ? false : (seen.add(f.name), true)));
@@ -139,7 +286,10 @@ export function functionsFor(d: SqlDialect | null | undefined): readonly Functio
   if (hit) return hit;
   let out: readonly FunctionDef[];
   if (key === "datafusion") out = unique([...FUNCTIONS.filter((f) => !NOT_ICEBERG.has(f.name)), ...DATAFUSION_EXTRA]);
-  else if (key === "athena") out = unique([...FUNCTIONS.filter((f) => !NOT_ICEBERG.has(f.name) && !NOT_TRINO.has(f.name)), ...TRINO_EXTRA]);
+  else if (isTrinoFamily(key)) out = unique([...FUNCTIONS.filter((f) => !NOT_ICEBERG.has(f.name) && !NOT_TRINO.has(f.name)), ...TRINO_EXTRA]);
+  else if (key === "spark") out = unique([...FUNCTIONS.filter((f) => !NOT_ICEBERG.has(f.name) && !NOT_SPARK.has(f.name)), ...SPARK_EXTRA]);
+  else if (key === "mysql") out = unique([...MYSQL_EXTRA, ...FUNCTIONS.filter((f) => !NOT_MYSQL.has(f.name))]);
+  // Redshift: the Postgres list (design: Postgres dialect for editor intelligence on Redshift).
   else out = FUNCTIONS;
   FUNCTION_CACHE.set(key, out);
   return out;
@@ -148,23 +298,34 @@ export function functionsFor(d: SqlDialect | null | undefined): readonly Functio
 // -- types, statements, snippets ---------------------------------------------------------------
 
 const DATAFUSION_TYPES = ["bigint", "int", "smallint", "double", "float", "decimal(38, 10)", "boolean", "string", "varchar", "date", "timestamp", "timestamp with time zone", "binary", "array", "struct"];
+const SPARK_TYPES = ["bigint", "int", "smallint", "tinyint", "double", "float", "decimal(38, 10)", "boolean", "string", "varchar(255)", "date", "timestamp", "timestamp_ntz", "binary", "array<string>", "map<string, bigint>", "struct<a: bigint>"];
 const ATHENA_TYPES = ["bigint", "integer", "smallint", "double", "real", "decimal(38, 10)", "boolean", "varchar", "date", "timestamp", "timestamp(6) with time zone", "varbinary", "uuid", "array(varchar)", "map(varchar, bigint)", "row(a bigint)"];
 
+const MYSQL_TYPES = ["int", "bigint", "smallint", "tinyint", "decimal(12, 2)", "double", "float", "varchar(255)", "char(36)", "text", "longtext", "json", "date", "datetime(6)", "timestamp", "time", "year", "blob", "varbinary(255)", "binary(16)", "bit(1)", "enum('a', 'b')", "geometry", "unsigned", "signed"];
+
 export function typeNamesFor(d: SqlDialect | null | undefined): readonly string[] {
-  return d === "datafusion" ? DATAFUSION_TYPES : d === "athena" ? ATHENA_TYPES : TYPE_NAMES;
+  return d === "datafusion" ? DATAFUSION_TYPES : isTrinoFamily(d) ? ATHENA_TYPES : d === "spark" ? SPARK_TYPES : d === "mysql" ? MYSQL_TYPES : TYPE_NAMES;
 }
+
+const MYSQL_STATEMENT_DROP = new Set(["VACUUM", "COPY", "COMMENT ON", "BEGIN", "EXPLAIN ANALYZE"]);
 
 const ICEBERG_STATEMENT_DROP = new Set(["VACUUM", "COPY", "GRANT", "REVOKE", "COMMENT ON", "BEGIN", "COMMIT", "ROLLBACK", "SET", "ANALYZE", "TRUNCATE", "CREATE INDEX", "EXPLAIN ANALYZE"]);
 
 export function statementStartFor(d: SqlDialect | null | undefined): readonly string[] {
+  if (d === "mysql")
+    return [...STATEMENT_START_KEYWORDS.filter((k) => !MYSQL_STATEMENT_DROP.has(k)), "REPLACE INTO", "START TRANSACTION", "SHOW TABLES", "SHOW DATABASES", "SHOW CREATE TABLE", "DESCRIBE", "EXPLAIN ANALYZE SELECT", "USE"];
   if (!isIcebergDialect(d)) return STATEMENT_START_KEYWORDS;
   const base = STATEMENT_START_KEYWORDS.filter((k) => !ICEBERG_STATEMENT_DROP.has(k));
-  // Athena runs row-level DML on Iceberg tables; the local engine appends only.
-  return d === "athena" ? [...base, "MERGE INTO", "DESCRIBE", "SHOW TABLES", "OPTIMIZE", "VACUUM"] : [...base, "DESCRIBE", "SHOW TABLES"];
+  // Athena, Trino and Spark run row-level DML on Iceberg tables; the local engine appends only.
+  if (d === "athena") return [...base, "MERGE INTO", "DESCRIBE", "SHOW TABLES", "OPTIMIZE", "VACUUM"];
+  if (d === "trino") return [...base, "MERGE INTO", "DESCRIBE", "SHOW TABLES", "SHOW SCHEMAS"];
+  if (d === "spark") return [...base, "MERGE INTO", "DESCRIBE", "SHOW TABLES", "SHOW NAMESPACES"];
+  return [...base, "DESCRIBE", "SHOW TABLES"];
 }
 
 /** Dialect keywords that may follow a complete relation (time travel on Athena). */
-export const afterRelationExtras = (d: SqlDialect | null | undefined): readonly string[] => (d === "athena" ? ["FOR VERSION AS OF", "FOR TIMESTAMP AS OF"] : []);
+export const afterRelationExtras = (d: SqlDialect | null | undefined): readonly string[] =>
+  isTrinoFamily(d) ? ["FOR VERSION AS OF", "FOR TIMESTAMP AS OF"] : d === "spark" ? ["VERSION AS OF", "TIMESTAMP AS OF"] : [];
 
 /** The local engine appends only (INSERT INTO works), so its UPDATE / DELETE snippets would just fail. */
 const DATAFUSION_SNIPPET_DROP = new Set(["upd", "del"]);
@@ -208,8 +369,26 @@ const ATHENA_SNIPPETS: readonly SnippetDef[] = [
   },
 ];
 
+const SPARK_SNIPPETS: readonly SnippetDef[] = [
+  {
+    label: "selver",
+    filter: "selver",
+    detail: "SELECT … VERSION AS OF",
+    body: "SELECT *\nFROM ${1:table} VERSION AS OF ${2:snapshot_id}\nLIMIT ${3:100};$0",
+    doc: "Time travel: reads the table as of a snapshot id.",
+  },
+  {
+    label: "selmeta",
+    filter: "selmeta",
+    detail: "SELECT … FROM table.snapshots",
+    body: "SELECT *\nFROM ${1:table}.snapshots\nORDER BY committed_at DESC;$0",
+    doc: "Metadata table: the snapshot history of a table.",
+  },
+];
+
 export function snippetsFor(d: SqlDialect | null | undefined): readonly SnippetDef[] {
-  if (d === "athena") return [...SNIPPETS, ...ATHENA_SNIPPETS];
+  if (isTrinoFamily(d)) return [...SNIPPETS, ...ATHENA_SNIPPETS];
+  if (d === "spark") return [...SNIPPETS, ...SPARK_SNIPPETS];
   if (d === "datafusion") return [...SNIPPETS.filter((s) => !DATAFUSION_SNIPPET_DROP.has(s.filter)), ...DATAFUSION_SNIPPETS];
   return SNIPPETS;
 }
@@ -221,6 +400,7 @@ export const METADATA_TABLES: Record<"datafusion" | "athena", readonly { name: s
   datafusion: [
     { name: "snapshots", doc: "One row per snapshot: id, parent, operation, commit time, summary." },
     { name: "manifests", doc: "The manifest files of the current snapshot." },
+    { name: "history", doc: "Table history: when each snapshot became current." },
   ],
   athena: [
     { name: "snapshots", doc: "One row per snapshot: id, parent, operation, commit time, manifest list." },

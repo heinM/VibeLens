@@ -6,6 +6,7 @@ import { STATUS_KEY } from "./hooks/useConnectionStatus";
 import { useGlobalShortcuts } from "./hooks/useGlobalShortcuts";
 import { ConnectionWizard } from "./components/connections/ConnectionWizard";
 import { ImportDialog } from "./components/connections/ImportDialog";
+import { HostKeyPrompt } from "./components/connections/HostKeyDialog";
 import { SettingsDialog } from "./components/settings/SettingsDialog";
 import { Shell } from "./components/layout/Shell";
 import { StatusBar } from "./components/layout/StatusBar";
@@ -75,6 +76,7 @@ export default function App() {
       <StatusBar />
       <ConnectionWizard />
       <ImportDialog />
+      <HostKeyPrompt />
       <SettingsDialog />
       <ModeChooser />
       <CommandPalette />

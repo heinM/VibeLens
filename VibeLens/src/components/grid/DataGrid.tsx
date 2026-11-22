@@ -92,6 +92,12 @@ function renderCell(cell: Cell, numeric: boolean, onExpand: (() => void) | null)
       return <span className="tabular-nums text-amber-700 dark:text-amber-300">{String(cell)}</span>;
     case "bytes":
       return <span className="italic text-muted">‹bytes {(cell as BytesCell).len}›</span>;
+    case "truncated":
+      return (
+        <span className="italic text-muted" title="This value was too large to load in full. Only its start is shown; it cannot be edited, and copies and exports carry a note instead of it.">
+          {displayText(cell)}
+        </span>
+      );
     case "json":
       return (
         <span className="flex items-center gap-1 text-sky-700 dark:text-sky-300">

@@ -1,7 +1,7 @@
 // Mirror of crates/vibelens-core/src/model/*.rs (serde camelCase). Change both together.
 
 export type ProfileId = string;
-export type EngineKind = "postgres" | "valkey" | "iceberg";
+export type EngineKind = "postgres" | "valkey" | "iceberg" | "redshift" | "mysql";
 export type Environment = "dev" | "test" | "staging" | "prod";
 export type AiDataAccess = "none" | "schemaOnly" | "resultsWithApproval" | "results";
 export type TlsMode = "disable" | "require" | "verifyFull";
@@ -39,8 +39,17 @@ export type TunnelConfig = {
   port: number;
   username: string;
   auth: SshAuth;
+  /** The pinned host key (`SHA256:<base64 without padding>`). Only this key is connected to; null until the user trusts or pastes one. */
   knownHostFingerprint: string | null;
 };
+
+/** The host key an SSH server presented when none was pinned for it. Nothing was sent to that server. */
+export interface PresentedHostKey {
+  host: string;
+  port: number;
+  /** `SHA256:<base64 without padding>`, what `ssh-keygen -lf` prints. */
+  fingerprint: string;
+}
 
 export type PgProxyMode = "blocking" | "nonBlocking" | "shunt";
 
@@ -88,6 +97,23 @@ export interface ConnectionProfile {
   updatedAt: string | null;
   /** Required when engine === "iceberg"; host/port are unused then. */
   iceberg?: IcebergOptions | null;
+  /** Required when engine === "redshift"; host/port/auth/tls/tunnel are unused then. */
+  redshift?: RedshiftOptions | null;
+  /** MySQL settings (Rust always has them; `#[serde(default)]`). Never send null: omit it instead. */
+  mysql?: MysqlOptions;
+}
+
+/** MySQL connection settings (crates/vibelens-core/src/model/mysql.rs). A MySQL profile also uses
+ *  host, port, database (required), auth (password | rdsIam), tls and tunnel. */
+export interface MysqlOptions {
+  /** 1 to 600 seconds. */
+  connectTimeoutSecs: number;
+  /** Per-statement limit; on expiry the statement is stopped with KILL QUERY. null = none. */
+  statementTimeoutMs: number | null;
+  /** 0 = never. */
+  idleDisconnectSecs: number;
+  /** 1 to 32. */
+  maxPoolSize: number;
 }
 
 // ---------- import ----------
@@ -140,9 +166,23 @@ export type IcebergStorage =
   | { kind: "s3Static"; endpoint: string | null; region: string | null; pathStyle: boolean } // keys in keychain
   | { kind: "local" };
 
+/** Authentication of the Trino / Livy HTTP engines. The password or token is in the vault (`engineSecret`). */
+export type HttpEngineAuth = { kind: "none" } | { kind: "basic"; username: string } | { kind: "bearer" };
+
 export type IcebergQueryEngine =
   | { kind: "local" }
-  | { kind: "athena"; workgroup: string; outputLocation: string | null; aws: AwsTarget | null };
+  | { kind: "athena"; workgroup: string; outputLocation: string | null; aws: AwsTarget | null }
+  | { kind: "trino"; url: string; catalog: string; user: string; auth: HttpEngineAuth; caCertPath: string | null }
+  | {
+      kind: "spark";
+      url: string;
+      catalog: string;
+      auth: HttpEngineAuth;
+      caCertPath: string | null;
+      proxyUser: string | null;
+      sessionConf: Record<string, string>;
+      sessionStartTimeoutSecs: number | null;
+    };
 
 export interface IcebergOptions {
   catalog: IcebergCatalog;
@@ -221,6 +261,31 @@ export interface ExpireSnapshotsResult {
   remaining: number;
 }
 
+// ---------- redshift ----------
+export type RedshiftTarget = { kind: "provisioned"; clusterIdentifier: string } | { kind: "serverless"; workgroupName: string };
+export type RedshiftAuth = { kind: "iamIdentity" } | { kind: "dbUser"; dbUser: string } | { kind: "secret"; secretArn: string };
+export interface RedshiftOptions {
+  target: RedshiftTarget;
+  database: string;
+  aws: AwsTarget;
+  auth: RedshiftAuth;
+}
+export interface RedshiftTableRef {
+  schema: string;
+  name: string;
+  /** TABLE, VIEW, ... as Redshift reports it. */
+  kind: string;
+}
+export interface RedshiftColumn {
+  name: string;
+  typeName: string;
+  nullable: boolean;
+  length: number | null;
+  precision: number | null;
+  scale: number | null;
+  defaultValue: string | null;
+}
+
 export type ConnectionState = "disconnected" | "connecting" | "connected" | "error";
 
 export interface ConnectionStatus {
@@ -239,6 +304,9 @@ export interface SecretStatus {
   hasSshPassphrase: boolean;
   hasIcebergSecret: boolean;
   hasS3Keys: boolean;
+  /** Trino / Spark password or token (`profile:{id}:engine-secret`). Optional: not in the design contract,
+   *  so an older or partial backend may not send it (then the wizard assumes nothing is stored). */
+  hasEngineSecret?: boolean;
 }
 
 export interface TestResult {
@@ -246,12 +314,16 @@ export interface TestResult {
   serverVersion: string | null;
   latencyMs: number;
   message: string;
+  /** Set when the test stopped because the SSH host's key is not pinned. A test never stores it. */
+  hostKey: PresentedHostKey | null;
 }
 
 // ---------- errors ----------
 export interface ErrorPayload {
   code: string; // see CoreError::code(); plus "confirm_required" from the prod write-guard
   message: string;
+  /** With code "unknown_host_key": the key the server presented, for the trust dialog. */
+  hostKey?: PresentedHostKey | null;
 }
 
 // ---------- query ----------
@@ -268,8 +340,19 @@ export interface ColumnMeta {
   typeOid: number;
 }
 
-/** int8/numeric/money arrive as strings; bytea as {$bytes, len}; json as embedded JSON. */
-export type Cell = null | boolean | number | string | { $bytes: string; len: number } | unknown[] | Record<string, unknown>;
+/**
+ * A value over 1 MiB (`MAX_CELL_BYTES` in `model/query.rs`) is not loaded in full: its cell is this
+ * marker. `bytes` is the size of the whole value; `preview` is its start (text for `text` and `json`,
+ * where the JSON is cut and so not parseable; base64 for `bytes`; empty for `other`). The marker is
+ * not the value: never write it back, compare with it in SQL, or copy or export it as if complete.
+ * Use `isTruncatedCell` / `containsTruncated` from `components/grid/cellFormat`.
+ */
+export interface TruncatedCell {
+  $truncated: { kind: "text" | "bytes" | "json" | "other"; bytes: number; preview: string };
+}
+
+/** int8/numeric/money arrive as strings; bytea as {$bytes, len}; json as embedded JSON; an oversized value as a `TruncatedCell`. */
+export type Cell = null | boolean | number | string | { $bytes: string; len: number } | TruncatedCell | unknown[] | Record<string, unknown>;
 
 export type QueryEvent =
   | { type: "started"; queryId: string; statementCount: number }
@@ -323,6 +406,42 @@ export interface SchemaObject {
   comment: string | null;
   estimatedRows: number | null;
   signature: string | null;
+  /** A partition of another table: still listed, but the tree nests it under its parent. */
+  isPartition: boolean;
+  parentSchema: string | null;
+  parentName: string | null;
+}
+export interface PartitionInfo {
+  schema: string;
+  name: string;
+  /** e.g. `FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')`. */
+  bound: string;
+  isDefault: boolean;
+  /** Itself partitioned: expands to its own partitions. */
+  isPartitioned: boolean;
+  estimatedRows: number | null;
+  sizeBytes: number | null;
+}
+/** pg_partman `part_config` settings; every field can be absent (partman 4 vs 5, unset columns). */
+export interface PartmanConfig {
+  control: string | null;
+  /** `1 day`, or a number for id-based sets. */
+  partitionInterval: string | null;
+  premake: number | null;
+  retention: string | null;
+  retentionKeepTable: boolean | null;
+  /** `on` / `off`. */
+  automaticMaintenance: string | null;
+}
+export interface PartitionListing {
+  /** e.g. `RANGE (created_at)`. */
+  partitionKey: string | null;
+  /** Direct children ordered by bound, the default partition last. */
+  partitions: PartitionInfo[];
+  /** More partitions exist than were returned. */
+  truncated: boolean;
+  /** Null when pg_partman is absent, does not manage the table, or cannot be read. */
+  partman: PartmanConfig | null;
 }
 export interface ColumnInfo {
   name: string;
@@ -446,6 +565,16 @@ export interface WorkspaceFile {
   size: number;
   modified: string | null;
 }
+/** One file `ws_import_files` left out. `name` is the file name only. */
+export interface ImportSkip {
+  name: string;
+  reason: string;
+}
+export interface WorkspaceImportOutcome {
+  /** Workspace-relative paths created, in the order picked. */
+  imported: string[];
+  skipped: ImportSkip[];
+}
 
 // ---------- agent ----------
 export type ProviderKind = "anthropic" | "openAiCompatible" | "portkey";
@@ -473,6 +602,11 @@ export interface ProviderConfig {
   requiresApiKey: boolean;
   /** Only for kind === "portkey". */
   portkey?: PortkeyOptions | null;
+  /**
+   * The model's context window in tokens (local models). The history sent each turn is cut to
+   * fit after leaving room for the output and the system prompt. null = the agent's default.
+   */
+  contextWindow?: number | null;
 }
 export interface ProviderSummary {
   config: ProviderConfig;
@@ -494,13 +628,47 @@ export interface Usage {
   inputTokens: number;
   outputTokens: number;
 }
+/**
+ * Where an agent call that needs approval will run. Rust builds it from the stored profile and
+ * the same database resolution execution uses, never from text the model wrote.
+ */
+export interface ApprovalTarget {
+  connection: string;
+  engine: EngineKind;
+  environment: Environment;
+  /** Postgres: the database the statement runs against. */
+  database: string | null;
+  /** Postgres: the connection's default database (what `database` is when the model names none). */
+  defaultDatabase: string | null;
+  /** Valkey: the logical database number. */
+  valkeyDb: number | null;
+  /**
+   * Where the statement really runs, resolved by Rust from the stored profile: Redshift
+   * `Redshift · cluster · database · region · auth`; Trino / Spark engine, host:port, catalog, namespace,
+   * acting user. Plain text: rendered as text, never as markup.
+   */
+  detail?: string | null;
+}
+/**
+ * Where an executed run_sql call ran, resolved by Rust from the stored profile (never from text
+ * the model wrote). No result rows.
+ */
+export interface SqlRun {
+  profileId: string;
+  /** Postgres / Redshift database it ran against; null for Iceberg. */
+  database: string | null;
+  /** The statement exactly as executed. */
+  sql: string;
+  /** True when it ran as a read-only call. */
+  readOnly: boolean;
+}
 export type AgentEvent =
   | { type: "turnStarted"; turnId: string; providerId: string; model: string }
   | { type: "textDelta"; text: string }
   | { type: "toolCallProposed"; callId: string; tool: string; arguments: unknown; risk: ToolRisk; reason: string | null }
-  | { type: "approvalRequired"; callId: string; tool: string; arguments: unknown; reason: string; preview: string | null }
+  | { type: "approvalRequired"; callId: string; tool: string; arguments: unknown; reason: string; preview: string | null; target?: ApprovalTarget | null }
   | { type: "toolStarted"; callId: string }
-  | { type: "toolFinished"; callId: string; ok: boolean; summary: string; elapsedMs: number }
+  | { type: "toolFinished"; callId: string; ok: boolean; summary: string; elapsedMs: number; sqlRun?: SqlRun | null }
   | { type: "fileWritten"; path: string }
   | { type: "turnFinished"; stopReason: string; usage: Usage | null }
   | { type: "failed"; error: ErrorPayload };

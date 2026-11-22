@@ -120,6 +120,34 @@ fn scan_quoted(b: &[u8], mut i: usize, quote: u8, backslash: bool) -> usize {
     b.len()
 }
 
+/// What a span returned by [`quoted_and_comment_spans`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpanKind {
+    /// A string literal of any form (`'…'`, `E'…'`, `U&'…'`, `$tag$…$tag$`, …).
+    Str,
+    /// A `"quoted identifier"` (or `U&"…"`).
+    QuotedIdent,
+    /// A `--` or `/* */` comment.
+    Comment,
+}
+
+/// The byte ranges this lexer reads as string literals, quoted identifiers and comments, in
+/// order. For engines that lex for themselves (Redshift) to check they agree with the classifier.
+pub(crate) fn quoted_and_comment_spans(sql: &str) -> Vec<(SpanKind, usize, usize)> {
+    lex(sql)
+        .into_iter()
+        .filter_map(|t| {
+            let kind = match t.kind {
+                TokKind::Str => SpanKind::Str,
+                TokKind::QuotedIdent => SpanKind::QuotedIdent,
+                TokKind::LineComment | TokKind::BlockComment => SpanKind::Comment,
+                _ => return None,
+            };
+            Some((kind, t.start, t.end))
+        })
+        .collect()
+}
+
 /// Tokenises PostgreSQL text. Never fails: unterminated strings/comments run to end of input.
 fn lex(sql: &str) -> Vec<Tok> {
     let b = sql.as_bytes();
@@ -1058,6 +1086,11 @@ const SIDE_EFFECT_NAMES: &[&str] = &[
     "pg_stat_file",
     "lowrite",
     "loread",
+    // Amazon Redshift workload and cluster administration.
+    "change_query_priority",
+    "change_session_priority",
+    "change_user_priority",
+    "reboot_cluster",
 ];
 
 /// Schemas whose every function is treated as side-effecting (extensions that reach outside the
@@ -1982,6 +2015,19 @@ mod tests {
             ("select database_to_xml(true, false, '')", "database_to_xml"),
         ] {
             assert_flagged(sql, f);
+        }
+    }
+
+    /// Redshift's workload and cluster administration functions are not reads.
+    #[test]
+    fn redshift_admin_functions_are_side_effects() {
+        for sql in [
+            "select change_query_priority(123, 'high')",
+            "select change_session_priority(123, 'high')",
+            "select change_user_priority('bob', 'high')",
+            "select reboot_cluster()",
+        ] {
+            assert_eq!(classify(sql).overall, Unknown, "{sql}");
         }
     }
 

@@ -12,7 +12,7 @@ use crate::error::{CoreError, Result};
 use crate::model::{
     CommandOutcome, ConnectionProfile, EngineKind, QueryResult, SchemaMetadata, TableDescription,
 };
-use crate::ports::ToolBackend;
+use crate::ports::{FileVersion, ToolBackend};
 
 /// Tool results sent to the model are cut at this many bytes.
 pub(super) const MAX_TOOL_RESULT_BYTES: usize = 24 * 1024;
@@ -23,11 +23,17 @@ const MAX_SCHEMA_TABLES: usize = 200;
 /// Cap on `write_file` contents the agent may propose.
 const MAX_WRITE_BYTES: usize = 1024 * 1024;
 const MAX_CELL_CHARS: usize = 500;
+/// Longest `purpose` shown on an approval card, in characters.
+pub(super) const MAX_PURPOSE_CHARS: usize = 200;
 
 /// A validated tool invocation.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum ToolCall {
     ListConnections,
+    /// The databases of a Postgres server or a Redshift cluster/workgroup (names only).
+    ListDatabases {
+        profile_id: String,
+    },
     GetSchema {
         profile_id: String,
         database: Option<String>,
@@ -82,6 +88,45 @@ fn opt_str(input: &Value, key: &str) -> Option<String> {
         .map(String::from)
 }
 
+/// Characters that change how surrounding text is laid out without being visible themselves:
+/// bidirectional embeddings, overrides and isolates, and the Unicode line/paragraph separators.
+fn is_layout_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// The model's `purpose` as it may appear on an approval card: one line (line breaks, control
+/// and bidirectional characters become spaces, runs of whitespace collapse) of at most
+/// [`MAX_PURPOSE_CHARS`] characters. It sits next to the facts the user approves, so it must not
+/// be able to push them out of view or imitate them on a line of its own.
+pub(super) fn bounded_purpose(raw: &str) -> String {
+    let flat: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_control() || is_layout_control(c) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let line = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() <= MAX_PURPOSE_CHARS {
+        return line;
+    }
+    let mut cut: String = line.chars().take(MAX_PURPOSE_CHARS - 1).collect();
+    cut.push('…');
+    cut
+}
+
 fn req_str(input: &Value, key: &str) -> std::result::Result<String, String> {
     opt_str(input, key).ok_or_else(|| format!("missing required argument `{key}`"))
 }
@@ -115,6 +160,7 @@ impl ToolCall {
     pub fn name(&self) -> &'static str {
         match self {
             ToolCall::ListConnections => "list_connections",
+            ToolCall::ListDatabases { .. } => "list_databases",
             ToolCall::GetSchema { .. } => "get_schema",
             ToolCall::DescribeTable { .. } => "describe_table",
             ToolCall::RunSql { .. } => "run_sql",
@@ -130,7 +176,8 @@ impl ToolCall {
     /// The connection this call touches, if any.
     pub fn profile_id(&self) -> Option<&str> {
         match self {
-            ToolCall::GetSchema { profile_id, .. }
+            ToolCall::ListDatabases { profile_id }
+            | ToolCall::GetSchema { profile_id, .. }
             | ToolCall::DescribeTable { profile_id, .. }
             | ToolCall::RunSql { profile_id, .. }
             | ToolCall::ValkeyScan { profile_id, .. }
@@ -140,6 +187,53 @@ impl ToolCall {
             | ToolCall::ListFiles
             | ToolCall::ReadFile { .. }
             | ToolCall::WriteFile { .. } => None,
+        }
+    }
+
+    /// Gives a SQL call on the user's active connection that names no database the active
+    /// database, so a follow-up question works where the user is (or where they pinned the
+    /// agent), not in the connection's default database. Calls on other connections, and calls
+    /// that name a database, are left alone. Only meaningful for Postgres and Redshift: the
+    /// caller applies it to those engines only.
+    pub fn default_database(
+        &mut self,
+        active_profile: Option<&str>,
+        active_database: Option<&str>,
+    ) {
+        let Some(active) = active_database.map(str::trim).filter(|d| !d.is_empty()) else {
+            return;
+        };
+        if let ToolCall::GetSchema {
+            profile_id,
+            database,
+            ..
+        }
+        | ToolCall::DescribeTable {
+            profile_id,
+            database,
+            ..
+        }
+        | ToolCall::RunSql {
+            profile_id,
+            database,
+            ..
+        } = self
+            && database.is_none()
+            && active_profile == Some(profile_id.as_str())
+        {
+            *database = Some(active.to_string());
+        }
+    }
+
+    /// Fixes the Postgres database of a `run_sql` call to the one `configured` (the profile's
+    /// database) resolves to, so the name on the approval card is the name execution is handed,
+    /// even if the profile is edited while the card is open. No-op for every other call.
+    pub fn pin_database(&mut self, configured: Option<&str>) {
+        if let ToolCall::RunSql { database, .. } = self {
+            *database = Some(crate::model::effective_database(
+                configured,
+                database.as_deref(),
+            ));
         }
     }
 
@@ -168,6 +262,9 @@ impl ToolCall {
         };
         Ok(match name {
             "list_connections" => ToolCall::ListConnections,
+            "list_databases" => ToolCall::ListDatabases {
+                profile_id: profile()?,
+            },
             "get_schema" => ToolCall::GetSchema {
                 profile_id: profile()?,
                 database: opt_str(input, "database"),
@@ -186,6 +283,8 @@ impl ToolCall {
                     database: opt_str(input, "database"),
                     sql,
                     purpose: opt_str(input, "purpose")
+                        .map(|p| bounded_purpose(&p))
+                        .filter(|p| !p.is_empty())
                         .unwrap_or_else(|| "(no purpose given)".into()),
                 }
             }
@@ -266,50 +365,62 @@ fn spec(name: &str, description: &str, properties: Value, required: &[&str]) -> 
 /// when to use each tool, what comes back, and what the user will be asked to approve.
 pub(super) fn tool_specs() -> Vec<ToolSpec> {
     let profile_id = json!({ "type": "string", "description": "Connection id from list_connections. Defaults to the user's active connection when omitted." });
-    let database = json!({ "type": "string", "description": "Postgres database name. Defaults to the connection's default database. Ignored for Apache Iceberg connections." });
+    let database = json!({ "type": "string", "description": "Postgres, MySQL or Amazon Redshift database name (list_databases lists them). Defaults to the connection's default database. Ignored for Apache Iceberg connections." });
     let db = json!({ "type": "integer", "minimum": 0, "maximum": 255, "description": "Valkey logical database number. Default 0. Cluster-mode connections only have 0." });
     vec![
         spec(
             "list_connections",
-            "List the user's saved database connections: id, name, engine (postgres, valkey or iceberg), environment (dev/test/staging/prod) and ai_data_access (none, schemaOnly, resultsWithApproval, results). \
+            "List the user's saved database connections: id, name, engine (postgres, mysql, valkey, iceberg or redshift), environment (dev/test/staging/prod) and ai_data_access (none, schemaOnly, resultsWithApproval, results). \
              Call this first when you do not know which connection to use. It never returns hosts or credentials. ai_data_access tells you what you may see: 'none' means do not touch the connection; \
              'schemaOnly' means table/column structure only, no row data; the 'results' levels allow query results (the second one asks the user before each query).",
             json!({}),
             &[],
         ),
         spec(
+            "list_databases",
+            "List the names of the databases on a Postgres or MySQL server or an Amazon Redshift cluster or workgroup (Postgres: templates and databases that refuse connections are left out). \
+             Use it when the user mentions another database, or when the table you need is not in the active one; then pass that name as `database` to get_schema, describe_table and run_sql. \
+             Names only: no sizes, owners or contents. Works at every ai_data_access level except 'none'. Not for Apache Iceberg (use get_schema for its namespaces) or Valkey connections.",
+            json!({ "profile_id": profile_id.clone() }),
+            &[],
+        ),
+        spec(
             "get_schema",
-            "Return the structure of a SQL connection (Postgres or Apache Iceberg) in compact text: schemas, tables, views, columns with types, and for Postgres primary and foreign keys. \
+            "Return the structure of a SQL connection (Postgres, MySQL or Apache Iceberg) in compact text: schemas, tables, views, columns with types, and for Postgres and MySQL primary and foreign keys. \
+             On MySQL a schema is a database: the listing is of one database (`database`, or `schema` naming one). \
              On Iceberg the 'schema' of a table is its namespace (nested namespaces are joined with '.', e.g. 'analytics.daily') and column types are Iceberg types (long, decimal(12, 2), timestamptz, struct<...>, list<...>). \
              Capped at 200 tables; if truncated, pass `schema` to narrow it. \
              Use this before writing SQL so you use real table and column names instead of guessing. Works at every ai_data_access level except 'none'. Not for Valkey connections.",
-            json!({ "profile_id": profile_id.clone(), "database": database.clone(), "schema": { "type": "string", "description": "Only this schema (Postgres, e.g. 'public') or Iceberg namespace (e.g. 'shop' or 'analytics.daily')." } }),
+            json!({ "profile_id": profile_id.clone(), "database": database.clone(), "schema": { "type": "string", "description": "Only this schema (Postgres, e.g. 'public'; on MySQL a database name) or Iceberg namespace (e.g. 'shop' or 'analytics.daily')." } }),
             &["profile_id"],
         ),
         spec(
             "describe_table",
             "Return full detail for one table or view: every column (type, nullability, default, comments) and, on Postgres, primary key, indexes with definitions, foreign keys, and the planner's row estimate. \
-             Use it when you need index or constraint detail for a specific table, for example before suggesting an index or a join. Works on Postgres and Apache Iceberg connections (on Iceberg, name the namespace in `schema`, or rely on the connection's default namespace).",
+             Use it when you need index or constraint detail for a specific table, for example before suggesting an index or a join. Works on Postgres, MySQL and Apache Iceberg connections (on Iceberg, name the namespace in `schema`, or rely on the connection's default namespace; on MySQL `schema` is the database and defaults to `database`).",
             json!({
                 "profile_id": profile_id.clone(), "database": database.clone(),
-                "schema": { "type": "string", "description": "Postgres schema (default 'public') or Iceberg namespace (default: the connection's default namespace; nested namespaces joined with '.')." },
+                "schema": { "type": "string", "description": "Postgres schema (default 'public'), MySQL database (default: `database`) or Iceberg namespace (default: the connection's default namespace; nested namespaces joined with '.')." },
                 "table": { "type": "string", "description": "Table or view name." }
             }),
             &["profile_id", "table"],
         ),
         spec(
             "run_sql",
-            "Run SQL on a Postgres or Apache Iceberg connection. Read-only statements (SELECT, WITH ... SELECT, EXPLAIN of a SELECT, SHOW, VALUES) execute inside a READ ONLY transaction (Iceberg: checked to be plain queries and refused otherwise); depending on the connection's ai_data_access \
+            "Run SQL on a Postgres, MySQL or Apache Iceberg connection. Read-only statements (SELECT, WITH ... SELECT, EXPLAIN of a SELECT, SHOW, VALUES) execute inside a READ ONLY transaction (Iceberg: checked to be plain queries and refused otherwise); depending on the connection's ai_data_access \
              they run immediately, need the user's approval, or are refused (schemaOnly). Anything else (INSERT, UPDATE, DELETE, DDL, SET, CALL, DO, EXPLAIN of a write, SELECT ... FOR UPDATE, or a SELECT that calls a function with side effects such as dblink, pg_read_file, lo_import, pg_advisory_lock, nextval or pg_sleep) \
              is shown to the user as an approval request and only runs if they approve; on production connections the user is warned prominently. A script may contain several statements. \
              The result is JSON: columns, rows (at most about 200, long values shortened), rowCount, truncated, commandTag. Always add LIMIT to exploratory queries. \
              On Apache Iceberg connections: name tables as namespace.table; the dialect is DataFusion SQL on the local engine and Trino/Athena SQL on an Athena engine. Time travel on the local engine reads a table as of a snapshot with a quoted name, ns.\"table@<snapshot_id>\". \
-             Iceberg writes (INSERT, CREATE TABLE AS, and on Athena DML/DDL) need approval and create a new table snapshot. The local engine can only append with INSERT, so UPDATE, DELETE and MERGE need an Athena connection. \
+             Iceberg writes (INSERT, CREATE TABLE AS, and on Athena, Trino or Spark also UPDATE, DELETE, MERGE and DDL) need approval and create a new table snapshot. The local (embedded) engine can only append with INSERT; UPDATE, DELETE and MERGE need a server-side engine (Athena, Trino or Spark). \
              Athena bills per TB scanned: select only the columns you need, filter on partition columns and always add LIMIT. \
+             On Amazon Redshift connections the dialect is Redshift SQL; each statement commits on its own (no transactions: BEGIN, COMMIT and ROLLBACK are refused), and read-only statements are checked to be plain queries rather than run in a READ ONLY transaction. \
+             On MySQL connections the dialect is MySQL 8; read-only statements run inside START TRANSACTION READ ONLY and are checked first (built-in read-only functions only; no INTO, FOR UPDATE, :=, /*! */ or /*+ */), and INTO OUTFILE, LOAD DATA, LOAD_FILE, SET GLOBAL, KILL, USE and DELIMITER are refused in every mode. \
+             On a Trino or Spark engine (remote clusters, not billed per TB) the dialect is Trino SQL or Spark SQL, writes include UPDATE, DELETE and MERGE, and session statements (USE, SET) are refused; on Spark also temporary objects, ADD, DECLARE, EXECUTE IMMEDIATE, CACHE and ${…} are refused in every mode, and read-only runs refuse reflect/java_method, direct file paths and comments. \
              For anything beyond a quick query, or any change to data or schema, prefer write_file to save the SQL as a .sql file for the user to review and run themselves. `purpose` is shown to the user next to the SQL, so state plainly why you are running it.",
             json!({
                 "profile_id": profile_id.clone(), "database": database.clone(),
-                "sql": { "type": "string", "description": "The SQL to run. One or more statements in the connection's dialect (PostgreSQL; DataFusion or Athena SQL for Iceberg)." },
+                "sql": { "type": "string", "description": "The SQL to run. One or more statements in the connection's dialect (PostgreSQL; MySQL; DataFusion, Athena, Trino or Spark SQL for Iceberg, depending on its engine)." },
                 "purpose": { "type": "string", "description": "One sentence for the user: why you are running this." }
             }),
             &["profile_id", "sql", "purpose"],
@@ -448,6 +559,25 @@ pub(super) fn frame_result(body: &str) -> String {
 
 fn shorten_cell(v: &Value, depth: usize) -> Value {
     match v {
+        // A value that was too large to read in full: say so in words, with the start of it
+        // when that is text. The marker's own shape would mean nothing to the model.
+        v if crate::model::is_truncated_cell(v) => {
+            let t = &v["$truncated"];
+            let kind = t["kind"].as_str().unwrap_or("other");
+            let bytes = t["bytes"].as_u64().unwrap_or(0);
+            let head: String = match kind {
+                "text" | "json" => t["preview"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(MAX_CELL_CHARS)
+                    .collect(),
+                _ => String::new(),
+            };
+            Value::String(format!(
+                "{head}…[value too large to read in full: {bytes} bytes of {kind}; only its start is shown]"
+            ))
+        }
         Value::String(s) if s.chars().count() > MAX_CELL_CHARS => {
             let head: String = s.chars().take(MAX_CELL_CHARS).collect();
             Value::String(format!(
@@ -735,6 +865,8 @@ pub(super) async fn run(
     call: &ToolCall,
     backend: &dyn ToolBackend,
     plan: &Assessment,
+    write_baseline: Option<&FileVersion>,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<ToolOutput> {
     match call {
         ToolCall::ListConnections => {
@@ -746,6 +878,14 @@ pub(super) async fn run(
                     profiles.len(),
                     if profiles.len() == 1 { "" } else { "s" }
                 ),
+            ))
+        }
+        ToolCall::ListDatabases { profile_id } => {
+            let names = backend.list_databases(profile_id).await?;
+            let n = names.len();
+            Ok(out(
+                json!({ "databases": names, "count": n }).to_string(),
+                format!("{n} database{}", if n == 1 { "" } else { "s" }),
             ))
         }
         ToolCall::GetSchema {
@@ -779,6 +919,15 @@ pub(super) async fn run(
             let profile = backend.profile(profile_id)?;
             let (schema, table) = if profile.engine == EngineKind::Iceberg {
                 resolve_iceberg_table(&profile, schema.as_deref(), table)?
+            } else if profile.engine == EngineKind::Mysql {
+                // A MySQL schema is a database: the one named, else the call's database.
+                (
+                    schema
+                        .clone()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| profile.effective_database(database.as_deref())),
+                    table.clone(),
+                )
             } else {
                 (
                     schema.clone().unwrap_or_else(|| "public".to_string()),
@@ -871,6 +1020,7 @@ pub(super) async fn run(
                     sql,
                     !plan.allow_write,
                     MAX_MODEL_ROWS,
+                    cancel.clone(),
                 )
                 .await?;
             Ok(out(
@@ -946,7 +1096,12 @@ pub(super) async fn run(
             Ok(out(text, format!("read {path} ({n} bytes)")))
         }
         ToolCall::WriteFile { path, contents } => {
-            backend.write_file(path, contents).await?;
+            // The file as the user saw it in the diff. The backend writes only if it is still
+            // that; without a baseline no diff was approved, and nothing is written.
+            let shown = write_baseline.ok_or_else(|| {
+                CoreError::Other("write_file reached execution without an approved diff".into())
+            })?;
+            backend.write_file(path, contents, shown).await?;
             Ok(ToolOutput {
                 body: format!(
                     "Wrote {} bytes to {path}. The file is now open in the user's editor for review.",
@@ -964,6 +1119,20 @@ mod tests {
     use super::*;
     use crate::model::{ColumnInfo, ColumnMeta, ObjectKind};
 
+    /// Audit 2026-11-21, item 14: the run_sql description must not send the model to Athena
+    /// for DML that Trino and Spark do too.
+    #[test]
+    fn run_sql_describes_every_iceberg_engine_truthfully() {
+        let specs = tool_specs();
+        let d = &specs
+            .iter()
+            .find(|s| s.name == "run_sql")
+            .unwrap()
+            .description;
+        assert!(!d.contains("need an Athena connection"), "{d}");
+        assert!(d.contains("Athena, Trino or Spark"), "{d}");
+    }
+
     #[test]
     fn specs_are_well_formed() {
         let specs = tool_specs();
@@ -972,6 +1141,7 @@ mod tests {
             names,
             [
                 "list_connections",
+                "list_databases",
                 "get_schema",
                 "describe_table",
                 "run_sql",
@@ -1086,6 +1256,24 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(c, ToolCall::DescribeTable { schema: None, .. }));
+        // list_databases takes only the connection, defaulting to the active one.
+        assert_eq!(
+            ToolCall::parse("list_databases", &json!({}), Some("active")).unwrap(),
+            ToolCall::ListDatabases {
+                profile_id: "active".into()
+            }
+        );
+        assert_eq!(
+            ToolCall::parse("list_databases", &json!({"profile_id":"p"}), Some("active"))
+                .unwrap()
+                .profile_id(),
+            Some("p")
+        );
+        assert!(
+            ToolCall::parse("list_databases", &json!({}), None)
+                .unwrap_err()
+                .contains("profile_id")
+        );
         // write_file keeps empty contents (truncating a file is legitimate) but needs the key.
         assert!(
             ToolCall::parse("write_file", &json!({"path":"a.sql","contents":""}), None).is_ok()
@@ -1099,6 +1287,119 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn default_database_fills_only_unnamed_calls_on_the_active_connection() {
+        let run = |input: Value| ToolCall::parse("run_sql", &input, Some("p1")).unwrap();
+        let db = |c: &ToolCall| match c {
+            ToolCall::RunSql { database, .. }
+            | ToolCall::GetSchema { database, .. }
+            | ToolCall::DescribeTable { database, .. } => database.clone(),
+            _ => None,
+        };
+
+        let mut c = run(json!({"sql":"select 1"}));
+        c.default_database(Some("p1"), Some("payments"));
+        assert_eq!(db(&c).as_deref(), Some("payments"), "active connection");
+
+        let mut c = run(json!({"sql":"select 1","database":"shop"}));
+        c.default_database(Some("p1"), Some("payments"));
+        assert_eq!(db(&c).as_deref(), Some("shop"), "the model's choice wins");
+
+        let mut c = run(json!({"sql":"select 1","profile_id":"p2"}));
+        c.default_database(Some("p1"), Some("payments"));
+        assert_eq!(db(&c), None, "another connection keeps its own default");
+
+        let mut c = run(json!({"sql":"select 1"}));
+        c.default_database(Some("p1"), Some("  "));
+        assert_eq!(db(&c), None, "no active database");
+
+        for name in ["get_schema", "describe_table"] {
+            let mut c = ToolCall::parse(name, &json!({"table":"t"}), Some("p1")).unwrap();
+            c.default_database(Some("p1"), Some("payments"));
+            assert_eq!(db(&c).as_deref(), Some("payments"), "{name}");
+        }
+        let mut c = ToolCall::parse("list_databases", &json!({}), Some("p1")).unwrap();
+        c.default_database(Some("p1"), Some("payments"));
+        assert_eq!(
+            c,
+            ToolCall::ListDatabases {
+                profile_id: "p1".into()
+            }
+        );
+    }
+
+    /// Review finding M3: `purpose` is model-written text in the approval card's headline.
+    #[test]
+    fn purpose_is_one_bounded_line() {
+        assert_eq!(
+            bounded_purpose("  check\tthe   totals \n"),
+            "check the totals"
+        );
+        assert_eq!(
+            bounded_purpose("line one\r\nline two\u{2028}three\u{0085}four"),
+            "line one line two three four"
+        );
+        // Bidirectional controls would let the text reorder what is shown around it.
+        assert_eq!(
+            bounded_purpose("safe\u{202E}evil\u{2066}x\u{2069}\u{200F}"),
+            "safe evil x"
+        );
+        let long = bounded_purpose(&"é".repeat(5_000));
+        assert_eq!(long.chars().count(), MAX_PURPOSE_CHARS);
+        assert!(long.ends_with('…'));
+        assert_eq!(
+            bounded_purpose(&"x".repeat(MAX_PURPOSE_CHARS))
+                .chars()
+                .count(),
+            200
+        );
+
+        let parsed = |purpose: &str| match ToolCall::parse(
+            "run_sql",
+            &json!({"profile_id":"p","sql":"select 1","purpose":purpose}),
+            None,
+        )
+        .unwrap()
+        {
+            ToolCall::RunSql { purpose, .. } => purpose,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            parsed("why\n\nPRODUCTION connection 'x'"),
+            "why PRODUCTION connection 'x'"
+        );
+        assert_eq!(parsed("\u{202E}\n"), "(no purpose given)");
+        assert!(parsed(&"a ".repeat(10_000)).chars().count() <= MAX_PURPOSE_CHARS);
+    }
+
+    #[test]
+    fn pin_database_resolves_like_execution_and_only_touches_run_sql() {
+        let run = |database: Option<&str>| ToolCall::RunSql {
+            profile_id: "p".into(),
+            database: database.map(String::from),
+            sql: "select 1".into(),
+            purpose: "x".into(),
+        };
+        let pinned = |mut c: ToolCall, configured: Option<&str>| {
+            c.pin_database(configured);
+            c
+        };
+        assert_eq!(pinned(run(None), Some("shop")), run(Some("shop")));
+        assert_eq!(
+            pinned(run(Some(" other ")), Some("shop")),
+            run(Some("other"))
+        );
+        assert_eq!(pinned(run(Some("  ")), Some("shop")), run(Some("shop")));
+        assert_eq!(pinned(run(None), None), run(Some("postgres")));
+        let scan = ToolCall::ValkeyScan {
+            profile_id: "v".into(),
+            db: 2,
+            pattern: "*".into(),
+            limit: 5,
+        };
+        assert_eq!(pinned(scan.clone(), Some("shop")), scan);
     }
 
     #[test]
@@ -1200,6 +1501,37 @@ mod tests {
         let v = shorten_cell(&json!("z".repeat(5000)), 0);
         let s = v.as_str().unwrap();
         assert!(s.chars().count() < 600 && s.contains("+4500 chars"));
+    }
+
+    /// A value that was cut when it was read (review finding H1) reaches the model as words,
+    /// not as the marker object and not as megabytes of preview.
+    #[test]
+    fn values_cut_at_read_time_are_described_to_the_model() {
+        use crate::model::{TruncatedKind, truncated_cell};
+        let text = truncated_cell(
+            TruncatedKind::Text,
+            50_000_000,
+            "q".repeat(900_000).as_bytes(),
+        );
+        let s = shorten_cell(&text, 0);
+        let s = s.as_str().unwrap();
+        assert!(
+            s.starts_with("qqq") && s.chars().count() < 700,
+            "{}",
+            s.len()
+        );
+        assert!(
+            s.contains("50000000 bytes of text") && s.contains("too large"),
+            "{s}"
+        );
+
+        let bytes = truncated_cell(TruncatedKind::Bytes, 9_000_000, &[1, 2, 3]);
+        let s = shorten_cell(&bytes, 0);
+        let s = s.as_str().unwrap();
+        assert!(
+            s.starts_with('…') && s.contains("9000000 bytes of bytes"),
+            "{s}"
+        );
     }
 
     #[test]

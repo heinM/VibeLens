@@ -9,6 +9,7 @@ import { useUIStore } from "../../store/useUIStore";
 import { useValkeyDbs, useValkeyScan } from "../../hooks/useValkey";
 import { useTabActions } from "../../hooks/useTabActions";
 import { Button, ErrorBox } from "../ui";
+import { TreeSsoReauth } from "../connections/SsoReauth";
 import { useMenu, type MenuEntry } from "../ui/Menu";
 import { copyToClipboard } from "../ui/clipboard";
 import { cn } from "../../lib/cn";
@@ -179,8 +180,9 @@ export function ValkeyTree({ profile, pattern }: { profile: ConnectionProfile; p
 
   if (dbsQ.isError && !dbsQ.data) {
     return (
-      <div className="p-2">
+      <div className="space-y-2 p-2">
         <ErrorBox error={asError(dbsQ.error)} />
+        <TreeSsoReauth profile={profile} error={asError(dbsQ.error)} reload={() => void dbsQ.refetch()} />
       </div>
     );
   }

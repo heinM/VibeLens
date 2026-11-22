@@ -31,6 +31,12 @@ mod cells;
 mod engine;
 mod scan;
 
+// Trino speaks the same dialect: the remote Trino engine shares the read-only check, the
+// command tags and the cell typing.
+pub(crate) use cells::{base_type, convert_cell};
+pub(crate) use engine::check_read_only_as;
+pub(crate) use scan::{command_tag, scan as scan_words};
+
 use std::time::{Duration, Instant};
 
 use aws_credential_types::provider::SharedCredentialsProvider;
@@ -159,12 +165,23 @@ impl AthenaEngine {
     /// Bounded, materialised execution: the result of the last statement that returns rows
     /// (or of the last statement when none does). Errors are returned as `Err`.
     pub async fn execute_collect(&self, sql: &str, opts: ExecOptions) -> Result<QueryResult> {
+        self.execute_collect_cancellable(sql, opts, CancellationToken::new())
+            .await
+    }
+
+    /// [`execute_collect`](Self::execute_collect) that stops when `cancel` fires, after
+    /// `StopQueryExecution` has been sent for the running query.
+    pub async fn execute_collect_cancellable(
+        &self,
+        sql: &str,
+        opts: ExecOptions,
+        cancel: CancellationToken,
+    ) -> Result<QueryResult> {
         let statements = crate::sql::split_statements(sql);
         if statements.is_empty() {
             return Ok(QueryResult::default());
         }
         let (tx, mut rx) = mpsc::channel::<QueryEvent>(32);
-        let cancel = CancellationToken::new();
         let session = self.session();
         let runner = async {
             let end = session.run(&statements, &opts, &cancel, &tx).await;

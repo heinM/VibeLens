@@ -11,6 +11,11 @@ export const pgQueries = {
     queryOptions({ queryKey: ["pg", profileId, db, "schemas"] as const, queryFn: () => api.pgListSchemas(profileId, db) }),
   objects: (profileId: string, db: string | null, schema: string) =>
     queryOptions({ queryKey: ["pg", profileId, db, "objects", schema] as const, queryFn: () => api.pgListObjects(profileId, db, schema) }),
+  partitions: (profileId: string, db: string | null, schema: string, table: string) =>
+    queryOptions({
+      queryKey: ["pg", profileId, db, "partitions", schema, table] as const,
+      queryFn: () => api.pgListPartitions(profileId, db, schema, table),
+    }),
   describe: (profileId: string, db: string | null, schema: string, table: string) =>
     queryOptions({
       queryKey: ["pg", profileId, db, "describe", schema, table] as const,

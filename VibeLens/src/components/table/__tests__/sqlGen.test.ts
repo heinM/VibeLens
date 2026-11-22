@@ -21,10 +21,14 @@ import {
   splitInList,
   sqlLiteral,
   typeCategory,
+  uneditableReason,
   validateRawWhere,
   type ColumnRef,
   type FilterRow,
   type TableTarget,
+  planTablePage,
+  CTID_ORDER_MAX_ROWS,
+  type PlanColumn,
 } from "../sqlGen";
 
 const cols: ColumnRef[] = [
@@ -417,5 +421,109 @@ describe("DML", () => {
     expect(sql).toBe(`UPDATE "public"."orders" SET "name" = 'x''); DROP TABLE orders; --'::character varying WHERE "id" = '1'::bigint;`);
     const evil2 = `\\'); DROP TABLE orders; --`;
     expect(buildInsert(target, { name: evil2 })).toBe(`INSERT INTO "public"."orders" ("name") VALUES (E'\\\\''); DROP TABLE orders; --'::character varying);`);
+  });
+});
+
+// Review finding H1: the marker for a value that was cut when it was read must never reach SQL.
+// Before this rule existed, `sqlLiteral` wrote the marker object itself as the value.
+describe("values that were cut when they were read", () => {
+  const START = "start-of-the-value";
+  const cut = (kind = "text") => ({ $truncated: { kind, bytes: 52_428_800, preview: START } });
+
+  it("has no SQL literal, whatever the column type", () => {
+    for (const type of ["text", "character varying", "bytea", "jsonb", "json", "text[]", "xml", "citext"]) {
+      expect(() => sqlLiteral(cut(), type), type).toThrow(SqlGenError);
+      expect(() => sqlLiteral(cut(), type), type).toThrow(/too large to load in full/);
+    }
+    // Also when it sits inside a JSON value (an Iceberg struct with one huge field).
+    expect(() => sqlLiteral({ device: "a", payload: cut() }, "jsonb")).toThrow(/too large to load in full/);
+  });
+
+  it("is never written by UPDATE or INSERT, nor used to find a row", () => {
+    expect(() => buildUpdate(target, { id: "1" }, { name: cut() })).toThrow(/too large to load in full/);
+    expect(() => buildInsert(target, { id: "2", name: cut() })).toThrow(/too large to load in full/);
+    expect(() => buildUpdate(target, { name: cut() }, { total: "5" })).toThrow(/too large to load in full/);
+    expect(() => buildDelete(target, { name: cut() })).toThrow(/too large to load in full/);
+  });
+
+  it("cannot be a paging position", () => {
+    expect(() => buildKeysetPredicate([{ column: "name", dataType: "text", dir: "asc" }], [cut()])).toThrow(/too large to load in full/);
+  });
+
+  it("has no edit text and cannot be edited or filtered on", () => {
+    expect(cellToEditText(cut())).toBe("");
+    expect(cellToEditText(cut("json"))).not.toContain(START);
+    expect(uneditableReason(cut())).toMatch(/too large to load in full .*50\.0 MB/);
+    expect(uneditableReason("ordinary")).toBeNull();
+    expect(uneditableReason({ $bytes: "AA==", len: 1 })).toBeNull();
+    expect(uneditableReason(null)).toBeNull();
+  });
+});
+
+describe("the order of a table page", () => {
+  const col = (name: string, o: Partial<PlanColumn> = {}): PlanColumn => ({ name, dataType: "integer", nullable: false, isPrimaryKey: false, ...o });
+  const withPk = [col("id", { isPrimaryKey: true }), col("name", { dataType: "text", nullable: true })];
+  const noPk = [col("n"), col("body", { dataType: "text", nullable: true })];
+  const small = { kind: "table" as const, estimatedRows: 1200 };
+  const order = (p: { orderBy: readonly { column: string; dir: string }[] }) => p.orderBy.map((k) => `${k.column} ${k.dir}`);
+
+  it("orders by the primary key and pages by it when every ordering column is NOT NULL", () => {
+    const p = planTablePage(withPk, [], small);
+    expect(order(p)).toEqual(["id asc"]);
+    expect(p).toMatchObject({ keyset: true, stableOrder: true, keyIdx: [0], names: ["id", "name"] });
+    // A nullable sort column cannot be paged by key; the primary key still breaks ties.
+    const sorted = planTablePage(withPk, [{ column: "name", dir: "desc" }, { column: "gone", dir: "asc" }], small);
+    expect(order(sorted)).toEqual(["name desc", "id asc"]);
+    expect(sorted).toMatchObject({ keyset: false, stableOrder: true });
+  });
+
+  // Without a primary key nothing fixed the order: `LIMIT n OFFSET m` over an unordered scan
+  // can hand out the same row on two pages and never show another.
+  it("breaks ties by ctid for a table without a primary key", () => {
+    const p = planTablePage(noPk, [], small);
+    expect(order(p)).toEqual(["tableoid asc", "ctid asc"]);
+    expect(p).toMatchObject({ keyset: false, stableOrder: true });
+    expect(buildSelectPage({ schema: "public", table: "log", columns: p.names, orderBy: p.orderBy, limit: 100, offset: 200 })).toBe(
+      'SELECT "n", "body"\nFROM "public"."log"\nORDER BY "tableoid" ASC, "ctid" ASC\nLIMIT 100\nOFFSET 200',
+    );
+    // After the user's own sort, which leaves ties wherever values repeat.
+    expect(order(planTablePage(noPk, [{ column: "body", dir: "desc" }], small))).toEqual(["body desc", "tableoid asc", "ctid asc"]);
+    // A materialized view is stored like a table.
+    expect(order(planTablePage(noPk, [], { kind: "materializedView", estimatedRows: 10 }))).toEqual(["ctid asc"]);
+  });
+
+  it("adds tableoid for a partitioned table, where ctid repeats from one partition to the next", () => {
+    expect(order(planTablePage(noPk, [], { kind: "partitionedTable", estimatedRows: 1200 }))).toEqual(["tableoid asc", "ctid asc"]);
+    expect(order(planTablePage(noPk, [{ column: "n", dir: "asc" }], { kind: "partitionedTable", estimatedRows: 1200 }))).toEqual(["n asc", "tableoid asc", "ctid asc"]);
+  });
+
+  it("leaves views and foreign tables alone, and says their order is not fixed", () => {
+    for (const kind of ["view", "foreignTable", null] as const) {
+      const p = planTablePage(noPk, [], { kind, estimatedRows: 10 });
+      expect(order(p)).toEqual([]);
+      expect(p.stableOrder).toBe(false);
+      // The user's sort is kept as it is; it does not make the order total.
+      const sorted = planTablePage(noPk, [{ column: "n", dir: "asc" }], { kind, estimatedRows: 10 });
+      expect(order(sorted)).toEqual(["n asc"]);
+      expect(sorted.stableOrder).toBe(false);
+    }
+  });
+
+  // Ordering by ctid alone makes the server read the whole table for every page (measured on
+  // Postgres 17: 94 ms against 0.04 ms for the first page of 3 million rows, growing with the
+  // table). Opening a very large table must not do that, so it stays unordered and says so.
+  it("does not order a large or unmeasured table by ctid alone, and says so", () => {
+    for (const estimatedRows of [CTID_ORDER_MAX_ROWS + 1, 500_000_000, null, -1, 0]) {
+      const p = planTablePage(noPk, [], { kind: "table", estimatedRows });
+      expect(order(p)).toEqual([]);
+      expect(p.stableOrder).toBe(false);
+    }
+    expect(planTablePage(noPk, [], { kind: "table", estimatedRows: CTID_ORDER_MAX_ROWS }).stableOrder).toBe(true);
+    // With a sort the server orders the rows anyway: the tie-break rides along.
+    const sorted = planTablePage(noPk, [{ column: "n", dir: "desc" }], { kind: "table", estimatedRows: 500_000_000 });
+    expect(order(sorted)).toEqual(["n desc", "tableoid asc", "ctid asc"]);
+    expect(sorted.stableOrder).toBe(true);
+    // A primary key needs none of this, whatever the size.
+    expect(order(planTablePage(withPk, [], { kind: "table", estimatedRows: 500_000_000 }))).toEqual(["id asc"]);
   });
 });

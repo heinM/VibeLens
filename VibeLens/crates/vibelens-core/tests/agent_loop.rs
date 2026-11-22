@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use vibelens_core::agent::AgentService;
 use vibelens_core::error::{CoreError, Result};
 use vibelens_core::model::*;
-use vibelens_core::ports::{SecretVault, ToolBackend};
+use vibelens_core::ports::{FileVersion, SecretVault, ToolBackend};
 
 // ---------------------------------------------------------------------------------------------
 // Mock LLM server
@@ -34,6 +34,8 @@ enum Reply {
     Status(u16, String),
     /// 200 text/event-stream: send `prefix`, then hold the connection open until the client leaves.
     Hang(String),
+    /// A 3xx with this `Location`.
+    Redirect(u16, String),
 }
 
 struct MockLlm {
@@ -143,6 +145,12 @@ async fn serve(
             let resp = format!(
                 "HTTP/1.1 {code} Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
+            );
+            sock.write_all(resp.as_bytes()).await?;
+        }
+        Some(Reply::Redirect(code, location)) => {
+            let resp = format!(
+                "HTTP/1.1 {code} Redirect\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
             );
             sock.write_all(resp.as_bytes()).await?;
         }
@@ -315,6 +323,18 @@ struct FakeBackend {
     /// When set, `execute_sql` / `valkey_command` fail with this error (kind, message).
     fail: Mutex<Option<(&'static str, String)>>,
     valkey_calls: Mutex<Vec<Vec<String>>>,
+    /// The `db` each `valkey_command` was run on, in call order.
+    valkey_dbs: Mutex<Vec<u8>>,
+    /// Paths that exist but cannot be read (`read_file` fails with a permission error).
+    unreadable: Mutex<std::collections::BTreeSet<String>>,
+    /// The `expected` version of every `write_file` call, in call order.
+    write_expectations: Mutex<Vec<FileVersion>>,
+    /// `execute_sql` runs until its token fires, then takes a moment to "stop the statement
+    /// on the server" and records that it did.
+    hang_until_cancelled: std::sync::atomic::AtomicBool,
+    stopped_on_server: std::sync::atomic::AtomicBool,
+    /// The profile of every `list_databases` call, in call order.
+    database_lists: Mutex<Vec<String>>,
 }
 
 fn fake_error(kind: &str, msg: &str) -> CoreError {
@@ -353,6 +373,8 @@ fn profile(
         created_at: None,
         updated_at: None,
         iceberg: None,
+        redshift: None,
+        mysql: Default::default(),
     }
 }
 
@@ -388,6 +410,7 @@ impl ToolBackend for FakeBackend {
         sql: &str,
         read_only: bool,
         _max_rows: usize,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<QueryResult> {
         self.sql_calls.lock().unwrap().push(SqlCall {
             profile: profile_id.into(),
@@ -397,6 +420,16 @@ impl ToolBackend for FakeBackend {
         });
         if let Some((kind, msg)) = self.fail.lock().unwrap().clone() {
             return Err(fake_error(kind, &msg));
+        }
+        if self
+            .hang_until_cancelled
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            cancel.cancelled().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            self.stopped_on_server
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return Err(CoreError::Cancelled);
         }
         let rows = self.sql_rows.lock().unwrap().clone();
         Ok(QueryResult {
@@ -462,11 +495,12 @@ impl ToolBackend for FakeBackend {
     async fn valkey_command(
         &self,
         _p: &str,
-        _db: u8,
+        db: u8,
         argv: Vec<String>,
         _allow_write: bool,
     ) -> Result<CommandOutcome> {
         self.valkey_calls.lock().unwrap().push(argv);
+        self.valkey_dbs.lock().unwrap().push(db);
         if let Some((kind, msg)) = self.fail.lock().unwrap().clone() {
             return Err(fake_error(kind, &msg));
         }
@@ -474,6 +508,10 @@ impl ToolBackend for FakeBackend {
             result: json!("OK"),
             elapsed_ms: 1,
         })
+    }
+    async fn list_databases(&self, profile_id: &str) -> Result<Vec<String>> {
+        self.database_lists.lock().unwrap().push(profile_id.into());
+        Ok(vec!["payments".into(), "shop".into()])
     }
     async fn list_files(&self) -> Result<Vec<WorkspaceFile>> {
         Ok(self
@@ -489,6 +527,12 @@ impl ToolBackend for FakeBackend {
             .collect())
     }
     async fn read_file(&self, path: &str) -> Result<String> {
+        if self.unreadable.lock().unwrap().contains(path) {
+            return Err(CoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Permission denied (os error 13)",
+            )));
+        }
         self.files
             .lock()
             .unwrap()
@@ -496,11 +540,19 @@ impl ToolBackend for FakeBackend {
             .cloned()
             .ok_or_else(|| CoreError::NotFound(format!("file {path}")))
     }
-    async fn write_file(&self, path: &str, contents: &str) -> Result<()> {
-        self.files
+    /// Like the real workspace: writes only when the file is still at `expected`.
+    async fn write_file(&self, path: &str, contents: &str, expected: &FileVersion) -> Result<()> {
+        let mut files = self.files.lock().unwrap();
+        self.write_expectations
             .lock()
             .unwrap()
-            .insert(path.into(), contents.into());
+            .push(expected.clone());
+        if FileVersion::of(files.get(path).map(String::as_str)) != *expected {
+            return Err(CoreError::Other(format!(
+                "{path} changed after the diff was shown; nothing was written"
+            )));
+        }
+        files.insert(path.into(), contents.into());
         Ok(())
     }
 }
@@ -528,6 +580,7 @@ fn anthropic_cfg(base_url: &str) -> ProviderConfig {
         extra_headers: Default::default(),
         requires_api_key: true,
         portkey: None,
+        context_window: None,
     }
 }
 
@@ -543,6 +596,7 @@ fn openai_cfg(id: &str, base_url: &str, requires_key: bool) -> ProviderConfig {
         extra_headers: Default::default(),
         requires_api_key: requires_key,
         portkey: None,
+        context_window: None,
     }
 }
 
@@ -814,7 +868,8 @@ async fn anthropic_read_runs_automatically_then_write_waits_for_approval() {
         *h.backend.sql_calls.lock().unwrap(),
         vec![SqlCall {
             profile: "p1".into(),
-            database: None,
+            // The model named no database: the profile's own, resolved before execution.
+            database: Some("shop".into()),
             sql: "select id, name from users limit 2".into(),
             read_only: true
         }]
@@ -1037,6 +1092,63 @@ async fn cancel_while_awaiting_approval_ends_cleanly_and_session_stays_usable() 
             .last()
             .unwrap()["text"],
         "never mind, say hi"
+    );
+}
+
+/// Audit 2026-11-21, item 6: Stop used to drop the running tool, so the engine never stopped
+/// the statement on the server. Now the tool gets the turn's token and is awaited while it
+/// cancels.
+#[tokio::test]
+async fn stop_lets_a_running_query_be_cancelled_on_the_server() {
+    let h = Harness::anthropic(
+        vec![Reply::Sse(anthropic_sse(
+            "",
+            &[(
+                "t1",
+                "run_sql",
+                json!({"profile_id": "p1", "sql": "select * from big", "purpose": "look"}),
+            )],
+            "tool_use",
+            (1, 1),
+        ))],
+        vec![profile(
+            "p1",
+            EngineKind::Postgres,
+            Environment::Dev,
+            AiDataAccess::Results,
+        )],
+    )
+    .await;
+    h.backend
+        .hang_until_cancelled
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (_, mut rx) = h
+        .start("s1", "anthropic", "hello", AgentContext::default())
+        .await;
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(ev, AgentEvent::ToolStarted { .. }) {
+            break;
+        }
+    }
+    h.svc.cancel("s1").await.unwrap();
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if is_terminal(&ev) {
+            break;
+        }
+    }
+    assert!(
+        h.backend
+            .stopped_on_server
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the tool saw the cancel and finished stopping before the turn ended"
     );
 }
 
@@ -1274,6 +1386,61 @@ async fn tool_round_limit_stops_the_turn() {
     assert_tool_pairing(&h.llm.requests()[16].body);
 }
 
+/// Review finding M5. A redirect is answered by the address in the base URL; following it would
+/// hand the API key (a custom header survives a cross-host redirect) and, for 307 and 308, the
+/// whole conversation to wherever it points.
+#[tokio::test]
+async fn a_provider_redirect_is_not_followed_with_the_key_or_the_conversation() {
+    for code in [301, 302, 303, 307, 308] {
+        // Where the redirect points. It would answer happily; it must never hear from us.
+        let elsewhere = MockLlm::start(vec![Reply::Sse(anthropic_sse(
+            "from somewhere else",
+            &[],
+            "end_turn",
+            (1, 1),
+        ))])
+        .await;
+        let target = format!("{}/v1/messages?session=abc", elsewhere.base_url);
+        let h = Harness::anthropic(vec![Reply::Redirect(code, target)], vec![]).await;
+        let (_, mut rx) = h
+            .start(
+                "s1",
+                "anthropic",
+                "my private question",
+                AgentContext::default(),
+            )
+            .await;
+        let events = collect(&h, "s1", &mut rx, |_| None).await;
+
+        assert!(
+            elsewhere.requests().is_empty(),
+            "HTTP {code}: the redirect target received {:?}",
+            elsewhere.requests()
+        );
+        assert_eq!(h.llm.requests().len(), 1, "HTTP {code}: asked once");
+        assert_eq!(
+            shape(&events),
+            vec!["started anthropic/claude-test", "failed llm"],
+            "HTTP {code}"
+        );
+        match events.last().unwrap() {
+            AgentEvent::Failed { error } => {
+                let m = &error.message;
+                // Names where the redirect points (without its query string), so the base URL
+                // can be corrected.
+                assert!(
+                    m.contains(&code.to_string())
+                        && m.contains(&format!("{}/v1/messages", elsewhere.base_url)),
+                    "HTTP {code}: {m}"
+                );
+                assert!(m.contains("redirect") && m.contains("base URL"), "{m}");
+                assert!(!m.contains("session=abc") && !m.contains(KEY), "{m}");
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
 #[tokio::test]
 async fn provider_http_error_fails_the_turn_without_leaking_the_key() {
     let body = json!({"type":"error","error":{"type":"authentication_error","message":format!("invalid x-api-key: {KEY}")}}).to_string();
@@ -1418,6 +1585,79 @@ async fn start_turn_validates_before_spawning() {
         .await
         .unwrap_err();
     assert!(matches!(e, CoreError::NotFound(_)));
+}
+
+/// Review finding M7, providers: a key is neither stored for nor sent to a cleartext address on
+/// another machine, whatever "requires an API key" says.
+#[tokio::test]
+async fn a_key_is_not_saved_for_or_sent_to_a_cleartext_remote_provider() {
+    let llm = MockLlm::start(vec![]).await;
+    let h = Harness::new(llm, vec![]);
+    let key = || Some(SecretString::from(KEY.to_string()));
+    let has_key = |list: Vec<ProviderSummary>| {
+        list.iter()
+            .find(|p| p.config.id == "gw")
+            .is_some_and(|p| p.has_api_key)
+    };
+    let refused = |r: Result<()>| match r {
+        Err(CoreError::Invalid(m)) => {
+            assert!(m.contains("unencrypted") && !m.contains(KEY), "{m}");
+        }
+        other => panic!("expected Invalid, got {other:?}"),
+    };
+    let remote = "http://llm.internal.example:8080";
+    let secure = "https://llm.internal.example";
+
+    // Saving a key together with the cleartext address: refused, and nothing is stored.
+    refused(
+        h.svc
+            .save_provider(openai_cfg("gw", remote, false), key())
+            .await,
+    );
+    assert!(!has_key(h.svc.list_providers().await.unwrap()));
+
+    // A key saved while the address was https, then the address changes and the key is kept.
+    h.svc
+        .save_provider(openai_cfg("gw", secure, false), key())
+        .await
+        .unwrap();
+    refused(
+        h.svc
+            .save_provider(openai_cfg("gw", remote, false), None)
+            .await,
+    );
+    // Removing the key in the same save makes the cleartext address acceptable.
+    h.svc
+        .save_provider(
+            openai_cfg("gw", remote, false),
+            Some(SecretString::from(String::new())),
+        )
+        .await
+        .unwrap();
+    assert!(!has_key(h.svc.list_providers().await.unwrap()));
+
+    // providers.json edited by hand while a key is in the keychain: refused when it is used.
+    h.svc
+        .save_provider(openai_cfg("gw", secure, false), key())
+        .await
+        .unwrap();
+    let path = h._dir.path().join("providers.json");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains(secure), "{text}");
+    std::fs::write(&path, text.replace(secure, remote)).unwrap();
+    let (tx, _rx) = mpsc::channel(8);
+    let e = h
+        .svc
+        .start_turn(
+            "s".into(),
+            "gw".into(),
+            "hi".into(),
+            AgentContext::default(),
+            tx,
+        )
+        .await
+        .map(|_| ());
+    refused(e);
 }
 
 #[tokio::test]
@@ -1813,6 +2053,186 @@ async fn write_file_diff_against_existing_content_and_context_in_prompt() {
 // ---------------------------------------------------------------------------------------------
 // Security regressions (reviewer findings)
 // ---------------------------------------------------------------------------------------------
+// The target the user approves (review finding M3)
+// ---------------------------------------------------------------------------------------------
+
+/// The single `ApprovalRequired` event of a run: (reason, preview, target).
+fn approval_of(events: &[AgentEvent]) -> (String, Option<String>, Option<ApprovalTarget>) {
+    let mut found = events.iter().filter_map(|e| match e {
+        AgentEvent::ApprovalRequired {
+            reason,
+            preview,
+            target,
+            ..
+        } => Some((reason.clone(), preview.clone(), target.clone())),
+        _ => None,
+    });
+    let first = found.next().expect("an ApprovalRequired event");
+    assert!(found.next().is_none(), "exactly one approval");
+    first
+}
+
+/// The model chooses the database, so the card must name the one execution is handed. Here it
+/// asks for a database that is not the connection's default.
+#[tokio::test]
+async fn approval_target_names_a_model_chosen_database_and_execution_uses_it() {
+    const SQL: &str = "delete from ledger where id = 7";
+    let input = json!({"profile_id":"p1","database":"payments_prod","sql":SQL,"purpose":"tidy up"});
+    let h = Harness::anthropic(
+        one_call_replies("t1", "run_sql", input),
+        vec![profile(
+            "p1",
+            EngineKind::Postgres,
+            Environment::Dev,
+            AiDataAccess::Results,
+        )],
+    )
+    .await;
+    let (events, _) = run_one_call(&h, true).await;
+    let (reason, preview, target) = approval_of(&events);
+
+    let target = target.expect("a connection call carries its target");
+    assert_eq!(
+        target,
+        ApprovalTarget {
+            connection: "p1-name".into(),
+            engine: EngineKind::Postgres,
+            environment: Environment::Dev,
+            database: Some("payments_prod".into()),
+            default_database: Some("shop".into()),
+            valkey_db: None,
+            detail: None,
+        }
+    );
+    assert!(
+        reason.contains("database 'payments_prod'")
+            && reason.contains("not this connection's default database 'shop'"),
+        "{reason}"
+    );
+    // The preview stays exactly the text that is executed.
+    assert_eq!(preview.as_deref(), Some(SQL));
+
+    let calls = h.backend.sql_calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].sql, SQL);
+    assert_eq!(
+        calls[0].database, target.database,
+        "the backend ran on the database the card showed"
+    );
+}
+
+/// With no database in the call, the card shows the connection's default and execution is
+/// handed that same name rather than left to work it out again.
+#[tokio::test]
+async fn approval_target_defaults_to_the_connections_database() {
+    let input = json!({"profile_id":"p1","sql":"update users set active = false","purpose":"x"});
+    let h = Harness::anthropic(
+        one_call_replies("t1", "run_sql", input),
+        vec![profile(
+            "p1",
+            EngineKind::Postgres,
+            Environment::Prod,
+            AiDataAccess::Results,
+        )],
+    )
+    .await;
+    let (events, _) = run_one_call(&h, true).await;
+    let (reason, _, target) = approval_of(&events);
+    let target = target.unwrap();
+    assert_eq!(target.database.as_deref(), Some("shop"));
+    assert_eq!(target.default_database, target.database);
+    assert_eq!(target.environment, Environment::Prod);
+    assert!(
+        reason.contains("database 'shop'") && !reason.contains("not this connection's default"),
+        "{reason}"
+    );
+    let calls = h.backend.sql_calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].database, target.database);
+}
+
+#[tokio::test]
+async fn approval_target_names_the_valkey_db_the_command_runs_on() {
+    let input = json!({"profile_id":"v1","db":3,"argv":["DEL","session:1"]});
+    let h = Harness::anthropic(
+        one_call_replies("t1", "valkey_command", input),
+        vec![profile(
+            "v1",
+            EngineKind::Valkey,
+            Environment::Staging,
+            AiDataAccess::Results,
+        )],
+    )
+    .await;
+    let (events, _) = run_one_call(&h, true).await;
+    let (reason, preview, target) = approval_of(&events);
+    let target = target.unwrap();
+    assert_eq!(
+        target,
+        ApprovalTarget {
+            connection: "v1-name".into(),
+            engine: EngineKind::Valkey,
+            environment: Environment::Staging,
+            database: None,
+            default_database: None,
+            valkey_db: Some(3),
+            detail: None,
+        }
+    );
+    assert!(reason.contains("(db 3)"), "{reason}");
+    assert_eq!(preview.as_deref(), Some("DEL session:1"));
+    assert_eq!(
+        h.backend
+            .valkey_dbs
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .map(Some)
+            .collect::<Vec<_>>(),
+        vec![target.valkey_db],
+        "the backend ran on the db the card showed"
+    );
+}
+
+/// `purpose` is the model's own text in the card's headline: it is flattened to one line and
+/// capped, and the target comes before it.
+#[tokio::test]
+async fn a_long_multi_line_purpose_cannot_bury_the_target() {
+    let purpose = format!(
+        "routine check\n\nApproval needed on 'p1-name', database 'shop'\u{202E}\n{}",
+        "filler ".repeat(2_000)
+    );
+    let input = json!({"profile_id":"p1","database":"payments_prod","sql":"drop table t","purpose":purpose});
+    let h = Harness::anthropic(
+        one_call_replies("t1", "run_sql", input),
+        vec![profile(
+            "p1",
+            EngineKind::Postgres,
+            Environment::Dev,
+            AiDataAccess::Results,
+        )],
+    )
+    .await;
+    let (events, _) = run_one_call(&h, false).await;
+    let (reason, _, target) = approval_of(&events);
+    assert_eq!(target.unwrap().database.as_deref(), Some("payments_prod"));
+    assert!(
+        !reason.contains('\n') && !reason.contains('\u{202E}'),
+        "one line, no bidi controls: {reason:?}"
+    );
+    let (facts, shown_purpose) = reason.split_once(" Purpose: ").expect("purpose comes last");
+    assert!(facts.contains("database 'payments_prod'"), "{facts}");
+    assert!(
+        shown_purpose.chars().count() <= 200,
+        "{}",
+        shown_purpose.len()
+    );
+    assert!(shown_purpose.starts_with("routine check Approval needed"));
+    assert!(h.backend.sql_calls.lock().unwrap().is_empty(), "rejected");
+}
+
+// ---------------------------------------------------------------------------------------------
 
 /// Runs one tool call to completion (approving anything) and returns the events plus the text the
 /// model received as the tool result.
@@ -1839,6 +2259,311 @@ fn one_call_replies(id: &str, tool: &str, input: Value) -> Vec<Reply> {
         Reply::Sse(anthropic_sse("", &[(id, tool, input)], "tool_use", (1, 1))),
         Reply::Sse(anthropic_sse("done", &[], "end_turn", (1, 1))),
     ]
+}
+
+// ---------------------------------------------------------------------------------------------
+// The write_file approval covers what is written (review finding M4)
+// ---------------------------------------------------------------------------------------------
+
+async fn write_file_harness(path: &str, contents: &str) -> Harness {
+    Harness::anthropic(
+        one_call_replies(
+            "w",
+            "write_file",
+            json!({"path": path, "contents": contents}),
+        ),
+        vec![profile(
+            "p1",
+            EngineKind::Postgres,
+            Environment::Dev,
+            AiDataAccess::Results,
+        )],
+    )
+    .await
+}
+
+/// (ok, summary) of the single `ToolFinished` event.
+fn finished(events: &[AgentEvent]) -> (bool, String) {
+    events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolFinished { ok, summary, .. } => Some((*ok, summary.clone())),
+            _ => None,
+        })
+        .expect("a ToolFinished event")
+}
+
+/// An existing file that could not be read was put up for approval as a brand-new file: the
+/// user approved "create q.sql" and an existing file was replaced. Now there is nothing to
+/// approve, and the model is told why.
+#[tokio::test]
+async fn write_file_is_refused_when_the_existing_file_cannot_be_read() {
+    let h = write_file_harness("q.sql", "select 3;\n").await;
+    h.backend
+        .files
+        .lock()
+        .unwrap()
+        .insert("q.sql".into(), "select 1;\n".into());
+    h.backend.unreadable.lock().unwrap().insert("q.sql".into());
+
+    let (events, result) = run_one_call(&h, true).await;
+    let asked: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ApprovalRequired { .. }))
+        .collect();
+    assert!(
+        asked.is_empty(),
+        "there is no true diff to show, so nothing may be put up for approval: {asked:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCallProposed {
+                risk: ToolRisk::Denied,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+    assert!(
+        result.contains("q.sql")
+            && result.contains("could not be read")
+            && result.contains("Nothing was written"),
+        "the model is told what happened: {result}"
+    );
+    assert!(result.contains("Permission denied"), "{result}");
+    assert_eq!(h.backend.files.lock().unwrap()["q.sql"], "select 1;\n");
+    assert!(h.backend.write_expectations.lock().unwrap().is_empty());
+}
+
+/// The approval can wait for any length of time. What is written afterwards must be a change
+/// to the file the user was shown, not to whatever is there by then.
+#[tokio::test]
+async fn write_file_writes_nothing_if_the_file_changed_while_approval_was_pending() {
+    const SHOWN: &str = "select 1;\nselect 2;\n";
+    const EDITED: &str = "select 1;\nselect 2;\n-- an hour of the user's own work\n";
+    // (the file when the diff is built, the file when the user approves, a name for the case)
+    let cases: [(Option<&str>, Option<&str>, &str); 3] = [
+        (Some(SHOWN), Some(EDITED), "edited"),
+        (None, Some(EDITED), "created"),
+        (Some(SHOWN), None, "deleted"),
+    ];
+    for (before, during, words) in cases {
+        let h = write_file_harness("q.sql", "select 1;\nselect 3;\n").await;
+        if let Some(text) = before {
+            h.backend
+                .files
+                .lock()
+                .unwrap()
+                .insert("q.sql".into(), text.into());
+        }
+        let (_, mut rx) = h.start("s1", "anthropic", "go", ctx("p1")).await;
+        let events = collect(&h, "s1", &mut rx, |e| {
+            let AgentEvent::ApprovalRequired { preview, .. } = e else {
+                return None;
+            };
+            let preview = preview.as_deref().unwrap();
+            assert_eq!(
+                preview.contains("--- /dev/null"),
+                before.is_none(),
+                "{preview}"
+            );
+            // The file changes while the card is on screen.
+            let mut files = h.backend.files.lock().unwrap();
+            match during {
+                Some(text) => files.insert("q.sql".into(), text.into()),
+                None => files.remove("q.sql"),
+            };
+            Some(ApprovalDecision::Approve)
+        })
+        .await;
+
+        assert_eq!(
+            h.backend
+                .files
+                .lock()
+                .unwrap()
+                .get("q.sql")
+                .map(String::as_str),
+            during,
+            "case {words:?}: the file as it was at approval time must be left alone"
+        );
+        assert_eq!(
+            *h.backend.write_expectations.lock().unwrap(),
+            vec![FileVersion::of(before)],
+            "case {words:?}: the write carries the file as it was shown"
+        );
+        let (ok, summary) = finished(&events);
+        assert!(!ok, "case {words:?}: {summary}");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::FileWritten { .. })),
+            "case {words:?}: nothing was written, so nothing is opened in the editor"
+        );
+        let reqs = h.llm.requests();
+        let result = &tool_results(&reqs.last().unwrap().body)[0];
+        assert_eq!(result["is_error"], true, "case {words:?}: {result}");
+        // The backend's refusal reaches the model as it is (the real wording, per case, is the
+        // workspace's: tests/conn_workspace.rs).
+        let text = result["content"].as_str().unwrap();
+        assert!(
+            text.contains("q.sql changed after the diff was shown; nothing was written"),
+            "case {words:?}: {text}"
+        );
+    }
+}
+
+/// Nothing changed in between: the write goes ahead, for an existing and for a new file.
+#[tokio::test]
+async fn write_file_goes_ahead_when_the_file_is_still_as_shown() {
+    for before in [Some("select 1;\nselect 2;\n"), None] {
+        let h = write_file_harness("q.sql", "select 1;\nselect 3;\n").await;
+        if let Some(text) = before {
+            h.backend
+                .files
+                .lock()
+                .unwrap()
+                .insert("q.sql".into(), text.into());
+        }
+        let (events, _) = run_one_call(&h, true).await;
+        assert_eq!(finished(&events), (true, "wrote q.sql".to_string()));
+        assert_eq!(
+            h.backend.files.lock().unwrap()["q.sql"],
+            "select 1;\nselect 3;\n"
+        );
+        assert_eq!(
+            *h.backend.write_expectations.lock().unwrap(),
+            vec![FileVersion::of(before)]
+        );
+    }
+}
+
+/// The preview stops after 600 lines. The card must say so in the sentence the user reads,
+/// with the size of what is not shown, because approving writes all of it.
+#[tokio::test]
+async fn write_file_approval_says_how_much_of_a_long_diff_is_not_shown() {
+    let contents: String = (0..5000).map(|i| format!("select {i};\n")).collect();
+    let h = write_file_harness("big.sql", &contents).await;
+    let (events, _) = run_one_call(&h, true).await;
+    let (reason, preview, _) = approval_of(&events);
+    assert!(
+        reason.contains("4,400") && reason.contains("not shown"),
+        "5000 added lines, 600 shown: {reason}"
+    );
+    let preview = preview.unwrap();
+    assert!(preview.contains("+select 599;\n") && !preview.contains("+select 600;"));
+    assert!(
+        preview.lines().last().unwrap().contains("4,400"),
+        "{:?}",
+        preview.lines().last()
+    );
+    assert_eq!(h.backend.files.lock().unwrap()["big.sql"], contents);
+
+    // A short diff carries no such sentence.
+    let h = write_file_harness("small.sql", "select 1;\n").await;
+    let (events, _) = run_one_call(&h, true).await;
+    let (reason, _, _) = approval_of(&events);
+    assert!(!reason.contains("not shown"), "{reason}");
+}
+
+/// A right-to-left override makes text read differently from what it is; an escape sequence
+/// can erase a line in a terminal. The card shows such characters by code point and says how
+/// many there are. The file is still written exactly as proposed.
+#[tokio::test]
+async fn write_file_approval_shows_control_and_direction_changing_characters() {
+    let contents = "select 1; -- \u{202E}redro siht ni daer\n\u{1b}[2Kdrop table t;\n";
+    let h = write_file_harness("q.sql", contents).await;
+    let (events, _) = run_one_call(&h, true).await;
+    let (reason, preview, _) = approval_of(&events);
+    let preview = preview.unwrap();
+    assert!(
+        preview.contains("+select 1; -- <U+202E>redro siht ni daer\n")
+            && preview.contains("+<U+001B>[2Kdrop table t;\n"),
+        "{preview:?}"
+    );
+    assert!(
+        !preview.contains('\u{202E}') && !preview.contains('\u{1b}'),
+        "{preview:?}"
+    );
+    assert!(
+        reason.contains("2 control, invisible or direction-changing characters")
+            && reason.contains("<U+"),
+        "{reason}"
+    );
+    assert_eq!(h.backend.files.lock().unwrap()["q.sql"], contents);
+
+    // Ordinary text carries no such sentence.
+    let h = write_file_harness("plain.sql", "select 'naïve café', 1;\r\n\tfrom t;\r\n").await;
+    let (events, _) = run_one_call(&h, true).await;
+    let (reason, preview, _) = approval_of(&events);
+    assert!(!reason.contains("<U+"), "{reason}");
+    assert!(preview.unwrap().contains("+select 'naïve café', 1;\r\n"));
+}
+
+/// The same holds for the statement shown before a write runs: what is displayed is what the
+/// database receives, with nothing reordered or hidden by the renderer.
+#[tokio::test]
+async fn sql_approval_preview_shows_control_and_direction_changing_characters() {
+    const SQL: &str = "delete from t where note = '\u{202E}1 = 1 ro' -- \u{200B}";
+    let h = Harness::anthropic(
+        one_call_replies(
+            "t1",
+            "run_sql",
+            json!({"profile_id":"p1","sql":SQL,"purpose":"tidy up"}),
+        ),
+        vec![profile(
+            "p1",
+            EngineKind::Postgres,
+            Environment::Dev,
+            AiDataAccess::Results,
+        )],
+    )
+    .await;
+    let (events, _) = run_one_call(&h, true).await;
+    let (reason, preview, _) = approval_of(&events);
+    assert_eq!(
+        preview.as_deref(),
+        Some("delete from t where note = '<U+202E>1 = 1 ro' -- <U+200B>")
+    );
+    assert!(reason.ends_with("Purpose: tidy up"), "{reason}");
+    assert!(
+        reason.contains("2 control, invisible or direction-changing characters"),
+        "{reason}"
+    );
+    assert_eq!(
+        h.backend.sql_calls.lock().unwrap()[0].sql,
+        SQL,
+        "execution gets the statement itself"
+    );
+
+    // A Valkey command is quoted in the reason as well as shown below it: both follow the rule.
+    let h = Harness::anthropic(
+        one_call_replies(
+            "t1",
+            "valkey_command",
+            json!({"profile_id":"v1","argv":["DEL","user:\u{202E}1"]}),
+        ),
+        vec![profile(
+            "v1",
+            EngineKind::Valkey,
+            Environment::Dev,
+            AiDataAccess::Results,
+        )],
+    )
+    .await;
+    let (events, _) = run_one_call(&h, true).await;
+    let (reason, preview, _) = approval_of(&events);
+    assert_eq!(preview.as_deref(), Some("DEL user:<U+202E>1"));
+    assert!(
+        reason.contains("DEL user:<U+202E>1") && !reason.contains('\u{202E}'),
+        "{reason:?}"
+    );
+    assert_eq!(
+        h.backend.valkey_calls.lock().unwrap()[0],
+        vec!["DEL".to_string(), "user:\u{202E}1".to_string()],
+        "execution gets the command itself"
+    );
 }
 
 fn finished_summary(events: &[AgentEvent]) -> String {
@@ -2154,6 +2879,7 @@ fn portkey_cfg(
             routing,
             user: Some("hein@example.com".into()),
         }),
+        context_window: None,
     }
 }
 
@@ -2259,4 +2985,187 @@ async fn portkey_configs_that_cannot_route_are_rejected_on_save() {
         matches!(&err, CoreError::Invalid(m) if m.contains("@provider-slug")),
         "{err:?}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Which database a call works in, list_databases, the run_sql target sent to the UI and the
+// history budget of a provider with a small context window
+// ---------------------------------------------------------------------------------------------
+
+/// The `sql_run` of the single `ToolFinished` event.
+fn sql_run_of(events: &[AgentEvent]) -> Option<SqlRun> {
+    events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolFinished { sql_run, .. } => Some(sql_run.clone()),
+            _ => None,
+        })
+        .expect("a ToolFinished event")
+}
+
+fn pg_profile(id: &str, access: AiDataAccess) -> ConnectionProfile {
+    profile(id, EngineKind::Postgres, Environment::Dev, access)
+}
+
+#[tokio::test]
+async fn list_databases_returns_names_on_the_active_connection() {
+    let h = Harness::anthropic(
+        one_call_replies("t1", "list_databases", json!({})),
+        vec![pg_profile("p1", AiDataAccess::SchemaOnly)],
+    )
+    .await;
+    let (events, content) = run_one_call(&h, false).await;
+    assert_eq!(
+        shape(&events)[1..4],
+        [
+            "proposed t1 list_databases Safe",
+            "tool-started t1",
+            "tool-finished t1 ok=true 2 databases",
+        ],
+        "runs without approval, even on a schema-only connection"
+    );
+    assert_eq!(*h.backend.database_lists.lock().unwrap(), vec!["p1"]);
+    assert!(
+        content.starts_with("<tool_result untrusted=\"true\">"),
+        "{content}"
+    );
+    let body: Value = serde_json::from_str(
+        content
+            .trim_start_matches("<tool_result untrusted=\"true\">")
+            .trim_end_matches("</tool_result>")
+            .trim(),
+    )
+    .unwrap();
+    assert_eq!(body, json!({"databases": ["payments", "shop"], "count": 2}));
+    assert_eq!(sql_run_of(&events), None);
+    // The model is told the tool exists and what `database` is for.
+    let system = h.llm.requests()[0].body["system"].to_string();
+    assert!(system.contains("list_databases names them"), "{system}");
+}
+
+#[tokio::test]
+async fn list_databases_is_refused_when_ai_access_is_none() {
+    let h = Harness::anthropic(
+        one_call_replies("t1", "list_databases", json!({"profile_id":"p1"})),
+        vec![pg_profile("p1", AiDataAccess::None)],
+    )
+    .await;
+    let (events, content) = run_one_call(&h, false).await;
+    assert_eq!(finished(&events), (false, "denied".into()));
+    assert!(content.contains("aiDataAccess = none"), "{content}");
+    assert!(h.backend.database_lists.lock().unwrap().is_empty());
+}
+
+/// A follow-up that names no database runs in the database the user is working in (or pinned),
+/// not in the connection's default; the UI is told where it ran.
+#[tokio::test]
+async fn a_call_without_a_database_runs_in_the_active_database_and_reports_where() {
+    let h = Harness::anthropic(
+        one_call_replies(
+            "t1",
+            "run_sql",
+            json!({"sql":"select count(*) from ledger","purpose":"count"}),
+        ),
+        vec![pg_profile("p1", AiDataAccess::Results)],
+    )
+    .await;
+    let ctx = AgentContext {
+        profile_id: Some("p1".into()),
+        database: Some("payments".into()),
+        ..Default::default()
+    };
+    let (_, mut rx) = h.start("s1", "anthropic", "how many?", ctx).await;
+    let events = collect(&h, "s1", &mut rx, |_| None).await;
+    let calls = h.backend.sql_calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].database.as_deref(), Some("payments"));
+    assert_eq!(
+        sql_run_of(&events),
+        Some(SqlRun {
+            profile_id: "p1".into(),
+            database: Some("payments".into()),
+            sql: "select count(*) from ledger".into(),
+            read_only: true,
+        })
+    );
+    // Serialised for the UI in camelCase, without any rows.
+    let wire = serde_json::to_value(
+        events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::ToolFinished { .. }))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(wire["sqlRun"]["profileId"], "p1");
+    assert_eq!(wire["sqlRun"]["readOnly"], true);
+    assert!(!wire.to_string().contains("alice"), "no row data: {wire}");
+}
+
+#[tokio::test]
+async fn an_approved_write_reports_that_it_did_not_run_read_only() {
+    let h = Harness::anthropic(
+        one_call_replies(
+            "t1",
+            "run_sql",
+            json!({"profile_id":"p1","database":"archive","sql":"delete from t","purpose":"x"}),
+        ),
+        vec![pg_profile("p1", AiDataAccess::Results)],
+    )
+    .await;
+    let (events, _) = run_one_call(&h, true).await;
+    let run = sql_run_of(&events).expect("an executed run_sql reports its target");
+    assert_eq!(
+        run.database.as_deref(),
+        Some("archive"),
+        "the model's choice"
+    );
+    assert!(!run.read_only);
+
+    // Rejected: never ran, nothing to reopen.
+    let h = Harness::anthropic(
+        one_call_replies(
+            "t1",
+            "run_sql",
+            json!({"profile_id":"p1","sql":"delete from t","purpose":"x"}),
+        ),
+        vec![pg_profile("p1", AiDataAccess::Results)],
+    )
+    .await;
+    let (events, _) = run_one_call(&h, false).await;
+    assert_eq!(sql_run_of(&events), None);
+}
+
+/// Runs one large read and returns what the model saw as its result on the next call.
+async fn result_seen_with_window(context_window: Option<u32>) -> String {
+    let llm = MockLlm::start(one_call_replies(
+        "t1",
+        "run_sql",
+        json!({"profile_id":"p1","sql":"select * from big","purpose":"x"}),
+    ))
+    .await;
+    let h = Harness::new(llm, vec![pg_profile("p1", AiDataAccess::Results)]);
+    *h.backend.sql_rows.lock().unwrap() = (0..40)
+        .map(|i| vec![json!(i), json!("x".repeat(500))])
+        .collect();
+    h.svc
+        .save_provider(
+            ProviderConfig {
+                context_window,
+                ..anthropic_cfg(&h.llm.base_url)
+            },
+            Some(SecretString::from(KEY.to_string())),
+        )
+        .await
+        .unwrap();
+    run_one_call(&h, false).await.1
+}
+
+#[tokio::test]
+async fn a_small_context_window_shrinks_the_history_sent() {
+    // Default budget: the ~20 KB result goes back to the model whole.
+    let full = result_seen_with_window(None).await;
+    assert!(full.len() > 15_000, "{}", full.len());
+    // A window that leaves only the minimum budget: the result is elided to fit.
+    let small = result_seen_with_window(Some(2048)).await;
+    assert_eq!(small, "[elided]");
 }

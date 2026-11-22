@@ -11,8 +11,8 @@
 //  * Numeric-typed values must look numeric before they are emitted (digits only inside the quotes).
 //  * The only free-form SQL is the user's "raw WHERE" text, which `validateRawWhere` fences in (no `;`,
 //    balanced quotes / parentheses / comments) and which is only ever used in read-only SELECTs.
-import type { Cell } from "../../ipc/types";
-import { hasInexactNumber, isBytesCell, NUMERIC_STRING, type BytesCell } from "../grid/cellFormat";
+import type { Cell, ObjectKind } from "../../ipc/types";
+import { findTruncated, formatBytes, hasInexactNumber, isBytesCell, isTruncatedCell, NUMERIC_STRING, type BytesCell } from "../grid/cellFormat";
 
 export class SqlGenError extends Error {
   constructor(message: string) {
@@ -182,9 +182,30 @@ function castType(type: string): string {
   return t.replace(/^(character|char)(?=$|\[)/i, "bpchar").replace(/^bit(?=$|\[)/i, "varbit");
 }
 
-/** SQL for one cell value, typed by the column's `dataType`. Throws `SqlGenError` for values that cannot be that type. */
+/**
+ * Why `cell` cannot be edited, filtered on or written into SQL: it is (or contains) a value that was
+ * too large to load in full, so only its start is known here. `null` for every ordinary value.
+ */
+export function uneditableReason(cell: Cell | undefined): string | null {
+  const cut = findTruncated(cell);
+  if (!cut) return null;
+  return `This value was too large to load in full (${formatBytes(cut.$truncated.bytes)}): only its start is known here, so it cannot be edited, filtered on or written into SQL. Use a SQL statement of your own for it.`;
+}
+
+/** Throws when `cell` is a cut value. `column` makes the message say where. */
+function refuseTruncated(cell: Cell | undefined, column?: string): void {
+  const reason = uneditableReason(cell);
+  if (reason) throw new SqlGenError(column ? `Column ${column}: ${reason}` : reason);
+}
+
+/**
+ * SQL for one cell value, typed by the column's `dataType`. Throws `SqlGenError` for values that
+ * cannot be that type, and for a value that was cut when it was read: writing its start (or its
+ * marker) would replace the real value with something else.
+ */
 export function sqlLiteral(cell: Cell | undefined, dataType: string, opts: LiteralOptions = {}): string {
   if (cell === null || cell === undefined) return "NULL";
+  refuseTruncated(cell);
   const cat = typeCategory(dataType);
   const type = dataType.trim();
   const cast = opts.cast !== false && isSafeTypeName(type) ? `::${castType(type)}` : "";
@@ -229,6 +250,8 @@ export function sqlLiteral(cell: Cell | undefined, dataType: string, opts: Liter
 /** The text shown in an editor / filter box for a cell value. */
 export function cellToEditText(cell: Cell | undefined): string {
   if (cell === null || cell === undefined) return "";
+  // Never the start of a cut value: text that can be edited and saved must be the whole value.
+  if (isTruncatedCell(cell)) return "";
   if (typeof cell === "string") return cell;
   if (typeof cell === "number" || typeof cell === "boolean") return String(cell);
   if (isBytesCell(cell)) return `\\x${bytesToHex(cell)}`;
@@ -602,6 +625,79 @@ export interface SelectPageOptions {
   after?: { keys: readonly KeysetKey[]; values: readonly Cell[] } | null;
 }
 
+/** What the page plan needs to know about a column. */
+export interface PlanColumn {
+  name: string;
+  dataType: string;
+  nullable: boolean;
+  isPrimaryKey: boolean;
+}
+
+export interface PagePlan {
+  orderBy: SortKey[];
+  /** Page by the ordering key (primary key present, every ordering column NOT NULL) instead of OFFSET. */
+  keyset: boolean;
+  keys: KeysetKey[];
+  /** Index of each ordering column in `names` (the cursor values of a row). */
+  keyIdx: number[];
+  names: string[];
+  /** False when nothing fixes the order of rows, so that pages can overlap or miss rows. */
+  stableOrder: boolean;
+}
+
+/**
+ * Above this many rows (the catalog's estimate) a table with no primary key and no sort is not
+ * ordered by `ctid`. Postgres cannot read a table in `ctid` order without scanning all of it, for
+ * every page: measured on Postgres 17, the first page of a 3-million-row table took 94 ms ordered
+ * against 0.04 ms unordered, and the cost grows with the table. Below the limit that is cheap.
+ */
+export const CTID_ORDER_MAX_ROWS = 250_000;
+
+/**
+ * How a table page is ordered and paged.
+ *
+ * The user's sort comes first. Then something has to break ties, or `LIMIT n OFFSET m` can hand
+ * out one row on two pages and never show another:
+ * - the primary key, when there is one (and paging goes by key if every ordering column is
+ *   NOT NULL);
+ * - otherwise the row's physical position, `ctid`, for relations that have one: materialized
+ *   views, and tables together with `tableoid`, because `ctid` starts again in each partition
+ *   and in each inheritance child. That order holds as long as the rows are not rewritten.
+ *
+ * A view or a foreign table has no `ctid`. A table that is large, or whose size is not known,
+ * gets the `ctid` tie-break only behind a sort (see {@link CTID_ORDER_MAX_ROWS}). In both cases
+ * `stableOrder` is false and the UI says so.
+ */
+export function planTablePage(columns: readonly PlanColumn[], sort: readonly SortKey[], relation: { kind: ObjectKind | null; estimatedRows: number | null }): PagePlan {
+  const pk = columns.filter((c) => c.isPrimaryKey);
+  const known = new Set(columns.map((c) => c.name));
+  const userSort = sort.filter((s) => known.has(s.column));
+  const orderBy: SortKey[] = [...userSort];
+  for (const c of pk) if (!orderBy.some((k) => k.column === c.name)) orderBy.push({ column: c.name, dir: "asc" });
+
+  let stableOrder = pk.length > 0;
+  if (!stableOrder) {
+    // A plain table can have children too (inheritance, which is also what a TimescaleDB
+    // hypertable is), and reading the parent reads them, so it gets `tableoid` like a partitioned one.
+    const physical =
+      relation.kind === "table" || relation.kind === "partitionedTable" ? ["tableoid", "ctid"] : relation.kind === "materializedView" ? ["ctid"] : null;
+    // No estimate, or zero, tells nothing about the size: the table was never analysed (zero is
+    // what Postgres 13 and older report then) or it was empty when it last was.
+    const rows = relation.estimatedRows;
+    const cheap = userSort.length > 0 || (rows !== null && rows > 0 && rows <= CTID_ORDER_MAX_ROWS);
+    if (physical && cheap) {
+      for (const column of physical) orderBy.push({ column, dir: "asc" });
+      stableOrder = true;
+    }
+  }
+
+  const byName = new Map(columns.map((c) => [c.name, c]));
+  const keyset = pk.length > 0 && orderBy.every((k) => byName.get(k.column)?.nullable === false);
+  const keys: KeysetKey[] = orderBy.map((k) => ({ column: k.column, dataType: byName.get(k.column)?.dataType ?? "text", dir: k.dir }));
+  const keyIdx = orderBy.map((k) => columns.findIndex((c) => c.name === k.column));
+  return { orderBy, keyset, keys, keyIdx, names: columns.map((c) => c.name), stableOrder };
+}
+
 export function buildSelectPage(o: SelectPageOptions): string {
   if (o.columns.length === 0) throw new SqlGenError("The table has no columns.");
   const conds: string[] = [];
@@ -642,6 +738,7 @@ function whereByKey(t: TableTarget, pk: Readonly<Record<string, Cell>>): string 
   return names
     .map((n) => {
       const v = pk[n];
+      refuseTruncated(v, n);
       return v === null || v === undefined ? `${quoteIdent(n)} IS NULL` : `${quoteIdent(n)} = ${sqlLiteral(v, colType(t, n))}`;
     })
     .join(" AND ");
@@ -650,13 +747,14 @@ function whereByKey(t: TableTarget, pk: Readonly<Record<string, Cell>>): string 
 export function buildUpdate(t: TableTarget, pk: Readonly<Record<string, Cell>>, set: Readonly<Record<string, Cell>>): string {
   const names = Object.keys(set);
   if (names.length === 0) throw new SqlGenError("Nothing to update.");
-  const assigns = names.map((n) => `${quoteIdent(n)} = ${sqlLiteral(set[n], colType(t, n))}`);
+  const assigns = names.map((n) => (refuseTruncated(set[n], n), `${quoteIdent(n)} = ${sqlLiteral(set[n], colType(t, n))}`));
   return `UPDATE ${qualifiedName(t.schema, t.name)} SET ${assigns.join(", ")} WHERE ${whereByKey(t, pk)};`;
 }
 
 export function buildInsert(t: TableTarget, values: Readonly<Record<string, Cell>>): string {
   const names = Object.keys(values);
   if (names.length === 0) return `INSERT INTO ${qualifiedName(t.schema, t.name)} DEFAULT VALUES;`;
+  for (const n of names) refuseTruncated(values[n], n);
   return `INSERT INTO ${qualifiedName(t.schema, t.name)} (${names.map(quoteIdent).join(", ")}) VALUES (${names.map((n) => sqlLiteral(values[n], colType(t, n))).join(", ")});`;
 }
 

@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { Ban, Check, ShieldAlert } from "lucide-react";
+import { AlertTriangle, Ban, Check, ShieldAlert } from "lucide-react";
 import type { ApprovalDecision } from "../../ipc/types";
 import { cn } from "../../lib/cn";
-import { Button } from "../ui";
+import { Button, EnvBadge } from "../ui";
 import { Key, modKey } from "../ui/formKit";
 import type { ApprovalItem } from "./agentReducer";
 import { CodeBody } from "./CodeView";
-import { compactJson, mentionsProd, previewKind, summarizeToolArgs } from "./toolSummary";
+import { compactJson, describeTarget, mentionsProd, previewKind, summarizeToolArgs } from "./toolSummary";
 
 /** Compact record of a resolved approval, shown in the transcript. */
 export function ApprovalNote({ item }: { item: ApprovalItem }) {
@@ -42,7 +42,10 @@ export function ApprovalCard({
   const [busy, setBusy] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const decide = useRef<(approve: boolean) => void>(() => undefined);
-  const danger = mentionsProd(item.reason) || prodContext;
+  // The target comes from the backend (stored profile + the database execution will use), so it
+  // is shown apart from the reason, which carries the model's own `purpose` text.
+  const target = describeTarget(item.target);
+  const danger = target?.environment === "prod" || mentionsProd(item.reason) || prodContext;
   const kind = previewKind(item.tool, item.preview);
 
   decide.current = (approve: boolean) => {
@@ -96,7 +99,27 @@ export function ApprovalCard({
             <span className={cn("font-semibold", danger ? "text-danger" : "text-warn")}>{danger ? "Approval needed: production" : "Approval needed"}</span>
             <span className="font-mono">{item.tool}</span>
           </div>
-          <p className="selectable mt-0.5 text-[13px] font-medium leading-snug text-fg">{item.reason}</p>
+          {target && (
+            <div className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[12.5px] text-fg" data-testid="approval-target">
+              <span className="text-muted">Runs on</span>
+              <span className="selectable font-semibold">{target.connection}</span>
+              <EnvBadge env={target.environment} />
+              {target.where && <span className="selectable font-mono font-semibold">{target.where}</span>}
+            </div>
+          )}
+          {target?.detail && (
+            // From Rust (the stored profile), not from the model. A text node: React escapes it.
+            <p className="selectable mt-0.5 font-mono text-[12px] text-fg/90" data-testid="approval-target-detail">
+              {target.detail}
+            </p>
+          )}
+          {target?.warning && (
+            <p className="mt-0.5 flex items-center gap-1 text-[12px] font-medium text-warn">
+              <AlertTriangle className="size-3.5 shrink-0" />
+              <span className="selectable">{target.warning}</span>
+            </p>
+          )}
+          <p className="selectable mt-1 text-[13px] font-medium leading-snug text-fg">{item.reason}</p>
         </div>
       </div>
       <div className="mx-3 mb-2 flex min-h-0 flex-1 flex-col overflow-hidden rounded-md border border-border bg-bg">

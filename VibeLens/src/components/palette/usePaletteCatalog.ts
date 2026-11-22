@@ -18,7 +18,9 @@ import { copyToClipboard } from "../ui/clipboard";
 import { openErdTab, openTableTab } from "../table/openTableTab";
 import { insertIntoActiveEditor } from "./insertIntoEditor";
 import { openIcebergQueryTab } from "./icebergPalette";
-import { catalogItems, connectionItems, fileItems, functionItems, historyItems, insertionText, type GoActions, type PaletteItem } from "./items";
+import { dialectOf } from "../../lib/sqlIntel/dialect";
+import { catalogItems, connectionItems, fileItems, functionItems, historyItems, insertionText, mysqlCatalogItems, type GoActions, type PaletteItem } from "./items";
+import { mySelectAllSql } from "../sidebar/mysqlTreeModel";
 import { usePaletteStore } from "./paletteStore";
 
 const MAX_FUNCTION_SCHEMAS = 16;
@@ -54,6 +56,19 @@ export function usePaletteCatalog(): PaletteCatalog {
     () => (profiles ?? []).filter((p) => p.engine === "postgres" && statuses?.some((s) => s.profileId === p.id && s.state === "connected")),
     [profiles, statuses],
   );
+
+  const connectedMy = useMemo(
+    () => (profiles ?? []).filter((p) => p.engine === "mysql" && statuses?.some((s) => s.profileId === p.id && s.state === "connected")),
+    [profiles, statuses],
+  );
+  const { metas: myMetas, loading: myLoading } = useQueries({
+    queries: connectedMy.map((p) => ({
+      queryKey: schemaMetadataKey(p.id, p.database ?? null, "mysql"),
+      queryFn: () => api.mySchemaMetadata(p.id, p.database ?? null),
+      staleTime: 5 * 60_000,
+    })),
+    combine: combineMeta,
+  });
 
   const { metas, loading } = useQueries({
     queries: connectedPg.map((p) => ({
@@ -93,6 +108,7 @@ export function usePaletteCatalog(): PaletteCatalog {
         if (stateOf(p.id) === "disconnected") connect.mutate(p.id);
         if (p.engine === "postgres") newSqlTab({ profileId: p.id, database: p.database ?? null });
         else if (p.engine === "iceberg") openIcebergQueryTab(p);
+        else if (p.engine === "redshift" || p.engine === "mysql") newSqlTab({ profileId: p.id, database: null });
         else newValkeyConsole({ profileId: p.id });
       },
       openTable: (p, db, schema, name) => {
@@ -100,7 +116,7 @@ export function usePaletteCatalog(): PaletteCatalog {
         openTableTab(p.id, db, schema, name);
       },
       insertName: (p, db, schema, name) => {
-        const text = insertionText(schema, name);
+        const text = insertionText(schema, name, dialectOf(p));
         void insertIntoActiveEditor(text).then((ok) => {
           if (!ok) newSqlTab({ profileId: p.id, database: db, contents: text });
         });
@@ -128,6 +144,16 @@ export function usePaletteCatalog(): PaletteCatalog {
       const m = metas[i];
       if (m) out.push(...catalogItems(p, p.database ?? null, m, actions));
     });
+    connectedMy.forEach((p, i) => {
+      const m = myMetas[i];
+      if (m)
+        out.push(
+          ...mysqlCatalogItems(p, m, {
+            query: (db, name) => newSqlTab({ profileId: p.id, database: db, title: name, contents: mySelectAllSql(db, name), autoRun: true }),
+            insertName: actions.insertName,
+          }),
+        );
+    });
     fnTargets.forEach((t, i) => {
       const o = objects[i];
       if (o) out.push(...functionItems(t.p, t.p.database ?? null, o, actions));
@@ -135,7 +161,7 @@ export function usePaletteCatalog(): PaletteCatalog {
     out.push(...fileItems(files ?? [], actions));
     out.push(...historyItems(history, actions));
     return out;
-  }, [profiles, stateOf, actions, connectedPg, metas, fnTargets, objects, files, history]);
+  }, [profiles, stateOf, actions, connectedPg, metas, connectedMy, myMetas, newSqlTab, fnTargets, objects, files, history]);
 
-  return { items, loading, connectedPg };
+  return { items, loading: loading + myLoading, connectedPg };
 }

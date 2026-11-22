@@ -9,6 +9,7 @@ import type { ConnectionProfile, IcebergField, IcebergNamespace } from "../../ip
 import { useUIStore } from "../../store/useUIStore";
 import { useWorkspaceStore } from "../../store/useWorkspaceStore";
 import { ErrorBox } from "../ui";
+import { TreeSsoReauth } from "../connections/SsoReauth";
 import { useMenu, type MenuEntry } from "../ui/Menu";
 import { copyToClipboard } from "../ui/clipboard";
 import { cn } from "../../lib/cn";
@@ -16,7 +17,8 @@ import { requestAutoRun } from "../editor/autoRun";
 import { IcebergGlyph } from "../iceberg/IcebergGlyph";
 import { compactNumber } from "../iceberg/iceFormat";
 import { iceQueries } from "../iceberg/iceQueries";
-import { qualifiedName, selectAllSql } from "../iceberg/iceSql";
+import { namespaceSql, qualifiedName, selectAllSql } from "../iceberg/iceSql";
+import { dialectOf } from "../../lib/sqlIntel/dialect";
 import { joinNamespace, openIcebergTableTab } from "../iceberg/openIcebergTab";
 import { catalogSummary } from "../connections/icebergForm";
 import { TREE_ROW_H, TreeRow } from "./TreeRow";
@@ -58,6 +60,7 @@ export function IcebergTree({ profile }: { profile: ConnectionProfile }) {
 
   const ice = profile.iceberg;
   const catalogLabel = ice ? catalogSummary(ice.catalog) : "Catalog";
+  const dialect = dialectOf(profile);
 
   const topQ = useQuery(iceQueries.namespaces(pid, []));
 
@@ -198,15 +201,15 @@ export function IcebergTree({ profile }: { profile: ConnectionProfile }) {
       const ns = row.namespace;
       const name = row.table.name;
       items.push({ label: "Open table", hint: "double-click", icon: <TableProperties className="size-3.5" />, onSelect: () => openTable(row) });
-      items.push({ label: "Query in new SQL tab", icon: <FileCode2 className="size-3.5" />, onSelect: () => openIcebergSqlTab(pid, name, selectAllSql(ns, name)) });
+      items.push({ label: "Query in new SQL tab", icon: <FileCode2 className="size-3.5" />, onSelect: () => openIcebergSqlTab(pid, name, selectAllSql(ns, name, 100, dialect)) });
       items.push("separator");
-      items.push({ label: "Copy qualified name", icon: <Copy className="size-3.5" />, onSelect: () => void copyToClipboard(qualifiedName(ns, name)) });
+      items.push({ label: "Copy qualified name", icon: <Copy className="size-3.5" />, onSelect: () => void copyToClipboard(qualifiedName(ns, name, dialect)) });
       items.push("separator");
       items.push({ label: "Refresh", icon: <RefreshCw className="size-3.5" />, onSelect: () => refresh(row) });
     } else if (row.kind === "namespace" && row.namespace) {
       const ns = row.namespace;
       items.push({ label: row.expanded ? "Collapse" : "Expand", onSelect: () => toggle(row) });
-      items.push({ label: "Copy name", icon: <Copy className="size-3.5" />, onSelect: () => void copyToClipboard(ns.map((l) => qualifiedName([], l)).join(".")) });
+      items.push({ label: "Copy name", icon: <Copy className="size-3.5" />, onSelect: () => void copyToClipboard(namespaceSql(ns, dialect)) });
       items.push("separator");
       items.push({ label: "Refresh", icon: <RefreshCw className="size-3.5" />, onSelect: () => refresh(row) });
     } else if (row.kind === "field" && row.field) {
@@ -270,6 +273,7 @@ export function IcebergTree({ profile }: { profile: ConnectionProfile }) {
     return (
       <div className="space-y-2 p-2">
         <ErrorBox error={asError(topQ.error)} />
+        <TreeSsoReauth profile={profile} error={asError(topQ.error)} reload={() => void topQ.refetch()} />
         <button type="button" onClick={() => void topQ.refetch()} className="inline-flex h-7 items-center gap-1.5 rounded-md border border-border bg-panel-2 px-2.5 text-xs font-medium hover:border-muted/60">
           <RefreshCw className="size-3.5" /> Try again
         </button>

@@ -161,7 +161,10 @@ pub(crate) struct ProviderClient {
 }
 
 impl ProviderClient {
-    /// Fails with `Invalid` when the config is unusable (no model, missing key).
+    /// Fails with `Invalid` when the config is unusable (no model, missing key) or would not
+    /// pass a save: `providers.json` can be edited by hand, so the rules of
+    /// [`validate`](super::store::validate) run again here, and a key is never attached to a
+    /// cleartext address on another machine.
     pub fn new(
         cfg: ProviderConfig,
         key: Option<SecretString>,
@@ -173,15 +176,16 @@ impl ProviderClient {
                 cfg.label
             )));
         }
-        if cfg.kind == ProviderKind::Portkey {
-            portkey::validate(&cfg)?;
-        }
+        super::store::validate(&cfg)?;
         let key = key.filter(|k| !k.expose_secret().trim().is_empty());
         if cfg.requires_api_key && key.is_none() {
             return Err(CoreError::Invalid(format!(
                 "add an API key for {} in Settings",
                 cfg.label
             )));
+        }
+        if key.is_some() {
+            super::store::check_key_is_not_sent_in_cleartext(&cfg)?;
         }
         Ok(Self { cfg, key, http })
     }
@@ -232,7 +236,8 @@ impl ProviderClient {
         format!("{}{}", self.cfg.base_url.trim_end_matches('/'), path)
     }
 
-    /// POSTs `body` as JSON with `headers` plus the config's `extra_headers`.
+    /// POSTs `body` as JSON with `headers` plus the config's `extra_headers`. A 3xx answer is an
+    /// error (see [`redirect_error`](Self::redirect_error)); every other status is returned.
     pub(super) async fn post(
         &self,
         url: &str,
@@ -258,7 +263,32 @@ impl ProviderClient {
                 redact(&describe_reqwest_error(&e), self.key_str())
             ))
         })?;
+        if resp.status().is_redirection() {
+            return Err(self.redirect_error(url, &resp));
+        }
         Ok(resp)
+    }
+
+    /// The error for a 3xx answer. The HTTP client does not follow redirects (the key and the
+    /// conversation would go along), so the user is told where the endpoint pointed and can
+    /// decide whether that belongs in the base URL.
+    fn redirect_error(&self, requested: &str, resp: &reqwest::Response) -> CoreError {
+        let target = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|location| redirect_target(requested, location));
+        let to = match target {
+            Some(t) => format!(" to {}", redact(&t, self.key_str())),
+            None => String::new(),
+        };
+        CoreError::Llm(format!(
+            "{} answered with a redirect (HTTP {}){to}. VibeLens does not follow redirects, because \
+             your API key and the conversation would be sent to that address. If it is the right \
+             endpoint, set it as this provider's base URL",
+            self.cfg.label,
+            resp.status().as_u16()
+        ))
     }
 
     /// Reads a non-2xx response into an `Llm` error carrying the provider's own message.
@@ -317,6 +347,21 @@ fn describe_reqwest_error(e: &reqwest::Error) -> String {
         src = s.source();
     }
     msg
+}
+
+/// Where a `Location` header points, resolved against the URL that was requested, as
+/// `scheme://host[:port]/path`. Credentials, query and fragment are left out: this goes into an
+/// error message, and a redirect URL can carry tokens there.
+fn redirect_target(requested: &str, location: &str) -> Option<String> {
+    let mut target = url::Url::parse(requested)
+        .ok()?
+        .join(location.trim())
+        .ok()?;
+    let _ = target.set_username("");
+    let _ = target.set_password(None);
+    target.set_query(None);
+    target.set_fragment(None);
+    Some(target.to_string())
 }
 
 /// Pulls a human message out of a provider error body (Anthropic, OpenAI and Gemini shapes),
@@ -420,6 +465,93 @@ pub(crate) fn parse_tool_args(raw: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cfg(base_url: &str, requires_api_key: bool) -> ProviderConfig {
+        ProviderConfig {
+            id: "gw".into(),
+            label: "Gateway".into(),
+            kind: ProviderKind::OpenAiCompatible,
+            base_url: base_url.into(),
+            model: "m".into(),
+            max_tokens: 1024,
+            temperature: None,
+            extra_headers: Default::default(),
+            requires_api_key,
+            portkey: None,
+            context_window: None,
+        }
+    }
+
+    fn client(cfg: ProviderConfig, key: Option<&str>) -> Result<ProviderClient> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        ProviderClient::new(
+            cfg,
+            key.map(|k| SecretString::from(k.to_string())),
+            reqwest::Client::new(),
+        )
+    }
+
+    fn refusal(r: Result<ProviderClient>) -> String {
+        match r {
+            Err(CoreError::Invalid(m)) => m,
+            Err(e) => panic!("expected Invalid, got {e:?}"),
+            Ok(_) => panic!("expected Invalid, got a usable client"),
+        }
+    }
+
+    /// Review finding M7. "No API key needed" can be ticked while a key from earlier is still
+    /// in the keychain; it would be attached and sent in the clear.
+    #[test]
+    fn a_key_is_never_attached_to_a_cleartext_remote_endpoint() {
+        const K: &str = "sk-test-0123456789";
+        let m = refusal(client(cfg("http://llm.internal:8080/v1", false), Some(K)));
+        assert!(m.contains("unencrypted") && !m.contains(K), "{m}");
+
+        // Nothing to leak without a key; this machine and https take the key.
+        assert!(client(cfg("http://llm.internal:8080/v1", false), None).is_ok());
+        assert!(client(cfg("http://localhost:11434/v1", false), Some(K)).is_ok());
+        assert!(client(cfg("https://llm.example/v1", false), Some(K)).is_ok());
+    }
+
+    /// `providers.json` can be edited by hand, so what `validate` refuses on save is refused
+    /// again on use.
+    #[test]
+    fn a_config_is_validated_again_when_it_is_used() {
+        const K: &str = "sk-test-0123456789";
+        let m = refusal(client(cfg("http://llm.internal/v1", true), Some(K)));
+        assert!(m.contains("unencrypted"), "{m}");
+
+        let mut c = cfg("https://llm.example/v1", true);
+        c.extra_headers
+            .insert("Authorization".into(), "Bearer abc".into());
+        let m = refusal(client(c, Some(K)));
+        assert!(m.contains("credential") && !m.contains("abc"), "{m}");
+
+        refusal(client(cfg("ftp://llm.example/v1", false), None));
+    }
+
+    #[test]
+    fn redirect_targets_are_shown_without_credentials_or_query() {
+        let from = "https://api.example.com/v1/messages";
+        assert_eq!(
+            redirect_target(from, "https://login.example.net/sso?token=abc#frag").as_deref(),
+            Some("https://login.example.net/sso")
+        );
+        assert_eq!(
+            redirect_target(from, "https://user:pw@other.example:8443/x").as_deref(),
+            Some("https://other.example:8443/x")
+        );
+        // Relative targets resolve against the request, as an HTTP client would.
+        assert_eq!(
+            redirect_target(from, "/login?next=/v1").as_deref(),
+            Some("https://api.example.com/login")
+        );
+        assert_eq!(
+            redirect_target(from, " messages/ ").as_deref(),
+            Some("https://api.example.com/v1/messages/")
+        );
+        assert_eq!(redirect_target("not a url", "/x"), None);
+    }
 
     #[test]
     fn redacts_keys() {

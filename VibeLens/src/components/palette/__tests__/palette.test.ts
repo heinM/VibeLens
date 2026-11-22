@@ -46,8 +46,8 @@ describe("catalog items", () => {
   it("functions carry their signature", () => {
     const a = goActions();
     const fns = functionItems(prof("p1", "X"), null, [
-      { schema: "shop", name: "order_total", kind: "function", comment: null, estimatedRows: null, signature: "(order_id bigint)" },
-      { schema: "shop", name: "orders", kind: "table", comment: null, estimatedRows: 1, signature: null },
+      { schema: "shop", name: "order_total", kind: "function", comment: null, estimatedRows: null, signature: "(order_id bigint)", isPartition: false, parentSchema: null, parentName: null },
+      { schema: "shop", name: "orders", kind: "table", comment: null, estimatedRows: 1, signature: null, isPartition: false, parentSchema: null, parentName: null },
     ], a);
     expect(fns).toHaveLength(1);
     expect(fns[0].subtitle).toBe("(order_id bigint)");
@@ -171,6 +171,15 @@ describe("buildCommands", () => {
       "Interface mode: Agent-first",
     ])
       expect(t).toContain(want);
+  });
+
+  it("offers workspace file import only when the action is wired, and runs it", () => {
+    expect(titles(env())).not.toContain("Import files into workspace");
+    const importWorkspaceFiles = vi.fn();
+    const e = env({ actions: { ...actions(), importWorkspaceFiles } });
+    expect(titles(e)).toContain("Import files into workspace");
+    buildCommands(e).find((c) => c.id === "cmd:import-workspace-files")!.run();
+    expect(importWorkspaceFiles).toHaveBeenCalledTimes(1);
   });
 
   it("hides the agent panel toggle in classic mode", () => {

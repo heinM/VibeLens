@@ -1,7 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { cellKind, copyText, displayText, escapeField, formatDelimited, formatTextTable, isNumericType } from "../cellFormat";
+import {
+  cellKind,
+  containsTruncated,
+  copyText,
+  countTruncated,
+  displayText,
+  escapeField,
+  formatDelimited,
+  formatTextTable,
+  isNumericType,
+  isTruncatedCell,
+  rowsToObjects,
+  truncatedNote,
+  withTruncatedNote,
+} from "../cellFormat";
 import { defuseFormula } from "../exportFormats";
-import type { ColumnMeta } from "../../../ipc/types";
+import type { ColumnMeta, TruncatedCell } from "../../../ipc/types";
 
 const cols: ColumnMeta[] = [
   { name: "id", typeName: "int8", typeOid: 20 },
@@ -68,5 +82,73 @@ describe("cellFormat", () => {
     expect(out.split("\n")[0]).toBe("id │ note");
     expect(out).toContain(" 1 │ a");
     expect(out).toContain("22 │ NULL");
+  });
+});
+
+// Review finding H1: a value over 1 MiB arrives as a marker holding only its start. The marker is
+// not the value, so nothing here may pass the start off as the whole.
+describe("values that were cut when they were read", () => {
+  const SECRET_TAIL = "start-of-the-value";
+  const cut = (kind: TruncatedCell["$truncated"]["kind"], bytes: number, preview = SECRET_TAIL): TruncatedCell => ({ $truncated: { kind, bytes, preview } });
+  const text = cut("text", 52_428_800);
+
+  it("recognises the marker, and only the marker", () => {
+    expect(isTruncatedCell(text)).toBe(true);
+    expect(isTruncatedCell(cut("bytes", 9, "3q2+"))).toBe(true);
+    for (const v of [null, "x", 1, [text], { $bytes: "AA==", len: 1 }, { $truncated: true }, { $truncated: { kind: "text" } }, { ...text, other: 1 }]) {
+      expect(isTruncatedCell(v)).toBe(false);
+    }
+  });
+
+  it("is a kind of its own, not text, bytes or json", () => {
+    expect(cellKind(text)).toBe("truncated");
+    expect(cellKind(cut("bytes", 9, "3q2+"))).toBe("truncated");
+    expect(cellKind(cut("json", 9, '{"a": [1'))).toBe("truncated");
+  });
+
+  it("shows the start in the grid behind a plain label", () => {
+    const shown = displayText(text);
+    expect(shown).toMatch(/^‹cut: 50\.0 MB of text›/);
+    expect(shown).toContain(SECRET_TAIL);
+    // Binary and unreadable values have no start worth showing.
+    expect(displayText(cut("bytes", 3 * 1024 * 1024, "3q2+"))).toBe("‹cut: 3.0 MB of binary data›");
+    expect(displayText(cut("other", 2_000_000, ""))).toBe("‹cut: 1.9 MB value›");
+  });
+
+  it("copies a note that says the value is cut, never the partial value", () => {
+    const note = copyText(text);
+    expect(note).toBe(truncatedNote(text));
+    expect(note).toBe("‹value not loaded in full: 52,428,800 bytes of text›");
+    expect(note).not.toContain(SECRET_TAIL);
+    expect(copyText(cut("json", 2_000_000, '{"a": [1'))).not.toContain('{"a"');
+  });
+
+  it("puts the note, not the start, into delimited copies and the text view", () => {
+    const cols2: ColumnMeta[] = [
+      { name: "id", typeName: "int8", typeOid: 20 },
+      { name: "body", typeName: "text", typeOid: 25 },
+    ];
+    const rows = [["1", text]];
+    const tsv = formatDelimited(cols2, rows, { r0: 0, r1: 0, c0: 0, c1: 1 }, "\t", false);
+    expect(tsv).toBe(`1\t${truncatedNote(text)}`);
+    expect(formatTextTable(cols2, rows, 10)).not.toContain(SECRET_TAIL);
+    expect(rowsToObjects(cols2, rows, 10)).toEqual([{ id: "1", body: truncatedNote(text) }]);
+  });
+
+  it("counts cut values, also inside nested JSON, so a copy can say so", () => {
+    const nested = { device: "a", payload: text };
+    const rows = [
+      ["1", text, null],
+      ["2", "ok", nested],
+      ["3", "ok", { fine: true }],
+    ];
+    expect(containsTruncated(nested)).toBe(true);
+    expect(containsTruncated({ fine: [1, { deeper: "x" }] })).toBe(false);
+    expect(countTruncated(rows)).toBe(2);
+    expect(countTruncated(rows, { r0: 1, r1: 2, c0: 0, c1: 1 })).toBe(0);
+    expect(countTruncated(rows, { r0: 0, r1: 0, c0: 1, c1: 1 })).toBe(1);
+    expect(withTruncatedNote("Copied 3 rows", 0)).toBe("Copied 3 rows");
+    expect(withTruncatedNote("Copied 3 rows", 1)).toBe("Copied 3 rows. 1 value was too large to load and is a placeholder, not data");
+    expect(withTruncatedNote("Copied 3 rows", 2)).toBe("Copied 3 rows. 2 values were too large to load and are placeholders, not data");
   });
 });

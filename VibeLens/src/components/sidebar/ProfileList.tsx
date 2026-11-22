@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Database, Ellipsis, FlaskConical, Import, Plus, Zap } from "lucide-react";
+import { Ellipsis, FlaskConical, Import, Plus } from "lucide-react";
 import { useUIStore } from "../../store/useUIStore";
 import { useWorkspaceStore } from "../../store/useWorkspaceStore";
 import { useConnect, useConnectionStatuses, useDisconnect } from "../../hooks/useConnectionStatus";
@@ -12,11 +12,11 @@ import { cn } from "../../lib/cn";
 import { Button, EnvBadge, ErrorBox, IconButton } from "../ui";
 import { useMenu, type MenuEntry } from "../ui/Menu";
 import { SkeletonRows, StatusDot } from "../ui/wsKit";
-import { IcebergGlyph } from "../iceberg/IcebergGlyph";
+import { EngineIcon } from "../ui/EngineIcon";
+import { ENGINE_NAME } from "../../lib/engines";
+import { redshiftSummary } from "../connections/redshiftForm";
 import { demoProfiles } from "./demoProfiles";
 import { SectionHeader } from "./TreeRow";
-
-const ENGINE_NAME = { postgres: "PostgreSQL", valkey: "Valkey", iceberg: "Apache Iceberg" } as const;
 
 /** An empty worksheet bound to an Iceberg connection (the Postgres-only `newSqlTab` would drop the binding). */
 function openIcebergBlankTab(profileId: string) {
@@ -27,6 +27,7 @@ function openIcebergBlankTab(profileId: string) {
 }
 
 function profileTitle(p: ConnectionProfile): string {
+  if (p.engine === "redshift") return `${p.name} (${redshiftSummary(p.redshift).replace(/^Redshift/, ENGINE_NAME.redshift)})`;
   if (p.engine !== "iceberg" || !p.iceberg) return `${p.name} (${ENGINE_NAME[p.engine]}, ${p.host}:${p.port})`;
   const c = p.iceberg.catalog;
   const where = c.kind === "rest" || c.kind === "sql" ? c.uri : c.kind === "hms" ? c.address : c.kind === "s3Tables" ? c.tableBucketArn : `Glue ${c.aws.region}`;
@@ -74,7 +75,9 @@ export function ProfileList() {
         ? { label: "New SQL tab", onSelect: () => newSqlTab({ profileId: p.id, database: null }) }
         : p.engine === "iceberg"
           ? { label: "New SQL tab", onSelect: () => openIcebergBlankTab(p.id) }
-          : { label: "New Valkey console", onSelect: () => newValkeyConsole({ profileId: p.id }) },
+          : p.engine === "redshift" || p.engine === "mysql"
+            ? { label: "New SQL tab", onSelect: () => newSqlTab({ profileId: p.id, database: null }) }
+            : { label: "New Valkey console", onSelect: () => newValkeyConsole({ profileId: p.id }) },
       "separator",
       { label: "Edit connection…", onSelect: () => openWizard(p.id) },
     ];
@@ -149,7 +152,7 @@ export function ProfileList() {
               )}
             >
               {selected && <span aria-hidden className="absolute inset-y-1 left-0 w-0.5 rounded-r bg-accent" />}
-              {p.engine === "postgres" ? <Database className="size-4 shrink-0 text-sky-500" /> : p.engine === "iceberg" ? <IcebergGlyph className="size-4 shrink-0 text-cyan-400" /> : <Zap className="size-4 shrink-0 text-rose-400" />}
+              <EngineIcon engine={p.engine} />
               <span className="min-w-0 flex-1 truncate text-[13px]">{p.name || "(unnamed)"}</span>
               <EnvBadge env={p.environment} />
               <StatusDot state={st} />

@@ -78,12 +78,16 @@ export function ResultsPanel({ runner, localError, context }: { runner: QueryRun
     if (firstErr >= 0 && !userPicked.current) setActive(firstErr);
   }, [firstErr]);
 
-  const shownError = localError ?? error;
+  // Dismissal covers this run's error only: a new run (new runId) or a new error object shows again.
+  const [dismissed, setDismissed] = useState<{ runId: number; error: ErrorPayload } | null>(null);
+  const rawError = localError ?? error;
+  const shownError = rawError && dismissed?.runId === runId && dismissed.error === rawError ? null : rawError;
+  const dismissError = rawError ? () => setDismissed({ runId, error: rawError }) : undefined;
   const collapsed = collapseTabs(results.length);
   const current = results[Math.min(active, results.length - 1)];
 
   if (results.length === 0) {
-    if (shownError) return <div className="h-full overflow-auto p-3"><ErrorBox error={shownError} /></div>;
+    if (shownError) return <div className="h-full overflow-auto p-3"><ErrorBox error={shownError} onDismiss={dismissError} /></div>;
     if (running) {
       return (
         <div className="flex h-full items-center justify-center gap-2 text-muted">
@@ -114,7 +118,7 @@ export function ResultsPanel({ runner, localError, context }: { runner: QueryRun
     <div className="flex h-full min-h-0 flex-col">
       {shownError && (
         <div className="shrink-0 border-b border-border p-2">
-          <ErrorBox error={shownError} />
+          <ErrorBox error={shownError} onDismiss={dismissError} />
         </div>
       )}
       {collapsed && (

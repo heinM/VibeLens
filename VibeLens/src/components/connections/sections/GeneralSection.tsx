@@ -1,9 +1,10 @@
-import { Database, Zap } from "lucide-react";
+import { Database, Server, Warehouse, Zap } from "lucide-react";
 import type { Environment } from "../../../ipc/types";
 import { cn } from "../../../lib/cn";
 import { Input } from "../../ui";
 import { IcebergGlyph } from "../../iceberg/IcebergGlyph";
 import { FormField, Notice, NumberField, RadioCards, SegmentedControl, invalidRing } from "../../ui/formKit";
+import { usesHostPort } from "../../../lib/defaults";
 import { switchEngine } from "../draft";
 import type { SectionProps } from "./types";
 
@@ -23,13 +24,15 @@ export function GeneralSection({ profile, editing, patch, patchIceberg, err }: S
       <FormField label="Engine" hint={editing ? "The engine can't be changed after a connection is created." : undefined}>
         <RadioCards
           ariaLabel="Engine"
-          columns={3}
+          columns={2}
           value={profile.engine}
           onChange={(engine) => patch((p) => switchEngine(p, engine))}
           options={[
             { value: "postgres", title: "PostgreSQL", description: "Aurora, RDS and self-hosted.", icon: <Database className="size-4" />, disabled: editing && profile.engine !== "postgres" },
             { value: "valkey", title: "Valkey / Redis", description: "ElastiCache, MemoryDB and self-hosted.", icon: <Zap className="size-4" />, disabled: editing && profile.engine !== "valkey" },
             { value: "iceberg", title: "Apache Iceberg", description: "Lakehouse tables on S3, Glue, S3 Tables or a REST catalog.", icon: <IcebergGlyph />, disabled: editing && profile.engine !== "iceberg" },
+            { value: "mysql", title: "MySQL", description: "MySQL 8, Aurora MySQL, RDS MySQL and self-hosted.", icon: <Server className="size-4" />, disabled: editing && profile.engine !== "mysql" },
+            { value: "redshift", title: "Amazon Redshift", description: "Provisioned or Serverless, signed in with IAM through the Data API.", icon: <Warehouse className="size-4" />, disabled: editing && profile.engine !== "redshift" },
           ]}
         />
       </FormField>
@@ -40,13 +43,13 @@ export function GeneralSection({ profile, editing, patch, patchIceberg, err }: S
           data-autofocus
           value={profile.name}
           autoComplete="off"
-          placeholder={profile.engine === "postgres" ? "orders-db (prod)" : profile.engine === "iceberg" ? "lakehouse (prod)" : "session-cache"}
+          placeholder={{ postgres: "orders-db (prod)", mysql: "shop-db (prod)", iceberg: "lakehouse (prod)", redshift: "warehouse (prod)", valkey: "session-cache" }[profile.engine]}
           className={err("name") ? invalidRing : undefined}
           onChange={(e) => patch((p) => ({ ...p, name: e.target.value }))}
         />
       </FormField>
 
-      {profile.engine !== "iceberg" && (
+      {usesHostPort(profile.engine) && (
       <div className="grid grid-cols-[1fr_110px] gap-3">
         <FormField label="Host" htmlFor="wz-host" error={err("host")}>
           <Input
@@ -54,7 +57,7 @@ export function GeneralSection({ profile, editing, patch, patchIceberg, err }: S
             value={profile.host}
             spellCheck={false}
             autoComplete="off"
-            placeholder={profile.engine === "postgres" ? "mydb.cluster-xyz.eu-west-1.rds.amazonaws.com" : "my-cache.xxxxxx.use1.cache.amazonaws.com"}
+            placeholder={profile.engine === "valkey" ? "my-cache.xxxxxx.use1.cache.amazonaws.com" : "mydb.cluster-xyz.eu-west-1.rds.amazonaws.com"}
             className={cn("font-mono", err("host") && invalidRing)}
             onChange={(e) => patch((p) => ({ ...p, host: e.target.value }))}
           />
@@ -79,8 +82,17 @@ export function GeneralSection({ profile, editing, patch, patchIceberg, err }: S
         </FormField>
       )}
 
-      {profile.engine === "postgres" && (
-        <FormField label="Database" htmlFor="wz-db" error={err("database")} hint="The database opened first. You can browse the others from the sidebar.">
+      {(profile.engine === "postgres" || profile.engine === "mysql") && (
+        <FormField
+          label={profile.engine === "mysql" ? "Default database" : "Database"}
+          htmlFor="wz-db"
+          error={err("database")}
+          hint={
+            profile.engine === "mysql"
+              ? "Required. Unqualified names in SQL resolve here, and the agent works here unless told otherwise. You can browse the others from the sidebar."
+              : "The database opened first. You can browse the others from the sidebar."
+          }
+        >
           <Input
             id="wz-db"
             value={profile.database ?? ""}
@@ -112,7 +124,9 @@ export function GeneralSection({ profile, editing, patch, patchIceberg, err }: S
         <Notice tone="warn">
           {profile.engine === "iceberg"
             ? "Production: expiring snapshots and writes ask for the connection name. Give the catalog credentials read-only access for anything the AI agent touches."
-            : "Production: use a least-privilege database role for anything the AI agent touches. The agent\u2019s read-only check is a safety net, not a security boundary."}
+            : profile.engine === "redshift"
+              ? "Production: writes ask for the connection name. Each statement commits on its own, so there is no transaction to roll back. Give the IAM identity a read-only database role for anything the AI agent touches."
+              : "Production: use a least-privilege database role for anything the AI agent touches. The agent\u2019s read-only check is a safety net, not a security boundary."}
         </Notice>
       )}
 

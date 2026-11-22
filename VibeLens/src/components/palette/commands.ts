@@ -1,9 +1,12 @@
 // The "Commands" list (⌘⇧P). Pure builder: everything it needs arrives in `env`.
-import type { ConnectionProfile, ConnectionState } from "../../ipc/types";
+import type { ConnectionProfile, ConnectionState, EngineKind } from "../../ipc/types";
 import type { AiMode } from "../../store/useUIStore";
 import { AI_MODES } from "../layout/aiModes";
 import type { ErdTarget } from "./erdTarget";
 import type { PaletteItem } from "./items";
+
+/** Engine named on the Connect / Disconnect rows. */
+const ENGINE_PALETTE_META: Record<EngineKind, string> = { postgres: "PostgreSQL", iceberg: "Iceberg", redshift: "Redshift", mysql: "MySQL", valkey: "Valkey" };
 
 export interface CommandActions {
   newSqlTab: () => void;
@@ -11,6 +14,8 @@ export interface CommandActions {
   newConnection: () => void;
   /** Opens the importer (DataGrip, DBeaver, Azure Data Studio, pgAdmin, pg_service.conf). */
   importConnections?: () => void;
+  /** Native picker, then copies the chosen files into the workspace folder. */
+  importWorkspaceFiles?: () => void;
   openSettings: () => void;
   setAiMode: (m: AiMode) => void;
   toggleTheme: () => void;
@@ -85,6 +90,9 @@ export function buildCommands(env: CommandEnv): PaletteItem[] {
   }
   if (env.connectedPg > 0) out.push(cmd("refresh-schema", "Database", "Refresh schema cache", { icon: "refresh", run: a.refreshSchema, search: "reload catalog tables metadata", meta: env.connectedPg > 1 ? `${env.connectedPg} connections` : undefined }));
   out.push(cmd("refresh-files", "Database", "Refresh workspace files", { icon: "refresh", run: a.refreshFiles, search: "reload worksheets" }));
+  if (a.importWorkspaceFiles) {
+    out.push(cmd("import-workspace-files", "Database", "Import files into workspace", { icon: "file", run: a.importWorkspaceFiles, search: "add copy bring worksheets sql file folder open" }));
+  }
 
   for (const p of env.profiles) {
     const st = env.stateOf(p.id);
@@ -94,8 +102,8 @@ export function buildCommands(env: CommandEnv): PaletteItem[] {
         icon: live ? "unplug" : "plug",
         tone: live ? "muted" : "emerald",
         env: p.environment,
-        meta: p.engine === "postgres" ? "PostgreSQL" : p.engine === "iceberg" ? "Iceberg" : "Valkey",
-        search: `${p.engine === "iceberg" ? "iceberg lakehouse" : p.host} ${live ? "close" : "open"}`,
+        meta: ENGINE_PALETTE_META[p.engine],
+        search: `${p.engine === "iceberg" ? "iceberg lakehouse" : p.engine === "redshift" ? "redshift warehouse" : p.host} ${live ? "close" : "open"}`,
         run: () => (live ? a.disconnect(p.id) : a.connect(p.id)),
       }),
     );

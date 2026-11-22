@@ -2,6 +2,8 @@
 
 use serde::Serialize;
 
+use crate::model::PresentedHostKey;
+
 pub type Result<T> = std::result::Result<T, CoreError>;
 
 #[derive(Debug, thiserror::Error)]
@@ -24,6 +26,14 @@ pub enum CoreError {
     Valkey(String),
     #[error("tunnel: {0}")]
     Tunnel(String),
+    /// The SSH host has no pinned key, so the connection stopped after the key exchange and
+    /// before any authentication. Only a user action in the UI may pin the key.
+    #[error(
+        "the SSH host key of {}:{} has not been trusted yet. The server presented {}. \
+         Check that against the server's real key, then trust it to connect",
+        .0.host, .0.port, .0.fingerprint
+    )]
+    UnknownHostKey(PresentedHostKey),
     #[error("vault: {0}")]
     Vault(String),
     #[error("LLM provider: {0}")]
@@ -55,6 +65,7 @@ impl CoreError {
             CoreError::Database(_) => "database",
             CoreError::Valkey(_) => "valkey",
             CoreError::Tunnel(_) => "tunnel",
+            CoreError::UnknownHostKey(_) => "unknown_host_key",
             CoreError::Vault(_) => "vault",
             CoreError::Llm(_) => "llm",
             CoreError::Io(_) => "io",
@@ -73,14 +84,25 @@ impl CoreError {
 pub struct ErrorPayload {
     pub code: String,
     pub message: String,
+    /// With code `unknown_host_key`: the key the server presented, for the trust dialog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_key: Option<PresentedHostKey>,
+}
+
+impl ErrorPayload {
+    /// A payload that is only a code and a message.
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        ErrorPayload {
+            code: code.into(),
+            message: message.into(),
+            host_key: None,
+        }
+    }
 }
 
 impl From<CoreError> for ErrorPayload {
     fn from(e: CoreError) -> Self {
-        ErrorPayload {
-            code: e.code().to_string(),
-            message: e.to_string(),
-        }
+        ErrorPayload::from(&e)
     }
 }
 
@@ -89,6 +111,10 @@ impl From<&CoreError> for ErrorPayload {
         ErrorPayload {
             code: e.code().to_string(),
             message: e.to_string(),
+            host_key: match e {
+                CoreError::UnknownHostKey(key) => Some(key.clone()),
+                _ => None,
+            },
         }
     }
 }

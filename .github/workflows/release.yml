@@ -3,9 +3,11 @@ name: Release
 # Builds installers for macOS (universal), Windows (x64) and Linux (x64) into a DRAFT GitHub release.
 # Signing/notarisation happen only when the corresponding secrets exist (see docs/RELEASING.md §9),
 # so this works unsigned out of the box.
+#
+# Started by hand only, on the tag to build:  gh workflow run release.yml --ref vX.Y.Z
+# (or Actions → Release → Run workflow → pick the tag). Pushing a tag does not start it, so a
+# release built on a Mac with scripts/release-local.sh is not built a second time by runners.
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
@@ -127,7 +129,7 @@ jobs:
           projectPath: VibeLens
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v__VERSION__' }}
           releaseName: "VibeLens v__VERSION__"
-          releaseBody: "VibeLens 0.1.0 Release Candidate 2. See VibeLens/RELEASE_NOTES_RC2.md for changes and verification details."
+          releaseBody: "See VibeLens/RELEASE_NOTES___VERSION__.md in the repository for changes and verification details."
           releaseDraft: true
           prerelease: ${{ contains(github.ref_name, '-') }}
           args: ${{ github.ref_type == 'tag' && contains(github.ref_name, '-') && matrix.name == 'Linux (x64)' && '--bundles deb,appimage' || matrix.args }}

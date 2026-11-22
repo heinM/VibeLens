@@ -1,11 +1,13 @@
 // Presentation helpers for agent tool calls. Argument shapes come from the Rust agent, so
 // everything here is defensive: unknown shapes fall back to compact JSON.
+import type { ApprovalTarget, Environment, SqlRun } from "../../ipc/types";
 
 export type ToolIconName = "list" | "schema" | "table" | "sql" | "key" | "files" | "file" | "write" | "other";
 
 export function toolIconName(tool: string): ToolIconName {
   switch (tool) {
     case "list_connections":
+    case "list_databases":
       return "list";
     case "get_schema":
       return "schema";
@@ -62,7 +64,8 @@ export function summarizeToolArgs(tool: string, args: unknown): string {
       s = pick(args, "sql", "query", "statement");
       break;
     case "describe_table": {
-      const schema = pick(args, "schema");
+      // Postgres and Redshift send `schema`; Iceberg sends its namespace levels.
+      const schema = isRecord(args) && Array.isArray(args.namespace) ? args.namespace.join(".") || null : pick(args, "schema", "namespace");
       const table = pick(args, "table", "name");
       s = table ? (schema ? `${schema}.${table}` : table) : null;
       break;
@@ -82,7 +85,7 @@ export function summarizeToolArgs(tool: string, args: unknown): string {
       s = pick(args, "path", "dir", "directory");
       break;
     case "get_schema":
-      s = pick(args, "schema");
+      s = pick(args, "schema", "namespace", "database");
       break;
     default:
       break;
@@ -92,6 +95,47 @@ export function summarizeToolArgs(tool: string, args: unknown): string {
 
 /** True when text clearly concerns production (for the red approval treatment). */
 export const mentionsProd = (s: string | null | undefined): boolean => !!s && /\bprod(uction)?\b/i.test(s);
+
+/** What the approval card's fixed header says about where a call runs. */
+export interface TargetSummary {
+  connection: string;
+  environment: Environment;
+  /** "database shop" (Postgres) or "db 3" (Valkey); null when the engine has neither. */
+  where: string | null;
+  /** Set when the statement runs somewhere other than the connection's default database. */
+  warning: string | null;
+  /** Rust's one-line description of the engine target (Redshift, Trino, Spark). Present only when sent. */
+  detail?: string;
+}
+
+/** Backend text for the fixed header: one line, no control characters, bounded. */
+export function targetDetailText(detail: string | null | undefined): string | null {
+  if (typeof detail !== "string") return null;
+  // eslint-disable-next-line no-control-regex
+  const t = detail.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ").replace(/\s+/g, " ").trim();
+  if (!t) return null;
+  return t.length > 240 ? `${t.slice(0, 239)}…` : t;
+}
+
+/**
+ * Turns the backend-resolved target into the card's header text. The model picks the database
+ * (and the Valkey db number), so this is the user's only reliable view of where a call lands.
+ */
+export function describeTarget(target: ApprovalTarget | null | undefined): TargetSummary | null {
+  if (!target) return null;
+  let where: string | null = null;
+  let warning: string | null = null;
+  if (target.database != null) {
+    where = `database ${target.database}`;
+    if (target.defaultDatabase != null && target.defaultDatabase !== target.database) {
+      warning = `Not this connection's default database (${target.defaultDatabase}).`;
+    }
+  } else if (target.valkeyDb != null) {
+    where = `db ${target.valkeyDb}`;
+  }
+  const detail = targetDetailText(target.detail);
+  return { connection: target.connection, environment: target.environment, where, warning, ...(detail ? { detail } : {}) };
+}
 
 export type PreviewKind = "sql" | "diff" | "text";
 
@@ -110,4 +154,14 @@ export function formatElapsed(ms: number | null): string {
 
 export function formatTokens(n: number): string {
   return n.toLocaleString("en-US");
+}
+
+/**
+ * What a run_sql card offers once it ran: reopening the SQL (always) and re-running it in a tab
+ * (only when Rust ran it read-only). Both use the connection and database Rust reported.
+ */
+export function sqlRunActions(item: { tool: string; sqlRun: SqlRun | null; status?: string }): { open: boolean; run: boolean } {
+  const r = item.tool === "run_sql" ? item.sqlRun : null;
+  // A call that failed is not offered for a one-click re-run.
+  return { open: !!r, run: !!r && r.readOnly && (item.status === undefined || item.status === "ok") };
 }

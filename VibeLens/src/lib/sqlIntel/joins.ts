@@ -1,7 +1,8 @@
 // Join-condition suggestions for `JOIN x ON |`: foreign keys first (either direction), then a
 // conservative naming-convention guess (`orders.customer_id` ~ `customers.id`) when no FK exists.
 import type { TableDescription } from "../../ipc/types";
-import { type Catalog, ident } from "./catalog";
+import { type Catalog, ident as identIn } from "./catalog";
+import type { SqlDialect } from "./dialect";
 import { type Relation, exposedName } from "./scope";
 import { lookupTable } from "./catalog";
 
@@ -13,7 +14,7 @@ export interface JoinSuggestion {
   fk: boolean;
 }
 
-const norm = (s: string) => s.replace(/\s+/g, "").replace(/"/g, "").toLowerCase();
+const norm = (s: string) => s.replace(/\s+/g, "").replace(/["`]/g, "").toLowerCase();
 
 const singular = (s: string): string => (s.endsWith("ies") ? s.slice(0, -3) + "y" : s.endsWith("ses") ? s.slice(0, -2) : s.endsWith("s") ? s.slice(0, -1) : s);
 
@@ -25,7 +26,8 @@ function sameTable(a: TableDescription, schema: string, name: string): boolean {
  * `right` is the relation being joined; `lefts` the relations already in the FROM clause. The
  * condition is written left-hand side first: `FROM orders o JOIN customers c ON o.customer_id = c.id`.
  */
-export function joinConditions(cat: Catalog | null, right: Relation, lefts: Relation[], existingOnText: string): JoinSuggestion[] {
+export function joinConditions(cat: Catalog | null, right: Relation, lefts: Relation[], existingOnText: string, dialect?: SqlDialect | null): JoinSuggestion[] {
+  const ident = (name: string) => identIn(name, false, dialect);
   const rt = right.kind === "table" ? lookupTable(cat, right.parts) : undefined;
   if (!rt) return [];
   const r = ident(exposedName(right));

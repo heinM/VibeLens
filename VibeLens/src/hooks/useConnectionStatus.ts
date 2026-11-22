@@ -1,6 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../ipc/commands";
 import type { ConnectionStatus } from "../ipc/types";
+import { useHostKeyPrompt } from "../components/connections/hostKeyPrompt";
+import { connectTrustingHostKey } from "../components/connections/hostKey";
 
 export const STATUS_KEY = ["connection-status"] as const;
 
@@ -24,10 +26,22 @@ export function useIsConnected(profileId: string | null | undefined): boolean {
   return useConnectionStatus(profileId)?.state === "connected";
 }
 
+/**
+ * Connects a profile. When its SSH host has no pinned key, the user is shown the key the server
+ * presented and decides; trusting pins it on the profile and connects again (see `hostKey.ts`).
+ */
 export function useConnect() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (profileId: string) => api.connect(profileId),
+    mutationFn: (profileId: string) =>
+      connectTrustingHostKey(profileId, {
+        connect: api.connect,
+        ask: useHostKeyPrompt.getState().ask,
+        trust: async (id, key) => {
+          await api.trustHostKey(id, key);
+          await qc.invalidateQueries({ queryKey: ["profiles"] });
+        },
+      }),
     onSuccess: (status) => {
       qc.setQueryData<ConnectionStatus[]>(STATUS_KEY, (old) => [...(old ?? []).filter((s) => s.profileId !== status.profileId), status]);
       void qc.invalidateQueries({ queryKey: STATUS_KEY });

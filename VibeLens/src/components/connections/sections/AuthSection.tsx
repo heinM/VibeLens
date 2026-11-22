@@ -8,6 +8,7 @@ import { defaultAwsTarget, regionFromArn, regionFromHost } from "../awsHelpers";
 import { SecretField } from "../SecretField";
 import { useSecretStatus } from "../useSecretStatus";
 import type { SectionProps } from "./types";
+import { mysqlPasswordUnbound } from "../mysqlForm";
 
 type Kind = AuthMethod["kind"];
 
@@ -24,6 +25,10 @@ const TOKEN_COMMANDS: { label: string; command: string }[] = [
   { label: "Azure Database for PostgreSQL (Entra ID)", command: "az account get-access-token --resource-type oss-rdbms --query accessToken -o tsv" },
   { label: "OIDC via kubelogin (Keycloak / Entra)", command: "kubectl oidc-login get-token --oidc-issuer-url=https://idp.example.com/realms/bank --oidc-client-id=pgproxy | jq -r .status.token" },
   { label: "gcloud identity token", command: "gcloud auth print-identity-token" },
+];
+const MY_MODES: { value: Kind; label: string }[] = [
+  { value: "password", label: "Password" },
+  { value: "rdsIam", label: "RDS IAM" },
 ];
 const VK_MODES: { value: Kind; label: string }[] = [
   { value: "none", label: "None" },
@@ -62,8 +67,10 @@ export function AuthSection({ profile, editing, original, patch, setPassword, dr
   const secrets = useSecretStatus(editing ? original?.id : null);
   const hasStoredPassword = editing && original?.auth.kind === a.kind && (a.kind === "password" || (a.kind === "accessToken" && !(original.auth.kind === "accessToken" && original.auth.command))) && (secrets.data?.hasPassword ?? false);
   const tokenNeedsTls = a.kind === "accessToken" && profile.tls.mode === "disable";
-  const modes = profile.engine === "postgres" ? PG_MODES : VK_MODES;
-  const iamNeedsTls = (a.kind === "rdsIam" || a.kind === "elastiCacheIam") && profile.tls.mode === "disable";
+  const mysql = profile.engine === "mysql";
+  const modes = profile.engine === "postgres" ? PG_MODES : mysql ? MY_MODES : VK_MODES;
+  const iamNeedsTls = (a.kind === "rdsIam" || a.kind === "elastiCacheIam") && (mysql ? profile.tls.mode !== "verifyFull" : profile.tls.mode === "disable");
+  const rebind = mysql && hasStoredPassword && draft.password.mode === "keep" && mysqlPasswordUnbound(original, profile);
 
   return (
     <div className="space-y-4">
@@ -95,7 +102,18 @@ export function AuthSection({ profile, editing, original, patch, setPassword, dr
               onChange={(e) => setAuth({ kind: "password", username: e.target.value })}
             />
           </FormField>
-          <SecretField label="Password" edit={draft.password} onChange={setPassword} hasStored={hasStoredPassword} optional />
+          <SecretField label="Password" edit={draft.password} onChange={setPassword} hasStored={hasStoredPassword} optional={!mysql} />
+          {mysql && err("auth.password") && <p className="text-[12px] text-danger">{err("auth.password")}</p>}
+          {rebind && (
+            <Notice tone="warn">
+              The saved password is used only for the host, port, user, TLS and tunnel settings it was saved with. You changed one of them, so saving deletes it: enter the password again.
+            </Notice>
+          )}
+          {mysql && (
+            <p className="text-[12px] leading-snug text-muted">
+              Kept in the OS keychain and sent only to the endpoint it was saved for. To another machine it is sent only over TLS with Verify full.
+            </p>
+          )}
         </div>
       )}
 
@@ -104,7 +122,12 @@ export function AuthSection({ profile, editing, original, patch, setPassword, dr
           <p className="text-[12px] leading-snug text-muted">
             VibeLens signs a short-lived (15 minute) token for each new connection. No password is stored anywhere.
           </p>
-          <FormField label="Database user" htmlFor={`${uid}-user`} error={err("auth.username")} hint="A user granted the rds_iam role.">
+          <FormField
+            label="Database user"
+            htmlFor={`${uid}-user`}
+            error={err("auth.username")}
+            hint={mysql ? "A user created IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS'. Needs TLS with Verify full." : "A user granted the rds_iam role."}
+          >
             <Input
               id={`${uid}-user`}
               value={a.username}
@@ -256,7 +279,13 @@ export function AuthSection({ profile, editing, original, patch, setPassword, dr
         <Notice tone="warn">The token travels as a cleartext password. Turn TLS on in the TLS section (pg-proxy: TLS_ENABLED) unless this only ever runs on localhost.</Notice>
       )}
 
-      {iamNeedsTls && <Notice tone="warn">IAM authentication requires TLS, but TLS is disabled for this connection. Change it in the TLS section.</Notice>}
+      {iamNeedsTls && (
+        <Notice tone="warn">
+          {mysql
+            ? "MySQL sends the IAM token with the cleartext plugin, so it needs TLS with Verify full. Change it in the TLS section."
+            : "IAM authentication requires TLS, but TLS is disabled for this connection. Change it in the TLS section."}
+        </Notice>
+      )}
     </div>
   );
 }

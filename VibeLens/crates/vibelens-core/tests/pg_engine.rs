@@ -5,6 +5,8 @@
 //!   cargo test -p vibelens-core --test pg_engine
 //! ```
 
+mod services;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -58,7 +60,7 @@ macro_rules! require_pg {
         match dsn() {
             Some(d) => d,
             None => {
-                eprintln!("VG_TEST_PG not set; skipping");
+                crate::services::skip("pg", "VG_TEST_PG is not set");
                 return;
             }
         }
@@ -476,6 +478,188 @@ async fn catalog_list_objects() {
     // Indexes are not objects of their own.
     assert!(objs.iter().all(|o| o.name != "child_parent_idx"));
     assert!(objs.iter().all(|o| o.schema == fx.schema));
+}
+
+const PARTITION_SETUP: &str = r#"
+CREATE TABLE $S.events (id bigint, created date NOT NULL, region text) PARTITION BY RANGE (created);
+CREATE TABLE $S.events_2024_10 PARTITION OF $S.events FOR VALUES FROM ('2024-10-01') TO ('2024-11-01');
+CREATE TABLE $S.events_2024_02 PARTITION OF $S.events FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
+CREATE TABLE $S.events_default PARTITION OF $S.events DEFAULT;
+CREATE TABLE $S.events_2025 PARTITION OF $S.events FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')
+    PARTITION BY LIST (region);
+CREATE TABLE $S.events_2025_eu PARTITION OF $S.events_2025 FOR VALUES IN ('eu');
+CREATE TABLE $S.plain (a int);
+INSERT INTO $S.events SELECT g, '2024-02-10', 'x' FROM generate_series(1, 100) g;
+ANALYZE $S.events;
+"#;
+
+#[tokio::test]
+async fn catalog_partitions_nest_under_their_parent() {
+    let d = require_pg!();
+    let fx = Fixture::new(&d, PARTITION_SETUP).await;
+    // A partition may live in another schema than its parent.
+    let other = Fixture::new(&d, "").await;
+    raw(&d)
+        .await
+        .batch_execute(&fx.q(&format!(
+            "CREATE TABLE {}.events_2023 PARTITION OF $S.events FOR VALUES FROM ('2023-01-01') TO ('2024-01-01')",
+            other.schema
+        )))
+        .await
+        .expect("cross-schema partition");
+    let h = connect(&d).await;
+
+    // list_objects still returns every partition, flagged with its parent.
+    let objs = h.list_objects(&fx.schema).await.expect("list_objects");
+    let get = |n: &str| {
+        objs.iter()
+            .find(|o| o.name == n)
+            .unwrap_or_else(|| panic!("{n} in {objs:?}"))
+    };
+    let events = get("events");
+    assert_eq!(events.kind, ObjectKind::PartitionedTable);
+    assert!(!events.is_partition && events.parent_name.is_none() && events.parent_schema.is_none());
+    assert!(!get("plain").is_partition);
+    for n in [
+        "events_2024_10",
+        "events_2024_02",
+        "events_default",
+        "events_2025",
+    ] {
+        let o = get(n);
+        assert!(o.is_partition, "{n}");
+        assert_eq!(o.parent_schema.as_deref(), Some(fx.schema.as_str()), "{n}");
+        assert_eq!(o.parent_name.as_deref(), Some("events"), "{n}");
+    }
+    // Sub-partitions are partitions of their own parent, not of the root.
+    assert_eq!(
+        get("events_2025_eu").parent_name.as_deref(),
+        Some("events_2025")
+    );
+    let others = h
+        .list_objects(&other.schema)
+        .await
+        .expect("list_objects other");
+    let o = others
+        .iter()
+        .find(|o| o.name == "events_2023")
+        .expect("cross-schema partition");
+    assert_eq!(o.parent_schema.as_deref(), Some(fx.schema.as_str()));
+    assert_eq!(o.parent_name.as_deref(), Some("events"));
+
+    // The agent's catalog dump is unchanged: the root only.
+    let meta = h
+        .schema_metadata(Some(&fx.schema), 100)
+        .await
+        .expect("meta");
+    let mut names: Vec<_> = meta.tables.iter().map(|t| t.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["events", "plain"]);
+
+    let l = h
+        .list_partitions(&fx.schema, "events")
+        .await
+        .expect("list_partitions");
+    assert_eq!(l.partition_key.as_deref(), Some("RANGE (created)"));
+    assert!(!l.truncated);
+    assert!(
+        l.partman.is_none(),
+        "pg_partman is not installed: no info, no error"
+    );
+    let got: Vec<(&str, &str)> = l
+        .partitions
+        .iter()
+        .map(|p| (p.schema.as_str(), p.name.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (other.schema.as_str(), "events_2023"),
+            (fx.schema.as_str(), "events_2024_02"),
+            (fx.schema.as_str(), "events_2024_10"),
+            (fx.schema.as_str(), "events_2025"),
+            (fx.schema.as_str(), "events_default"),
+        ],
+        "by bound, default last, any schema"
+    );
+    let p = |n: &str| l.partitions.iter().find(|p| p.name == n).unwrap();
+    assert_eq!(
+        p("events_2024_02").bound,
+        "FOR VALUES FROM ('2024-02-01') TO ('2024-03-01')"
+    );
+    assert_eq!(p("events_2024_02").estimated_rows, Some(100));
+    assert!(p("events_2024_02").size_bytes.is_some_and(|s| s > 0));
+    assert!(!p("events_2024_02").is_default && !p("events_2024_02").is_partitioned);
+    assert_eq!(p("events_default").bound, "DEFAULT");
+    assert!(p("events_default").is_default);
+    assert!(p("events_2025").is_partitioned && !p("events_2025").is_default);
+    assert!(p("events_2025").size_bytes.is_some(), "sum over the leaves");
+
+    // A partitioned partition expands again.
+    let sub = h
+        .list_partitions(&fx.schema, "events_2025")
+        .await
+        .expect("sub");
+    assert_eq!(sub.partition_key.as_deref(), Some("LIST (region)"));
+    assert_eq!(sub.partitions.len(), 1);
+    assert_eq!(sub.partitions[0].name, "events_2025_eu");
+    assert_eq!(sub.partitions[0].bound, "FOR VALUES IN ('eu')");
+
+    // A table without partitions, and one that does not exist, are not partitioned tables.
+    let leaf = h
+        .list_partitions(&fx.schema, "plain")
+        .await
+        .expect_err("plain table");
+    assert!(matches!(leaf, CoreError::NotFound(_)), "{leaf:?}");
+    assert!(h.list_partitions(&fx.schema, "nope").await.is_err());
+    // Names are bound parameters, never spliced into SQL.
+    assert!(
+        h.list_partitions("x' OR '1'='1", "events\"; DROP TABLE plain; --")
+            .await
+            .is_err()
+    );
+    assert!(
+        !h.list_objects(&fx.schema)
+            .await
+            .unwrap()
+            .iter()
+            .all(|o| o.name != "plain")
+    );
+}
+
+#[tokio::test]
+async fn catalog_partition_list_is_ordered_numerically_and_capped() {
+    let d = require_pg!();
+    let fx = Fixture::new(
+        &d,
+        r#"
+CREATE TABLE $S.many (k int NOT NULL) PARTITION BY LIST (k);
+DO $$ BEGIN
+  FOR i IN 1..1001 LOOP
+    EXECUTE format('CREATE TABLE $S.many_%s PARTITION OF $S.many FOR VALUES IN (%s)', i, i);
+  END LOOP;
+END $$;
+"#,
+    )
+    .await;
+    let h = connect(&d).await;
+    let l = h
+        .list_partitions(&fx.schema, "many")
+        .await
+        .expect("list_partitions");
+    assert!(l.truncated, "1001 partitions exceed the cap");
+    assert_eq!(l.partitions.len(), 1000);
+    let bounds: Vec<&str> = l.partitions.iter().map(|p| p.bound.as_str()).collect();
+    assert_eq!(
+        &bounds[..3],
+        [
+            "FOR VALUES IN (1)",
+            "FOR VALUES IN (2)",
+            "FOR VALUES IN (3)"
+        ]
+    );
+    assert_eq!(bounds[9], "FOR VALUES IN (10)", "10 after 9, not after 1");
+    assert_eq!(bounds[999], "FOR VALUES IN (1000)");
 }
 
 #[tokio::test]
@@ -1024,6 +1208,116 @@ async fn page_size_zero_is_treated_as_one_and_empty_results_have_columns_only() 
     assert_finished(&evs);
 }
 
+// ---- oversized values (review finding H1) ------------------------------------------------------
+
+/// One row with three values far over the limit and one small one, through both result paths.
+#[tokio::test]
+async fn oversized_values_arrive_cut_and_marked_not_whole() {
+    let d = require_pg!();
+    let h = connect_single(&d).await;
+    const LIMIT: usize = vibelens_core::model::MAX_CELL_BYTES;
+    let sql = "SELECT repeat('x', 3000000) AS t, \
+               decode(repeat('ab', 1500000), 'hex') AS b, \
+               ('{\"k\":\"' || repeat('y', 2000000) || '\"}')::jsonb AS j, \
+               repeat('z', 10) AS small";
+
+    let streamed: Vec<Vec<Value>> = run(&h, sql, ExecOptions::default())
+        .await
+        .into_iter()
+        .filter_map(|e| match e {
+            QueryEvent::Rows { rows, .. } => Some(rows),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let collected = h
+        .execute_collect(sql, ExecOptions::default())
+        .await
+        .unwrap()
+        .rows;
+
+    for (path, rows) in [("stream", streamed), ("collect", collected)] {
+        assert_eq!(rows.len(), 1, "{path}");
+        let row = &rows[0];
+        let shape = |c: &Value| {
+            let t = &c["$truncated"];
+            (
+                t["kind"].as_str().map(str::to_owned),
+                t["bytes"].as_u64(),
+                t["preview"].as_str().map(str::len),
+            )
+        };
+        assert_eq!(
+            shape(&row[0]),
+            (Some("text".into()), Some(3_000_000), Some(LIMIT)),
+            "{path}: text"
+        );
+        // base64 of LIMIT bytes
+        assert_eq!(
+            shape(&row[1]),
+            (
+                Some("bytes".into()),
+                Some(1_500_000),
+                Some(LIMIT.div_ceil(3) * 4)
+            ),
+            "{path}: bytea"
+        );
+        assert_eq!(
+            shape(&row[2]),
+            // jsonb prints `{"k": "yyy…"}`, with a space after the colon: 9 bytes around the 2 MB.
+            (Some("json".into()), Some(2_000_009), Some(LIMIT)),
+            "{path}: jsonb"
+        );
+        assert_eq!(row[3], json!("zzzzzzzzzz"), "{path}: small value");
+        let sent: usize = row.iter().map(|c| c.to_string().len()).sum();
+        assert!(
+            sent < 4 * LIMIT,
+            "{path}: {sent} bytes of JSON for one row of 6.5 MB"
+        );
+    }
+}
+
+/// Twenty rows of 600 KB each are 12 MB: they must not travel as one page just because twenty
+/// is fewer than `page_size`.
+#[tokio::test]
+async fn a_page_of_large_cells_is_sent_before_it_reaches_page_size() {
+    let d = require_pg!();
+    let h = connect_single(&d).await;
+    let evs = run(
+        &h,
+        "SELECT repeat('x', 600000) FROM generate_series(1, 20)",
+        ExecOptions {
+            page_size: 500,
+            ..Default::default()
+        },
+    )
+    .await;
+    let pages = row_pages(&evs);
+    assert_eq!(pages.iter().sum::<usize>(), 20, "{pages:?}");
+    let budget = vibelens_core::model::PAGE_BYTE_BUDGET;
+    for e in &evs {
+        if let QueryEvent::Rows { rows, .. } = e {
+            let bytes: usize = rows.iter().flatten().map(|c| c.to_string().len()).sum();
+            assert!(
+                bytes <= budget + 700_000,
+                "a page of {} rows weighs {bytes} bytes: {pages:?}",
+                rows.len()
+            );
+        }
+    }
+    // Small rows still fill whole pages.
+    let evs = run(
+        &h,
+        "SELECT g FROM generate_series(1, 1200) g",
+        ExecOptions {
+            page_size: 500,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(row_pages(&evs), [500, 500, 200]);
+}
+
 #[tokio::test]
 async fn max_rows_truncates_without_draining_the_stream() {
     let d = require_pg!();
@@ -1075,6 +1369,236 @@ async fn max_rows_truncates_without_draining_the_stream() {
             ..
         }
     ));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Read-only runs and the row cap (review finding H2)
+// ---------------------------------------------------------------------------------------------
+
+/// A result the server streams row by row and would take minutes to send in full.
+const HUGE_RESULT: &str = "SELECT g FROM (SELECT generate_series(1, 2000000000) AS g) s";
+
+/// How long a truncated run may take. Far more than it needs, far less than the whole result.
+const TRUNCATED_RUN_BUDGET: Duration = Duration::from_secs(10);
+
+/// Waits until no backend is running a statement whose text contains `marker` any more.
+async fn assert_server_stopped(d: &Dsn, marker: &str) {
+    let c = raw(d).await;
+    let t0 = Instant::now();
+    loop {
+        let running: i64 = c
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE pid <> pg_backend_pid() AND state <> 'idle' AND position($1 in query) > 0",
+                &[&marker],
+            )
+            .await
+            .expect("pg_stat_activity")
+            .get(0);
+        if running == 0 {
+            return;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "{running} backend(s) still producing the abandoned result after {:?}",
+            t0.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The read-only twin of `max_rows_truncates_without_draining_the_stream`. A read-only run
+/// checks its transaction after every statement and ends it with `ROLLBACK`, both on the same
+/// connection: they must not wait for the rest of a result nobody will read.
+#[tokio::test]
+async fn read_only_max_rows_truncates_without_draining_the_stream() {
+    let d = require_pg!();
+    let h = connect_single(&d).await;
+    // Its own upper bound, so `pg_stat_activity` can tell this statement from other tests'.
+    const MARKER: &str = "generate_series(1, 2000000123)";
+    let sql = format!("SELECT g FROM (SELECT {MARKER} AS g) s");
+    let t0 = Instant::now();
+    let evs = tokio::time::timeout(
+        TRUNCATED_RUN_BUDGET * 2,
+        run(
+            &h,
+            &sql,
+            ExecOptions {
+                max_rows: 5,
+                page_size: 2,
+                read_only: true,
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "still running after {:?}: the read-only run waited for the whole result",
+            t0.elapsed()
+        )
+    });
+    assert!(
+        t0.elapsed() < TRUNCATED_RUN_BUDGET,
+        "took {:?}: the stream must not be drained",
+        t0.elapsed()
+    );
+    assert_eq!(row_pages(&evs), [2, 2, 1]);
+    match dones(&evs)[0] {
+        QueryEvent::StatementDone {
+            row_count: 5,
+            truncated: true,
+            ..
+        } => {}
+        other => panic!("{other:?}"),
+    }
+    assert_finished(&evs);
+    // The server was told to stop, not left to produce two thousand million rows for nobody.
+    assert_server_stopped(&d, MARKER).await;
+    // The pool (of one) still serves queries, read-only and not.
+    assert_eq!(scalar(&h, "7::int4").await, json!(7));
+    let r = h
+        .execute_collect(
+            "SELECT current_setting('transaction_read_only')",
+            ExecOptions {
+                read_only: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("read-only run after a truncated one");
+    assert_eq!(r.rows, vec![vec![json!("on")]]);
+
+    // Exactly max_rows rows is not truncation, and keeps the connection.
+    let pid = scalar(&h, "pg_backend_pid()").await;
+    let evs = run(
+        &h,
+        "SELECT g FROM generate_series(1, 5) g",
+        ExecOptions {
+            max_rows: 5,
+            read_only: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(matches!(
+        dones(&evs)[0],
+        QueryEvent::StatementDone {
+            row_count: 5,
+            truncated: false,
+            ..
+        }
+    ));
+    assert_finished(&evs);
+    assert_eq!(
+        scalar(&h, "pg_backend_pid()").await,
+        pid,
+        "an untruncated read-only run returns its connection to the pool"
+    );
+}
+
+/// The AI agent's path: materialised, read-only, 200 rows, 30 s statement timeout. It must get
+/// its 200 rows at once, not a statement-timeout error half a minute later.
+#[tokio::test]
+async fn read_only_execute_collect_truncates_without_draining_the_stream() {
+    let d = require_pg!();
+    let h = connect_single(&d).await;
+    let t0 = Instant::now();
+    let r = tokio::time::timeout(
+        Duration::from_secs(45),
+        h.execute_collect(
+            HUGE_RESULT,
+            ExecOptions {
+                max_rows: 200,
+                read_only: true,
+                timeout_ms: Some(30_000),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("still running after {:?}", t0.elapsed()));
+    let took = t0.elapsed();
+    let r = r.unwrap_or_else(|e| panic!("after {took:?}: {e}"));
+    assert!(
+        took < TRUNCATED_RUN_BUDGET,
+        "took {took:?}: the stream must not be drained"
+    );
+    assert_eq!((r.rows.len(), r.row_count, r.truncated), (200, 200, true));
+    assert_eq!(r.rows[0], vec![json!(1)]);
+    assert_eq!(r.rows[199], vec![json!(200)]);
+    assert_eq!(scalar(&h, "7::int4").await, json!(7));
+}
+
+/// A statement that is cut off stops a read-only script: the statements after it would have to
+/// wait for the rest of its result, and running them on another connection would lose the
+/// `SET`s, temporary tables and cursors the script made. The run says which were not run.
+#[tokio::test]
+async fn read_only_script_stops_after_a_truncated_statement_that_is_not_the_last() {
+    let d = require_pg!();
+    let h = connect_single(&d).await;
+    let script = format!("SELECT 1 AS one; {HUGE_RESULT}; SELECT 42 AS answer; SELECT 43");
+    let opts = || ExecOptions {
+        max_rows: 5,
+        read_only: true,
+        ..Default::default()
+    };
+    let t0 = Instant::now();
+    let evs = tokio::time::timeout(TRUNCATED_RUN_BUDGET * 2, run(&h, &script, opts()))
+        .await
+        .unwrap_or_else(|_| panic!("still running after {:?}", t0.elapsed()));
+    assert!(
+        t0.elapsed() < TRUNCATED_RUN_BUDGET,
+        "took {:?}",
+        t0.elapsed()
+    );
+
+    let summary: Vec<_> = dones(&evs)
+        .into_iter()
+        .map(|e| match e {
+            QueryEvent::StatementDone {
+                statement_index,
+                row_count,
+                truncated,
+                ..
+            } => (*statement_index, *row_count, *truncated),
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [(0, 1, false), (1, 5, true)],
+        "the rows that were read are still delivered: {evs:?}"
+    );
+    let (idx, err) = failed(&evs);
+    assert_eq!(
+        idx,
+        Some(2),
+        "reported on the first statement that did not run"
+    );
+    assert_eq!(err.code, "invalid");
+    assert!(
+        err.message
+            .contains("statement 2 returned more than 5 rows")
+            && err.message.contains("statements 3 to 4 were not run"),
+        "{}",
+        err.message
+    );
+    assert!(
+        !evs.iter().any(|e| matches!(
+            e,
+            QueryEvent::Columns { statement_index, .. } if *statement_index >= 2
+        )),
+        "nothing after the truncated statement ran: {evs:?}"
+    );
+
+    // The materialised form reports the same thing as an error.
+    let e = h
+        .execute_collect(&format!("{HUGE_RESULT}; SELECT 42"), opts())
+        .await
+        .expect_err("the last statement did not run");
+    assert!(e.to_string().contains("statement 2 was not run"), "{e}");
+    assert_eq!(scalar(&h, "7::int4").await, json!(7));
 }
 
 #[tokio::test]
@@ -2318,6 +2842,63 @@ async fn pgproxy_block_errors_are_policy_denials() {
     )
     .await;
     assert_eq!(failed(&evs).1.code, "database");
+}
+
+/// Review finding H2 in shunt mode: the after-statement check and the closing `SET` are queries
+/// on the same connection too, so a truncated result must not be waited for there either.
+#[tokio::test]
+async fn shunt_mode_read_only_truncates_without_draining_the_stream() {
+    let d = require_pg!();
+    let mut p = shunt_params(&d);
+    p.options.max_pool_size = 1;
+    let h = connect_with(&d, p).await;
+    let opts = || ExecOptions {
+        max_rows: 5,
+        read_only: true,
+        ..Default::default()
+    };
+    let t0 = Instant::now();
+    let evs = tokio::time::timeout(TRUNCATED_RUN_BUDGET * 2, run(&h, HUGE_RESULT, opts()))
+        .await
+        .unwrap_or_else(|_| panic!("still running after {:?}", t0.elapsed()));
+    assert!(
+        t0.elapsed() < TRUNCATED_RUN_BUDGET,
+        "took {:?}",
+        t0.elapsed()
+    );
+    assert!(matches!(
+        dones(&evs)[0],
+        QueryEvent::StatementDone {
+            row_count: 5,
+            truncated: true,
+            ..
+        }
+    ));
+    assert_finished(&evs);
+
+    let script = format!("{HUGE_RESULT}; SELECT 42");
+    let t0 = Instant::now();
+    let evs = tokio::time::timeout(TRUNCATED_RUN_BUDGET * 2, run(&h, &script, opts()))
+        .await
+        .unwrap_or_else(|_| panic!("still running after {:?}", t0.elapsed()));
+    assert!(
+        t0.elapsed() < TRUNCATED_RUN_BUDGET,
+        "took {:?}",
+        t0.elapsed()
+    );
+    let (idx, err) = failed(&evs);
+    assert_eq!(idx, Some(1));
+    assert!(err.message.contains("statement 2 was not run"), "{err:?}");
+
+    // The next run gets a fresh session: not read-only by a default the closed one left behind.
+    let r = h
+        .execute_collect(
+            "SELECT current_setting('default_transaction_read_only')",
+            ExecOptions::default(),
+        )
+        .await
+        .expect("run after a truncated one");
+    assert_eq!(r.rows, vec![vec![json!("off")]]);
 }
 
 #[tokio::test]

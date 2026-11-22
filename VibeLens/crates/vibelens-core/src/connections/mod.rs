@@ -11,6 +11,11 @@
 //!   the connection does not vanish from the UI after five quiet minutes. Valkey and Iceberg
 //!   handles are still closed outright. `0` means "never".
 //! - `AppToolBackend` implements `ports::ToolBackend` over this + `WorkspaceFs`.
+//! - MySQL: one `MysqlHandle` per (profile, database), like Postgres (tunnel, TLS name, IAM
+//!   tokens per physical connection, idle sessions released by the reaper).
+//! - Redshift: one `RedshiftEngine` per profile. It holds only a Data API client (no socket,
+//!   no session, no tunnel), so the idle reaper leaves it alone; AWS identity comes from the
+//!   same `AwsService` as Iceberg's.
 //!
 //! Concurrency rules:
 //! - The registry lock is a plain `std::sync::Mutex` and is **never held across an `.await`**.
@@ -35,13 +40,16 @@ use secrecy::SecretString;
 use crate::error::{CoreError, Result};
 use crate::iceberg::{IcebergDeps, IcebergHandle};
 use crate::model::*;
+use crate::mysql::{MysqlConnectParams, MysqlHandle};
 use crate::pg::{PgConnectParams, PgHandle};
 use crate::ports::{
-    CredentialFn, CredentialSource, ProfileStore, SecretVault, ToolBackend, TunnelHandle,
-    TunnelProvider,
+    CredentialFn, CredentialSource, FileVersion, ProfileStore, SecretVault, ToolBackend,
+    TunnelHandle, TunnelProvider,
 };
+use crate::redshift::RedshiftEngine;
 use crate::valkey::{ValkeyConnectParams, ValkeyHandle};
 use crate::workspace::WorkspaceFs;
+use tokio_util::sync::CancellationToken;
 
 /// How often the idle reaper wakes up.
 const REAP_INTERVAL: Duration = Duration::from_secs(30);
@@ -55,7 +63,44 @@ const AGENT_VALKEY_MAX_ITEMS: usize = 200;
 /// Statement timeout for agent-issued SQL.
 const AGENT_SQL_TIMEOUT_MS: u64 = 30_000;
 /// Athena queries are queued and run server-side, so they get a longer budget than a local scan.
+/// The same budget applies to the other remote engines (Trino, Spark).
 const AGENT_ATHENA_TIMEOUT_MS: u64 = 120_000;
+/// Whole-script budget for agent SQL, below the agent's 180 s tool timeout so the engine is
+/// cancelled (and stops the work on the server) before the agent gives up on the tool.
+const AGENT_SCRIPT_DEADLINE: Duration = Duration::from_secs(150);
+/// Redshift statements are queued and run server-side too (and a Serverless workgroup may have
+/// to resume first), so they get the same budget as Athena.
+const AGENT_REDSHIFT_TIMEOUT_MS: u64 = 120_000;
+/// Most MySQL database pools one profile may hold at once (one per database name).
+pub const MAX_MYSQL_POOLS_PER_PROFILE: usize = 8;
+/// A reserved place for one MySQL pool being dialed; freed on insert, failure or drop.
+struct DialSlot<'a> {
+    manager: &'a ConnectionManager,
+    profile_id: ProfileId,
+    released: bool,
+}
+
+impl DialSlot<'_> {
+    /// Frees the slot under a state lock the caller already holds.
+    fn release(mut self, st: &mut State) {
+        if let Some(n) = st.mysql_dialing.get_mut(&self.profile_id) {
+            *n = n.saturating_sub(1);
+        }
+        self.released = true;
+    }
+}
+
+impl Drop for DialSlot<'_> {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let mut st = self.manager.lock();
+        if let Some(n) = st.mysql_dialing.get_mut(&self.profile_id) {
+            *n = n.saturating_sub(1);
+        }
+    }
+}
 /// Safety valve for `valkey_scan`: stop after this many SCAN pages even if the cursor never ends.
 const MAX_SCAN_PAGES: usize = 2_000;
 
@@ -65,6 +110,13 @@ struct PgEntry {
     connected_at: DateTime<Utc>,
     signature: String,
     server_version: Option<String>,
+}
+
+struct MysqlEntry {
+    handle: Arc<MysqlHandle>,
+    tunnel: Option<TunnelHandle>,
+    connected_at: DateTime<Utc>,
+    signature: String,
 }
 
 struct ValkeyEntry {
@@ -80,6 +132,14 @@ struct IcebergEntry {
     connected_at: DateTime<Utc>,
     signature: String,
     /// `IcebergHandle::describe_target()` captured when the handle was created.
+    target: String,
+}
+
+struct RedshiftEntry {
+    engine: Arc<RedshiftEngine>,
+    connected_at: DateTime<Utc>,
+    signature: String,
+    /// `RedshiftEngine::describe_target()`: `Redshift · {cluster or workgroup} · {db} · {region}`.
     target: String,
 }
 
@@ -104,18 +164,24 @@ type ConnectLockKey = (ProfileId, Option<String>);
 #[derive(Default)]
 struct State {
     pg: HashMap<(ProfileId, String), PgEntry>,
+    mysql: HashMap<(ProfileId, String), MysqlEntry>,
     valkey: HashMap<ProfileId, ValkeyEntry>,
     iceberg: HashMap<ProfileId, IcebergEntry>,
+    redshift: HashMap<ProfileId, RedshiftEntry>,
     transient: HashMap<ProfileId, Transient>,
     epochs: HashMap<ProfileId, u64>,
     connect_locks: HashMap<ConnectLockKey, Arc<tokio::sync::Mutex<()>>>,
+    /// MySQL pools being dialed per profile (reserved against the pool cap).
+    mysql_dialing: HashMap<ProfileId, usize>,
 }
 
 impl State {
     fn has_live(&self, profile_id: &str) -> bool {
         self.valkey.contains_key(profile_id)
             || self.iceberg.contains_key(profile_id)
+            || self.redshift.contains_key(profile_id)
             || self.pg.keys().any(|(id, _)| id == profile_id)
+            || self.mysql.keys().any(|(id, _)| id == profile_id)
     }
     fn epoch(&self, profile_id: &str) -> u64 {
         self.epochs.get(profile_id).copied().unwrap_or(0)
@@ -129,6 +195,11 @@ pub struct ConnectionManager {
     state: Mutex<State>,
     reaper_started: AtomicBool,
     iceberg_deps: OnceLock<IcebergDeps>,
+    /// Test wiring only: where Redshift Data API requests go instead of the regional endpoint.
+    /// Never read from a profile (see `RedshiftEngine::with_endpoint_url`), and not compiled
+    /// into the app (`test-util` feature).
+    #[cfg(any(test, feature = "test-util"))]
+    redshift_endpoint: OnceLock<String>,
 }
 
 impl ConnectionManager {
@@ -144,6 +215,8 @@ impl ConnectionManager {
             state: Mutex::new(State::default()),
             reaper_started: AtomicBool::new(false),
             iceberg_deps: OnceLock::new(),
+            #[cfg(any(test, feature = "test-util"))]
+            redshift_endpoint: OnceLock::new(),
         })
     }
 
@@ -201,8 +274,48 @@ impl ConnectionManager {
             .iter()
             .map(|(k, e)| (k.clone(), e.handle.clone()))
             .collect();
+        // Keys only: a clone of every MySQL handle held for the whole pass would make each pool
+        // look "held" to the eviction in `mysql()`, which would then refuse a new database.
+        let mysql_keys: Vec<_> = self.lock().mysql.keys().cloned().collect();
 
         let mut closed = 0;
+        for key in mysql_keys {
+            let Some(handle) = self.lock().mysql.get(&key).map(|e| e.handle.clone()) else {
+                continue;
+            };
+            let gone = match self.profiles.get(&key.0) {
+                Ok(p) => {
+                    if idle_exceeded(handle.idle_secs(), p.mysql.idle_disconnect_secs) {
+                        let released = handle.release_idle_connections();
+                        if released > 0 {
+                            tracing::debug!(profile_id = %key.0, database = %key.1, released, "released idle MySQL sessions");
+                            closed += released;
+                        }
+                    }
+                    false
+                }
+                Err(CoreError::NotFound(_)) => true,
+                Err(e) => {
+                    tracing::warn!(error = %e, "idle reaper could not read profile; leaving connection open");
+                    false
+                }
+            };
+            if gone {
+                let removed = {
+                    let mut st = self.lock();
+                    match st.mysql.get(&key) {
+                        Some(e) if Arc::ptr_eq(&e.handle, &handle) => st.mysql.remove(&key),
+                        _ => None,
+                    }
+                };
+                if let Some(entry) = removed {
+                    entry.handle.close().await;
+                    drop(entry.tunnel);
+                    closed += 1;
+                    self.forget_if_idle(&key.0);
+                }
+            }
+        }
         for (key, handle) in pg {
             let verdict = match self.profiles.get(&key.0) {
                 Ok(p) => {
@@ -314,7 +427,7 @@ impl ConnectionManager {
                         None
                     }
                 };
-                let db = default_database(&profile, None);
+                let db = profile.effective_database(None);
                 if let Some(entry) = self.lock().pg.get_mut(&(profile.id.clone(), db))
                     && Arc::ptr_eq(&entry.handle, &handle)
                 {
@@ -341,6 +454,14 @@ impl ConnectionManager {
                 // record: `iceberg()` registered Connecting/Connected/Error like pg/valkey do.
                 self.iceberg(profile_id).await?;
             }
+            EngineKind::Redshift => {
+                // `redshift()` verified the target answers and recorded the status.
+                self.redshift(profile_id).await?;
+            }
+            EngineKind::Mysql => {
+                // The version comes from the handshake of the first connection.
+                self.mysql(profile_id, None).await?;
+            }
         }
         let st = self.lock();
         status_of(&st, &profile.id).ok_or_else(|| {
@@ -351,7 +472,7 @@ impl ConnectionManager {
     /// Closes every handle and tunnel of the profile. Idempotent, and works for profiles that
     /// no longer exist in the store (the delete-profile flow calls it first).
     pub async fn disconnect(&self, profile_id: &str) -> Result<()> {
-        let (pg, valkey, iceberg) = {
+        let (pg, mysql, valkey, iceberg, redshift) = {
             let mut st = self.lock();
             *st.epochs.entry(profile_id.to_string()).or_insert(0) += 1;
             st.transient.remove(profile_id);
@@ -363,13 +484,28 @@ impl ConnectionManager {
                 .cloned()
                 .collect();
             let pg: Vec<PgEntry> = keys.iter().filter_map(|k| st.pg.remove(k)).collect();
+            let mkeys: Vec<_> = st
+                .mysql
+                .keys()
+                .filter(|(id, _)| id == profile_id)
+                .cloned()
+                .collect();
+            let mysql: Vec<MysqlEntry> = mkeys.iter().filter_map(|k| st.mysql.remove(k)).collect();
             (
                 pg,
+                mysql,
                 st.valkey.remove(profile_id),
                 st.iceberg.remove(profile_id),
+                st.redshift.remove(profile_id),
             )
         };
+        // A Redshift engine holds no connection; dropping it is all there is to close.
+        drop(redshift);
         for entry in pg {
+            entry.handle.close().await;
+            drop(entry.tunnel);
+        }
+        for entry in mysql {
             entry.handle.close().await;
             drop(entry.tunnel);
         }
@@ -389,16 +525,39 @@ impl ConnectionManager {
     ///
     /// Connection-level failures (unreachable, bad password, TLS, tunnel…) come back as
     /// `Ok(TestResult { ok: false, message })`; only invalid input is an `Err`.
+    ///
+    /// A test writes nothing: when the SSH host's key is not pinned it reports the key the
+    /// server presented in `host_key` and leaves pinning to the caller.
     pub async fn test(
         &self,
         profile: &ConnectionProfile,
         password_override: Option<SecretString>,
+    ) -> Result<TestResult> {
+        self.test_with_engine_secret(profile, password_override, None)
+            .await
+    }
+
+    /// [`test`](Self::test) with the not-yet-saved password or token of an Iceberg
+    /// connection's remote query engine (Trino, Spark through Livy). Like the catalog secret it
+    /// is served from an overlay on the vault for this test only; `None` uses the stored one.
+    pub async fn test_with_engine_secret(
+        &self,
+        profile: &ConnectionProfile,
+        password_override: Option<SecretString>,
+        engine_secret_override: Option<SecretString>,
     ) -> Result<TestResult> {
         if profile.engine == EngineKind::Iceberg {
             // `host`/`port` are unused for Iceberg; the catalog options are what matter.
             if profile.iceberg.is_none() {
                 return Err(CoreError::Invalid(
                     "Iceberg catalog options are required".into(),
+                ));
+            }
+        } else if profile.engine == EngineKind::Redshift {
+            // `host`/`port` are unused; the options are validated by `check_profile` below.
+            if profile.redshift.is_none() {
+                return Err(CoreError::Invalid(
+                    "Redshift connection options are required".into(),
                 ));
             }
         } else {
@@ -411,17 +570,21 @@ impl ConnectionManager {
                 ));
             }
         }
+        // A draft that would send a secret in the clear is invalid input, not a failed test.
+        crate::cleartext::check_profile(profile)?;
         let started = Instant::now();
-        let outcome =
-            match tokio::time::timeout(TEST_TIMEOUT, self.test_inner(profile, password_override))
-                .await
-            {
-                Ok(r) => r,
-                Err(_) => Err(CoreError::Timeout(format!(
-                    "connection test took longer than {}s",
-                    TEST_TIMEOUT.as_secs()
-                ))),
-            };
+        let outcome = match tokio::time::timeout(
+            TEST_TIMEOUT,
+            self.test_inner(profile, password_override, engine_secret_override),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(CoreError::Timeout(format!(
+                "connection test took longer than {}s",
+                TEST_TIMEOUT.as_secs()
+            ))),
+        };
         let latency_ms = started.elapsed().as_millis() as u64;
         match outcome {
             Ok(version) => Ok(TestResult {
@@ -432,6 +595,7 @@ impl ConnectionManager {
                 },
                 server_version: version,
                 latency_ms,
+                host_key: None,
             }),
             Err(e @ (CoreError::Invalid(_) | CoreError::Cancelled)) => Err(e),
             Err(e) => Ok(TestResult {
@@ -439,6 +603,10 @@ impl ConnectionManager {
                 server_version: None,
                 latency_ms,
                 message: e.to_string(),
+                host_key: match e {
+                    CoreError::UnknownHostKey(key) => Some(key),
+                    _ => None,
+                },
             }),
         }
     }
@@ -447,9 +615,16 @@ impl ConnectionManager {
         &self,
         profile: &ConnectionProfile,
         password_override: Option<SecretString>,
+        engine_secret_override: Option<SecretString>,
     ) -> Result<Option<String>> {
         if profile.engine == EngineKind::Iceberg {
-            return self.test_iceberg(profile, password_override).await;
+            return self
+                .test_iceberg(profile, password_override, engine_secret_override)
+                .await;
+        }
+        if profile.engine == EngineKind::Redshift {
+            // No password exists for Redshift (IAM-signed Data API), so there is nothing to override.
+            return self.test_redshift(profile).await;
         }
         let creds = self.credential_fn(profile, password_override);
         match profile.engine {
@@ -465,7 +640,7 @@ impl ConnectionManager {
                 {
                     crate::pg::pgproxy_ready(url).await?;
                 }
-                let db = default_database(profile, None);
+                let db = profile.effective_database(None);
                 let (handle, tunnel) = self.dial_pg(profile, &db, creds).await?;
                 let version = handle.server_version().await;
                 handle.close().await;
@@ -479,9 +654,20 @@ impl ConnectionManager {
                 drop(tunnel);
                 Ok(info?.version)
             }
+            EngineKind::Mysql => {
+                let db = profile.effective_database(None);
+                let (handle, tunnel) = self.dial_mysql(profile, &db, creds).await?;
+                let version = handle.server_version();
+                handle.close().await;
+                drop(tunnel);
+                Ok(version.map(|v| format!("MySQL {v}")))
+            }
             // Handled above (it needs no credential closure).
             EngineKind::Iceberg => Err(CoreError::Other(
                 "Iceberg connections are tested by test_iceberg".into(),
+            )),
+            EngineKind::Redshift => Err(CoreError::Other(
+                "Redshift connections are tested by test_redshift".into(),
             )),
         }
     }
@@ -493,6 +679,7 @@ impl ConnectionManager {
         &self,
         profile: &ConnectionProfile,
         secret_override: Option<SecretString>,
+        engine_secret_override: Option<SecretString>,
     ) -> Result<Option<String>> {
         let mut deps = self.iceberg_deps()?;
         if let Some(secret) = secret_override {
@@ -502,10 +689,39 @@ impl ConnectionManager {
                 value: secret,
             });
         }
+        // A secret typed for the test is bound to the endpoint being tested, and only there.
+        let origin = match (&engine_secret_override, profile.iceberg.as_ref()) {
+            (Some(_), Some(o)) => crate::remote::secret::engine_origin(&o.query_engine)?,
+            _ => None,
+        };
+        if let Some(secret) = engine_secret_override
+            && let Some(origin) = origin
+        {
+            deps.vault = Arc::new(OverlayVault {
+                inner: deps.vault.clone(),
+                key: vault_keys::engine_secret(&profile.id),
+                value: secret,
+            });
+            deps.vault = Arc::new(OverlayVault {
+                inner: deps.vault.clone(),
+                key: vault_keys::engine_secret_origin(&profile.id),
+                value: SecretString::from(origin),
+            });
+        }
         let handle = IcebergHandle::connect(profile.clone(), deps).await?;
         let target = handle.describe_target();
+        let probed = handle.probe_engine().await;
         handle.close().await;
+        probed?;
         Ok(Some(target).filter(|t| !t.is_empty()))
+    }
+
+    /// Ephemeral Redshift engine + one `ListDatabases` call, which signs in with the profile's
+    /// identity and authentication and so checks all of it. Nothing is cached.
+    async fn test_redshift(&self, profile: &ConnectionProfile) -> Result<Option<String>> {
+        let engine = self.build_redshift(profile).await?;
+        engine.ping().await?;
+        Ok(Some(engine.describe_target()))
     }
 
     /// One entry per profile that is connecting, connected or failed. Disconnected profiles
@@ -516,7 +732,9 @@ impl ConnectionManager {
             .valkey
             .keys()
             .chain(st.iceberg.keys())
+            .chain(st.redshift.keys())
             .chain(st.pg.keys().map(|(id, _)| id))
+            .chain(st.mysql.keys().map(|(id, _)| id))
             .chain(st.transient.keys())
             .collect();
         ids.sort();
@@ -527,11 +745,12 @@ impl ConnectionManager {
     }
 
     /// Pool for `(profile, database)`, connecting lazily. `database` defaults to the profile's
-    /// database, then `"postgres"`.
+    /// database, then `"postgres"` ([`ConnectionProfile::effective_database`], which is also what
+    /// the agent's approval card shows).
     pub async fn pg(&self, profile_id: &str, database: Option<&str>) -> Result<Arc<PgHandle>> {
         let profile = self.profiles.get(profile_id)?;
         require_engine(&profile, EngineKind::Postgres)?;
-        let db = default_database(&profile, database);
+        let db = profile.effective_database(database);
         let key = (profile.id.clone(), db.clone());
         let signature = connection_signature(&profile);
 
@@ -588,6 +807,155 @@ impl ConnectionManager {
                 Ok(handle)
             }
         }
+    }
+
+    /// Pool for `(profile, database)` of a MySQL connection, connecting lazily. `database`
+    /// defaults to the profile's (required) database; the rule is the one the agent's approval
+    /// card uses ([`ConnectionProfile::effective_database`]).
+    pub async fn mysql(
+        &self,
+        profile_id: &str,
+        database: Option<&str>,
+    ) -> Result<Arc<MysqlHandle>> {
+        let profile = self.profiles.get(profile_id)?;
+        require_engine(&profile, EngineKind::Mysql)?;
+        let db = profile.effective_database(database);
+        crate::mysql::check_database_name(&db)?;
+        let key = (profile.id.clone(), db.clone());
+        let signature = connection_signature(&profile);
+
+        if let Some(handle) = self.cached_mysql(&key, &signature).await {
+            return Ok(handle);
+        }
+        let lock = self.connect_lock((profile.id.clone(), Some(db.clone())));
+        let _single_flight = lock.lock().await;
+        if let Some(handle) = self.cached_mysql(&key, &signature).await {
+            return Ok(handle);
+        }
+
+        // Each database name gets its own pool, and the name comes from the UI or the model;
+        // `shop`, `Shop` and `sHop` would each open one. A connection holds a bounded number.
+        // A slot is reserved under the state lock (counting open pools and dials in flight);
+        // the dial runs outside any lock, so one slow server does not hold up the others; the
+        // slot is released when the pool is inserted or the dial fails or is dropped. At the cap
+        // the least recently used pool that nobody holds (no handle outside the registry, no
+        // operation running) is closed to make room.
+        let (slot, evicted) = {
+            let mut st = self.lock();
+            let open = st.mysql.keys().filter(|(id, _)| *id == profile.id).count()
+                + st.mysql_dialing.get(&profile.id).copied().unwrap_or(0);
+            let evicted = if open < MAX_MYSQL_POOLS_PER_PROFILE {
+                None
+            } else {
+                let lru = st
+                    .mysql
+                    .iter()
+                    .filter(|((id, _), e)| {
+                        *id == profile.id && Arc::strong_count(&e.handle) == 1 && !e.handle.in_use()
+                    })
+                    .max_by_key(|(_, e)| e.handle.idle_ms())
+                    .map(|(k, _)| k.clone());
+                match lru {
+                    Some(k) => st.mysql.remove(&k),
+                    None => {
+                        return Err(CoreError::Invalid(format!(
+                            "connection \"{}\" has {MAX_MYSQL_POOLS_PER_PROFILE} databases open \
+                             and all of them are in use; try again when one is free",
+                            profile.name
+                        )));
+                    }
+                }
+            };
+            *st.mysql_dialing.entry(profile.id.clone()).or_insert(0) += 1;
+            (
+                DialSlot {
+                    manager: self,
+                    profile_id: profile.id.clone(),
+                    released: false,
+                },
+                evicted,
+            )
+        };
+        if let Some(old) = evicted {
+            tracing::info!(profile_id = %profile.id, "closing the least recently used MySQL database pool");
+            old.handle.close().await;
+            drop(old.tunnel);
+        }
+        let epoch = self.lock().epoch(&profile.id);
+        let mut attempt = Attempt::begin(self, &profile);
+        let dialed = self
+            .dial_mysql(&profile, &db, self.credential_fn(&profile, None))
+            .await;
+        let (handle, tunnel) = match dialed {
+            Ok(x) => x,
+            Err(e) => {
+                attempt.fail(&e);
+                return Err(e);
+            }
+        };
+        let entry = MysqlEntry {
+            handle: handle.clone(),
+            tunnel,
+            connected_at: Utc::now(),
+            signature,
+        };
+        let inserted = {
+            let mut st = self.lock();
+            slot.release(&mut st);
+            if st.epoch(&profile.id) != epoch {
+                Err(entry)
+            } else {
+                st.transient.remove(&profile.id);
+                Ok(st.mysql.insert(key, entry))
+            }
+        };
+        match inserted {
+            Err(discarded) => {
+                handle.close().await;
+                drop(discarded.tunnel);
+                attempt.abandon();
+                Err(CoreError::Cancelled)
+            }
+            Ok(replaced) => {
+                attempt.succeeded();
+                if let Some(old) = replaced {
+                    old.handle.close().await;
+                }
+                Ok(handle)
+            }
+        }
+    }
+
+    /// How many MySQL database pools `profile_id` holds now.
+    pub fn mysql_pool_count(&self, profile_id: &str) -> usize {
+        self.lock()
+            .mysql
+            .keys()
+            .filter(|(id, _)| id == profile_id)
+            .count()
+    }
+
+    async fn cached_mysql(
+        &self,
+        key: &(ProfileId, String),
+        signature: &str,
+    ) -> Option<Arc<MysqlHandle>> {
+        let stale = {
+            let mut st = self.lock();
+            match st.mysql.get(key) {
+                None => return None,
+                Some(e) if e.signature == signature && !tunnel_dead(&e.tunnel) => {
+                    return Some(e.handle.clone());
+                }
+                Some(_) => st.mysql.remove(key),
+            }
+        };
+        if let Some(entry) = stale {
+            tracing::info!(profile_id = %key.0, database = %key.1, "discarding stale MySQL connection");
+            entry.handle.close().await;
+            drop(entry.tunnel);
+        }
+        None
     }
 
     /// Services Iceberg connections need (AWS identity and the keychain for REST/S3 secrets).
@@ -668,6 +1036,117 @@ impl ConnectionManager {
                     old.handle.close().await;
                 }
                 Ok(handle)
+            }
+        }
+    }
+
+    /// Where Redshift Data API requests go instead of the regional endpoint. For tests that wire
+    /// the manager to a mock; the app never calls it and no profile field reaches it. A second
+    /// call is ignored. Only in test builds (`test-util` feature).
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn set_redshift_endpoint_url(&self, url: impl Into<String>) {
+        if self.redshift_endpoint.set(url.into()).is_err() {
+            tracing::debug!("Redshift endpoint override was already set; ignoring the second call");
+        }
+    }
+
+    /// A Redshift engine for `profile`: options validated, credentials resolved for its AWS
+    /// target. Makes no request.
+    async fn build_redshift(&self, profile: &ConnectionProfile) -> Result<RedshiftEngine> {
+        let opts = profile.redshift.clone().ok_or_else(|| {
+            CoreError::Invalid(format!(
+                "connection \"{}\" has no Redshift options",
+                profile.name
+            ))
+        })?;
+        // The stored profile may have been edited by hand; the rules a save applies run again.
+        crate::cleartext::check_profile(profile)?;
+        let aws = self
+            .iceberg_deps
+            .get()
+            .map(|d| d.aws.clone())
+            .ok_or_else(|| {
+                CoreError::Invalid(
+                    "AWS support is not initialised: the application never called set_iceberg_deps"
+                        .into(),
+                )
+            })?;
+        let creds = aws.credentials_provider(&opts.aws).await?;
+        let engine = RedshiftEngine::new(opts, creds)?;
+        #[cfg(any(test, feature = "test-util"))]
+        let engine = match self.redshift_endpoint.get() {
+            Some(url) => engine.with_endpoint_url(url.clone()),
+            None => engine,
+        };
+        Ok(engine)
+    }
+
+    /// Lazily created Redshift engine for the profile. The first creation checks that the
+    /// cluster or workgroup answers with the profile's identity (one `ListDatabases` call).
+    /// Single-flight per profile; reused while the profile's Redshift options are unchanged.
+    pub async fn redshift(&self, profile_id: &str) -> Result<Arc<RedshiftEngine>> {
+        let profile = self.profiles.get(profile_id)?;
+        require_engine(&profile, EngineKind::Redshift)?;
+        let signature = connection_signature(&profile);
+
+        if let Some(engine) = self.cached_redshift(&profile.id, &signature) {
+            return Ok(engine);
+        }
+        let lock = self.connect_lock((profile.id.clone(), None));
+        let _single_flight = lock.lock().await;
+        if let Some(engine) = self.cached_redshift(&profile.id, &signature) {
+            return Ok(engine);
+        }
+
+        let epoch = self.lock().epoch(&profile.id);
+        let mut attempt = Attempt::begin(self, &profile);
+        let built = match self.build_redshift(&profile).await {
+            Ok(e) => e.ping().await.map(|()| e),
+            Err(e) => Err(e),
+        };
+        let engine = match built {
+            Ok(e) => Arc::new(e),
+            Err(e) => {
+                attempt.fail(&e);
+                return Err(e);
+            }
+        };
+        let entry = RedshiftEntry {
+            engine: engine.clone(),
+            connected_at: Utc::now(),
+            signature,
+            target: engine.describe_target(),
+        };
+        let inserted = {
+            let mut st = self.lock();
+            if st.epoch(&profile.id) != epoch {
+                false
+            } else {
+                st.transient.remove(&profile.id);
+                st.redshift.insert(profile.id.clone(), entry);
+                true
+            }
+        };
+        if inserted {
+            attempt.succeeded();
+            Ok(engine)
+        } else {
+            // `disconnect()` ran while we were connecting: throw the new engine away.
+            attempt.abandon();
+            Err(CoreError::Cancelled)
+        }
+    }
+
+    fn cached_redshift(&self, profile_id: &str, signature: &str) -> Option<Arc<RedshiftEngine>> {
+        let mut st = self.lock();
+        match st.redshift.get(profile_id) {
+            None => None,
+            Some(e) if e.signature == signature => Some(e.engine.clone()),
+            Some(_) => {
+                tracing::info!(profile_id, "discarding stale Redshift engine");
+                st.redshift.remove(profile_id);
+                None
             }
         }
     }
@@ -868,6 +1347,9 @@ impl ConnectionManager {
         database: &str,
         creds: CredentialFn,
     ) -> Result<(Arc<PgHandle>, Option<TunnelHandle>)> {
+        // Before the tunnel and before any credential is fetched. The profile may have been
+        // edited by hand, so the rules a save applies run again here.
+        crate::cleartext::check_profile(profile)?;
         let tunnel = self.open_tunnel(profile).await?;
         let (host, port) = dial_target(profile, &tunnel);
         let params = PgConnectParams {
@@ -888,6 +1370,7 @@ impl ConnectionManager {
         profile: &ConnectionProfile,
         creds: CredentialFn,
     ) -> Result<(Arc<ValkeyHandle>, Option<TunnelHandle>)> {
+        crate::cleartext::check_profile(profile)?;
         if profile.tunnel.is_some() && profile.valkey.cluster {
             tracing::warn!(profile = %profile.name, "Valkey cluster mode through an SSH tunnel will not follow MOVED redirects (see docs/DESIGN.md §8)");
         }
@@ -903,6 +1386,31 @@ impl ConnectionManager {
         let handle = ValkeyHandle::connect(params, creds).await?;
         Ok((handle, tunnel))
     }
+
+    async fn dial_mysql(
+        &self,
+        profile: &ConnectionProfile,
+        database: &str,
+        creds: CredentialFn,
+    ) -> Result<(Arc<MysqlHandle>, Option<TunnelHandle>)> {
+        // Before the tunnel and before any credential is fetched (R2, R9).
+        crate::cleartext::check_profile(profile)?;
+        let tunnel = self.open_tunnel(profile).await?;
+        let (host, port) = dial_target(profile, &tunnel);
+        let params = MysqlConnectParams {
+            host,
+            port,
+            tls_server_name: profile.host.trim().to_string(),
+            database: database.to_string(),
+            tls: profile.tls.clone(),
+            options: profile.mysql.clone(),
+            // The validator has required verified TLS for RDS IAM.
+            cleartext_plugin: matches!(profile.auth, AuthMethod::RdsIam { .. })
+                && profile.tls.mode == TlsMode::VerifyFull,
+        };
+        let handle = MysqlHandle::connect(params, creds).await?;
+        Ok((handle, tunnel))
+    }
 }
 
 /// Where the driver actually dials: the tunnel's local end when tunnelled, else the profile.
@@ -913,9 +1421,10 @@ fn dial_target(profile: &ConnectionProfile, tunnel: &Option<TunnelHandle>) -> (S
     }
 }
 
-/// Iceberg connections never use the SSH tunnel, whatever a stale profile field says.
+/// Iceberg and Redshift connections never use the SSH tunnel, whatever a stale profile field says.
 fn is_tunneled(profile: &ConnectionProfile) -> bool {
-    profile.engine != EngineKind::Iceberg && profile.tunnel.is_some()
+    !matches!(profile.engine, EngineKind::Iceberg | EngineKind::Redshift)
+        && profile.tunnel.is_some()
 }
 
 /// A vault that answers one key from memory and defers everything else (and all writes) to the
@@ -962,21 +1471,6 @@ fn idle_exceeded(idle_secs: u64, limit_secs: u64) -> bool {
     limit_secs > 0 && idle_secs > limit_secs
 }
 
-fn default_database(profile: &ConnectionProfile, requested: Option<&str>) -> String {
-    requested
-        .map(str::trim)
-        .filter(|d| !d.is_empty())
-        .or_else(|| {
-            profile
-                .database
-                .as_deref()
-                .map(str::trim)
-                .filter(|d| !d.is_empty())
-        })
-        .unwrap_or("postgres")
-        .to_string()
-}
-
 fn require_engine(profile: &ConnectionProfile, wanted: EngineKind) -> Result<()> {
     if profile.engine == wanted {
         return Ok(());
@@ -985,11 +1479,15 @@ fn require_engine(profile: &ConnectionProfile, wanted: EngineKind) -> Result<()>
         EngineKind::Postgres => "a Postgres",
         EngineKind::Valkey => "a Valkey",
         EngineKind::Iceberg => "an Iceberg",
+        EngineKind::Redshift => "a Redshift",
+        EngineKind::Mysql => "a MySQL",
     };
     let wants = match wanted {
         EngineKind::Postgres => "Postgres",
         EngineKind::Valkey => "Valkey",
         EngineKind::Iceberg => "Iceberg",
+        EngineKind::Redshift => "Redshift",
+        EngineKind::Mysql => "MySQL",
     };
     Err(CoreError::Invalid(format!(
         "connection \"{}\" is {is} connection, not {wants}",
@@ -999,7 +1497,8 @@ fn require_engine(profile: &ConnectionProfile, wanted: EngineKind) -> Result<()>
 
 /// Serialised form of everything that affects *how we connect*. Cached handles are reused only
 /// while this is unchanged. Cosmetic fields, the idle timeouts (the reaper reads the live
-/// profile) and the TOFU-pinned host key (written back by the tunnel itself) are excluded.
+/// profile) and the pinned SSH host key are excluded: a live tunnel was checked against the pin
+/// it was opened with, and the next one is checked against whatever is pinned then.
 fn connection_signature(profile: &ConnectionProfile) -> String {
     let mut p = profile.clone();
     p.name.clear();
@@ -1010,6 +1509,7 @@ fn connection_signature(profile: &ConnectionProfile) -> String {
     p.ai_data_access = AiDataAccess::default();
     p.pg.idle_disconnect_secs = 0;
     p.valkey.idle_disconnect_secs = 0;
+    p.mysql.idle_disconnect_secs = 0;
     // Everything under `iceberg` (catalog, storage, query engine, default namespace) changes how
     // we connect, so it stays in the signature. Secrets live in the vault and are not part of it.
     if let Some(TunnelConfig::Ssh {
@@ -1032,11 +1532,27 @@ fn status_of(st: &State, profile_id: &str) -> Option<ConnectionStatus> {
         .collect();
     let valkey = st.valkey.get(profile_id);
     let iceberg = st.iceberg.get(profile_id);
-    if !pg.is_empty() || valkey.is_some() || iceberg.is_some() {
-        let engine = if valkey.is_some() {
+    let redshift = st.redshift.get(profile_id);
+    let mysql: Vec<&MysqlEntry> = st
+        .mysql
+        .iter()
+        .filter(|((id, _), _)| id == profile_id)
+        .map(|(_, e)| e)
+        .collect();
+    if !pg.is_empty()
+        || !mysql.is_empty()
+        || valkey.is_some()
+        || iceberg.is_some()
+        || redshift.is_some()
+    {
+        let engine = if !mysql.is_empty() {
+            EngineKind::Mysql
+        } else if valkey.is_some() {
             EngineKind::Valkey
         } else if iceberg.is_some() {
             EngineKind::Iceberg
+        } else if redshift.is_some() {
+            EngineKind::Redshift
         } else {
             EngineKind::Postgres
         };
@@ -1045,19 +1561,32 @@ fn status_of(st: &State, profile_id: &str) -> Option<ConnectionStatus> {
             .map(|e| e.connected_at)
             .chain(valkey.map(|e| e.connected_at))
             .chain(iceberg.map(|e| e.connected_at))
+            .chain(redshift.map(|e| e.connected_at))
+            .chain(mysql.iter().map(|e| e.connected_at))
             .min();
         let server_version = pg
             .iter()
             .filter_map(|e| e.server_version.clone())
             .chain(valkey.and_then(|e| e.server_version.clone()))
             .chain(iceberg.map(|e| e.target.clone()).filter(|t| !t.is_empty()))
+            .chain(redshift.map(|e| e.target.clone()))
+            .chain(
+                mysql
+                    .iter()
+                    .filter_map(|e| e.handle.server_version().map(|v| format!("MySQL {v}"))),
+            )
             .next();
-        let tunneled =
-            pg.iter().any(|e| e.tunnel.is_some()) || valkey.is_some_and(|e| e.tunnel.is_some());
+        let tunneled = pg.iter().any(|e| e.tunnel.is_some())
+            || mysql.iter().any(|e| e.tunnel.is_some())
+            || valkey.is_some_and(|e| e.tunnel.is_some());
         // Postgres handles whose sessions the reaper released are still connected, just asleep.
-        let detail = (engine == EngineKind::Postgres
-            && pg.iter().all(|e| e.handle.open_sessions() == 0))
-        .then(|| "idle: no open server sessions; the next query reconnects".to_string());
+        let asleep = match engine {
+            EngineKind::Postgres => pg.iter().all(|e| e.handle.open_sessions() == 0),
+            EngineKind::Mysql => mysql.iter().all(|e| e.handle.open_sessions() == 0),
+            _ => false,
+        };
+        let detail =
+            asleep.then(|| "idle: no open server sessions; the next query reconnects".to_string());
         return Some(ConnectionStatus {
             profile_id: profile_id.to_string(),
             engine,
@@ -1201,6 +1730,58 @@ impl AppToolBackend {
             workspace,
         })
     }
+
+    /// `execute_sql` for one engine, stopped by `cancel`.
+    async fn execute_sql_inner(
+        &self,
+        profile_id: &str,
+        database: Option<&str>,
+        sql: &str,
+        read_only: bool,
+        max_rows: usize,
+        cancel: &CancellationToken,
+    ) -> Result<QueryResult> {
+        let profile = self.connections.profiles().get(profile_id)?;
+        let mut opts = ExecOptions {
+            read_only,
+            max_rows,
+            page_size: max_rows.max(1),
+            timeout_ms: Some(AGENT_SQL_TIMEOUT_MS),
+        };
+        if profile.engine == EngineKind::Iceberg {
+            // `database` has no meaning for Iceberg; tables are addressed as `namespace.table`.
+            if matches!(
+                profile.iceberg.as_ref().map(|o| &o.query_engine),
+                Some(
+                    IcebergQueryEngine::Athena { .. }
+                        | IcebergQueryEngine::Trino { .. }
+                        | IcebergQueryEngine::Spark { .. }
+                )
+            ) {
+                opts.timeout_ms = Some(AGENT_ATHENA_TIMEOUT_MS);
+            }
+            let handle = self.connections.iceberg(profile_id).await?;
+            return handle
+                .execute_collect_cancellable(sql, opts, cancel.clone())
+                .await;
+        }
+        if profile.engine == EngineKind::Redshift {
+            opts.timeout_ms = Some(AGENT_REDSHIFT_TIMEOUT_MS);
+            let engine = self.connections.redshift(profile_id).await?;
+            return engine
+                .execute_collect(sql, database, opts, cancel.clone())
+                .await;
+        }
+        if profile.engine == EngineKind::Mysql {
+            let h = self.connections.mysql(profile_id, database).await?;
+            return h.execute_collect(sql, opts, cancel.clone()).await;
+        }
+        // Everything else goes through the Postgres path, which rejects other engines with
+        // a clear `Invalid`.
+        let pg = self.connections.pg(profile_id, database).await?;
+        pg.execute_collect_cancellable(sql, opts, cancel.clone())
+            .await
+    }
 }
 
 #[async_trait]
@@ -1220,29 +1801,31 @@ impl ToolBackend for AppToolBackend {
         sql: &str,
         read_only: bool,
         max_rows: usize,
+        cancel: CancellationToken,
     ) -> Result<QueryResult> {
-        let profile = self.connections.profiles().get(profile_id)?;
-        let mut opts = ExecOptions {
-            read_only,
-            max_rows,
-            page_size: max_rows.max(1),
-            timeout_ms: Some(AGENT_SQL_TIMEOUT_MS),
+        // One deadline for the whole script, below the agent's tool timeout: when it passes,
+        // the engine is cancelled and stops the statement on the server before returning.
+        let script = cancel.child_token();
+        let timer = {
+            let script = script.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(AGENT_SCRIPT_DEADLINE).await;
+                script.cancel();
+            })
         };
-        if profile.engine == EngineKind::Iceberg {
-            // `database` has no meaning for Iceberg; tables are addressed as `namespace.table`.
-            if matches!(
-                profile.iceberg.as_ref().map(|o| &o.query_engine),
-                Some(IcebergQueryEngine::Athena { .. })
-            ) {
-                opts.timeout_ms = Some(AGENT_ATHENA_TIMEOUT_MS);
+        let res = self
+            .execute_sql_inner(profile_id, database, sql, read_only, max_rows, &script)
+            .await;
+        timer.abort();
+        match res {
+            Err(CoreError::Cancelled) if !cancel.is_cancelled() && script.is_cancelled() => {
+                Err(CoreError::Timeout(format!(
+                    "the script did not finish within {} seconds; it was cancelled",
+                    AGENT_SCRIPT_DEADLINE.as_secs()
+                )))
             }
-            let handle = self.connections.iceberg(profile_id).await?;
-            return handle.execute_collect(sql, opts).await;
+            other => other,
         }
-        // Everything else goes through the Postgres path, which rejects other engines with
-        // a clear `Invalid`.
-        let pg = self.connections.pg(profile_id, database).await?;
-        pg.execute_collect(sql, opts).await
     }
 
     async fn schema_metadata(
@@ -1258,6 +1841,21 @@ impl ToolBackend for AppToolBackend {
             return handle
                 .schema_metadata(namespace_levels(schema_filter), max_tables)
                 .await;
+        }
+        if profile.engine == EngineKind::Redshift {
+            let engine = self.connections.redshift(profile_id).await?;
+            return engine
+                .schema_metadata(database, schema_filter, max_tables)
+                .await;
+        }
+        if profile.engine == EngineKind::Mysql {
+            // On MySQL a schema is a database: `schema` (when given) names the one to describe.
+            let db = schema_filter
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or(database);
+            let h = self.connections.mysql(profile_id, database).await?;
+            return h.schema_metadata(db, max_tables).await;
         }
         let pg = self.connections.pg(profile_id, database).await?;
         pg.schema_metadata(schema_filter, max_tables).await
@@ -1321,6 +1919,33 @@ impl ToolBackend for AppToolBackend {
         handle.describe_table(namespace, name).await
     }
 
+    async fn list_databases(&self, profile_id: &str) -> Result<Vec<String>> {
+        let profile = self.connections.profiles().get(profile_id)?;
+        match profile.engine {
+            EngineKind::Redshift => {
+                let engine = self.connections.redshift(profile_id).await?;
+                engine.list_databases().await
+            }
+            EngineKind::Postgres => {
+                let pg = self.connections.pg(profile_id, None).await?;
+                Ok(pg
+                    .list_databases()
+                    .await?
+                    .into_iter()
+                    .filter(|d| !d.is_template && d.allow_connections)
+                    .map(|d| d.name)
+                    .collect())
+            }
+            EngineKind::Mysql => {
+                let h = self.connections.mysql(profile_id, None).await?;
+                h.list_databases().await
+            }
+            EngineKind::Iceberg | EngineKind::Valkey => Err(CoreError::Invalid(
+                "list_databases works on Postgres, MySQL and Redshift connections only".into(),
+            )),
+        }
+    }
+
     async fn list_files(&self) -> Result<Vec<WorkspaceFile>> {
         self.workspace.list().await
     }
@@ -1329,8 +1954,10 @@ impl ToolBackend for AppToolBackend {
         self.workspace.read(path).await
     }
 
-    async fn write_file(&self, path: &str, contents: &str) -> Result<()> {
-        self.workspace.write(path, contents).await
+    async fn write_file(&self, path: &str, contents: &str, expected: &FileVersion) -> Result<()> {
+        self.workspace
+            .write_if_unchanged(path, contents, expected)
+            .await
     }
 }
 
@@ -1423,19 +2050,22 @@ mod tests {
             created_at: None,
             updated_at: None,
             iceberg: None,
+            redshift: None,
+            mysql: Default::default(),
         }
     }
 
     #[test]
     fn default_database_precedence() {
         let mut p = profile(EngineKind::Postgres);
-        assert_eq!(default_database(&p, None), "postgres");
+        assert_eq!(p.effective_database(None), "postgres");
         p.database = Some("app".into());
-        assert_eq!(default_database(&p, None), "app");
-        assert_eq!(default_database(&p, Some("other")), "other");
-        assert_eq!(default_database(&p, Some("  ")), "app");
+        assert_eq!(p.effective_database(None), "app");
+        assert_eq!(p.effective_database(Some("other")), "other");
+        assert_eq!(p.effective_database(Some(" other ")), "other");
+        assert_eq!(p.effective_database(Some("  ")), "app");
         p.database = Some(String::new());
-        assert_eq!(default_database(&p, None), "postgres");
+        assert_eq!(p.effective_database(None), "postgres");
     }
 
     #[test]

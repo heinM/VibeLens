@@ -33,7 +33,7 @@ function useCountdown(expiresAt: string | null): number | null {
 
 const mmss = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 
-function WaitingForBrowser({ start, onCancel }: { start: DeviceLoginStart; onCancel: () => void }) {
+export function WaitingForBrowser({ start, onCancel }: { start: DeviceLoginStart; onCancel: () => void }) {
   const remaining = useCountdown(start.expiresAt);
   const link = start.verificationUriComplete ?? start.verificationUri;
   return (

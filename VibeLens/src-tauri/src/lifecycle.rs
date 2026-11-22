@@ -39,7 +39,9 @@ fn prompt_text(n: usize, verb: &str) -> String {
     } else {
         format!("{n} tabs have")
     };
-    format!("{tabs} unsaved changes. {verb} anyway? Unsaved scratch SQL will be lost.")
+    format!(
+        "{tabs} unsaved changes. {verb} anyway? The text is restored the next time VibeLens opens (tabs over 1 MiB excepted), but it is not saved to a file."
+    )
 }
 
 /// Ask before discarding unsaved tabs; `proceed` runs on confirmation (or immediately when clean).
@@ -191,7 +193,7 @@ mod tests {
     fn wording() {
         assert_eq!(
             prompt_text(1, "Quit"),
-            "1 tab has unsaved changes. Quit anyway? Unsaved scratch SQL will be lost."
+            "1 tab has unsaved changes. Quit anyway? The text is restored the next time VibeLens opens (tabs over 1 MiB excepted), but it is not saved to a file."
         );
         assert!(prompt_text(3, "Close").starts_with("3 tabs have"));
     }

@@ -1,7 +1,7 @@
 // Pure helpers for rendering / copying result cells.
-import type { Cell, ColumnMeta } from "../../ipc/types";
+import type { Cell, ColumnMeta, TruncatedCell } from "../../ipc/types";
 
-export type CellKind = "null" | "bool" | "number" | "text" | "bytes" | "json";
+export type CellKind = "null" | "bool" | "number" | "text" | "bytes" | "json" | "truncated";
 
 export interface BytesCell {
   $bytes: string;
@@ -16,6 +16,88 @@ export function isBytesCell(c: unknown): c is BytesCell {
     typeof (c as Record<string, unknown>).$bytes === "string" &&
     typeof (c as Record<string, unknown>).len === "number"
   );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Values that were too large to load in full
+// ---------------------------------------------------------------------------------------------
+// The backend sends only the start of a value over 1 MiB, inside a marker (`TruncatedCell`). The
+// start is for looking at. Everything that copies, exports or writes a cell goes through the
+// helpers below so the start is never passed off as the value.
+
+export function isTruncatedCell(c: unknown): c is TruncatedCell {
+  if (typeof c !== "object" || c === null || Array.isArray(c)) return false;
+  const keys = Object.keys(c);
+  if (keys.length !== 1 || keys[0] !== "$truncated") return false;
+  const t = (c as Record<string, unknown>).$truncated as Record<string, unknown> | null;
+  return typeof t === "object" && t !== null && typeof t.kind === "string" && typeof t.bytes === "number" && typeof t.preview === "string";
+}
+
+/** The first marker in `v`, looking inside arrays and objects (an Iceberg struct can hold one). */
+export function findTruncated(v: unknown, depth = 0): TruncatedCell | null {
+  if (typeof v !== "object" || v === null || depth > 32) return null;
+  if (isTruncatedCell(v)) return v;
+  for (const x of Array.isArray(v) ? v : Object.values(v)) {
+    const found = findTruncated(x, depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+export const containsTruncated = (v: unknown): boolean => findTruncated(v) !== null;
+
+/** "50.0 MB": binary units, one decimal. */
+export function formatBytes(n: number): string {
+  if (n < 1024) return `${n} bytes`;
+  if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)} MB`;
+  return `${(n / 1024 ** 3).toFixed(1)} GB`;
+}
+
+const TRUNCATED_WHAT: Record<string, string> = { text: "text", json: "JSON", bytes: "binary data" };
+
+/**
+ * What stands in for a cut value wherever cell text leaves the grid (clipboard, CSV, Markdown, JSON):
+ * a note with the size and no part of the value.
+ */
+export function truncatedNote(c: TruncatedCell): string {
+  const what = TRUNCATED_WHAT[c.$truncated.kind];
+  return `‹value not loaded in full: ${formatCount(c.$truncated.bytes)} bytes${what ? ` of ${what}` : ""}›`;
+}
+
+/**
+ * `v` with every cut value in it, at any depth (an Iceberg struct can hold one), replaced by its
+ * `truncatedNote`. A value that holds none is returned as it is.
+ */
+export function notingTruncated<T>(v: T, depth = 0): T | string {
+  if (typeof v !== "object" || v === null || depth > 32) return v;
+  if (isTruncatedCell(v)) return truncatedNote(v);
+  if (!containsTruncated(v)) return v;
+  if (Array.isArray(v)) return v.map((x) => notingTruncated(x, depth + 1)) as T;
+  return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, notingTruncated(x, depth + 1)])) as T;
+}
+
+/** How many cells in `rows` (within `range`, when given) are or contain a cut value. */
+export function countTruncated(rows: readonly (readonly Cell[])[], range?: CellRange): number {
+  const r0 = range?.r0 ?? 0;
+  const r1 = Math.min(range?.r1 ?? rows.length - 1, rows.length - 1);
+  let n = 0;
+  for (let r = r0; r <= r1; r++) {
+    const row = rows[r];
+    if (!row) continue;
+    const c1 = Math.min(range?.c1 ?? row.length - 1, row.length - 1);
+    for (let c = range?.c0 ?? 0; c <= c1; c++) {
+      const v = row[c];
+      if (typeof v === "object" && v !== null && containsTruncated(v)) n++;
+    }
+  }
+  return n;
+}
+
+/** Adds to a "Copied …" / "Exported …" message that some values are placeholders. */
+export function withTruncatedNote(message: string, truncated: number): string {
+  if (truncated <= 0) return message;
+  return `${message}. ${truncated === 1 ? "1 value was too large to load and is a placeholder" : `${formatCount(truncated)} values were too large to load and are placeholders`}, not data`;
 }
 
 /** A JSON value holding a number JS cannot have received exactly (a big integer or a 16+ digit decimal). */
@@ -34,6 +116,7 @@ export function cellKind(c: Cell): CellKind {
   if (typeof c === "number") return "number";
   if (typeof c === "string") return "text";
   if (isBytesCell(c)) return "bytes";
+  if (isTruncatedCell(c)) return "truncated";
   return "json";
 }
 
@@ -71,12 +154,22 @@ export function displayText(c: Cell): string {
     }
     case "bytes":
       return `‹bytes ${(c as BytesCell).len}›`;
+    case "truncated": {
+      const t = (c as TruncatedCell).$truncated;
+      const what = TRUNCATED_WHAT[t.kind];
+      const label = `‹cut: ${formatBytes(t.bytes)}${what ? ` of ${what}` : " value"}›`;
+      const start = t.kind === "text" || t.kind === "json" ? t.preview.slice(0, 300) : "";
+      return start ? `${label} ${start}…` : label;
+    }
     case "json":
       return jsonPreview(c as object);
   }
 }
 
-/** Full-fidelity text for the clipboard (NULL becomes empty, JSON stays JSON). */
+/**
+ * Full-fidelity text for the clipboard (NULL becomes empty, JSON stays JSON). A value that was cut
+ * when it was read has no full text: it is copied as a note that says so (`truncatedNote`).
+ */
 export function copyText(c: Cell): string {
   switch (cellKind(c)) {
     case "null":
@@ -87,9 +180,12 @@ export function copyText(c: Cell): string {
       return String(c);
     case "bytes":
       return `‹bytes ${(c as BytesCell).len}›`;
+    case "truncated":
+      return truncatedNote(c as TruncatedCell);
     case "json":
       try {
-        return JSON.stringify(c);
+        // A cut value inside the JSON is a note too, not its start.
+        return JSON.stringify(notingTruncated(c));
       } catch {
         return "";
       }
@@ -160,7 +256,10 @@ export function rowsToObjects(columns: readonly ColumnMeta[], rows: readonly (re
   const n = Math.min(rows.length, limit);
   for (let r = 0; r < n; r++) {
     const o: Record<string, Cell> = {};
-    for (let c = 0; c < keys.length; c++) o[keys[c]] = rows[r][c] ?? null;
+    for (let c = 0; c < keys.length; c++) {
+      const v = rows[r][c] ?? null;
+      o[keys[c]] = notingTruncated(v);
+    }
     out.push(o);
   }
   return out;

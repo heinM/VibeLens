@@ -1,6 +1,7 @@
 // Indexed view over a SchemaMetadata, built once per fetched catalog (WeakMap-memoised), so the
 // completion hot path is hash lookups and never walks thousands of tables.
 import type { ColumnInfo, ForeignKeyInfo, SchemaMetadata, TableDescription } from "../../ipc/types";
+import { nestedNamespaceIsOneIdent, quoteIdentFor, type SqlDialect } from "./dialect";
 import { RESERVED_WORDS } from "./keywords";
 
 export interface Catalog {
@@ -157,21 +158,29 @@ export const kindLabel = (k: TableDescription["kind"]): string =>
 
 // -- identifier quoting ---------------------------------------------------------------------------
 
-/** True if `name` must be double-quoted to be read back as the same identifier. */
-export function needsQuoting(name: string): boolean {
-  return !/^[a-z_][a-z0-9_$]*$/.test(name) || RESERVED_WORDS.has(name);
+/** True if `name` must be quoted to be read back as the same identifier (Spark has no `$` in bare names). */
+export function needsQuoting(name: string, dialect?: SqlDialect | null): boolean {
+  const bare = dialect === "spark" ? /^[a-z_][a-z0-9_]*$/ : /^[a-z_][a-z0-9_$]*$/;
+  return !bare.test(name) || RESERVED_WORDS.has(name);
 }
 
-export function quoteIdent(name: string): string {
-  return `"${name.replace(/"/g, '""')}"`;
+/** Quoted in the dialect's own way: backticks for Spark SQL, double quotes elsewhere (see `quoteIdentFor`). */
+export function quoteIdent(name: string, dialect?: SqlDialect | null): string {
+  return quoteIdentFor(name, dialect);
 }
 
 /** The text to insert for an identifier: bare when safe, quoted otherwise (or when forced). */
-export function ident(name: string, force = false): string {
-  return force || needsQuoting(name) ? quoteIdent(name) : name;
+export function ident(name: string, force = false, dialect?: SqlDialect | null): string {
+  return force || needsQuoting(name, dialect) ? quoteIdent(name, dialect) : name;
 }
 
-/** A schema name as SQL: a dotted catalog (Iceberg) writes each namespace level as its own identifier. */
-export function schemaIdent(cat: Catalog | null, schema: string, force = false): string {
-  return cat?.dotted ? schema.split(".").map((p) => ident(p, force)).join(".") : ident(schema, force);
+/**
+ * A schema name as SQL. A dotted catalog (Iceberg) writes each namespace level as its own identifier,
+ * except on Trino / Athena, which read a nested namespace as one schema: `"lake.sales"`.
+ */
+export function schemaIdent(cat: Catalog | null, schema: string, force = false, dialect?: SqlDialect | null): string {
+  if (!cat?.dotted) return ident(schema, force, dialect);
+  const levels = schema.split(".");
+  if (levels.length > 1 && nestedNamespaceIsOneIdent(dialect)) return quoteIdent(schema, dialect);
+  return levels.map((p) => ident(p, force, dialect)).join(".");
 }

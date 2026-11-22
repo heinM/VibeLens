@@ -96,7 +96,8 @@ PermitRootLogin yes
 AllowTcpForwarding yes
 PermitTunnel no
 X11Forwarding no
-LogLevel ERROR
+# DEBUG1 logs every authentication request, which the tests read to prove that none was made.
+LogLevel DEBUG1
 CONF
 
 "$sshd_bin" -t -f "$wd/sshd_config" >&2

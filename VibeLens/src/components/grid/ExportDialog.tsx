@@ -6,7 +6,7 @@ import type { Cell, ColumnMeta } from "../../ipc/types";
 import { readStorage, writeStorage } from "../layout/storage";
 import { Button, Dialog, Field, Input } from "../ui";
 import { suggestFileName, toCsv, toJson, toSqlInserts, type InsertTarget } from "./exportFormats";
-import { formatCount } from "./cellFormat";
+import { formatCount, countTruncated, withTruncatedNote } from "./cellFormat";
 import { showToast } from "./toast";
 
 export type ExportFormat = "csv" | "json" | "sql";
@@ -63,6 +63,9 @@ export function ExportDialog({
   }, [format, table]);
 
   const rowCount = format ? getRows().length : 0;
+  // Values that were too large to load in full: a file would hold a note in their place.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const cutCount = useMemo(() => (format ? countTruncated(getRows()) : 0), [format]);
   const fileName = useMemo(() => (format ? suggestFileName(baseName, EXT[format]) : ""), [format, baseName]);
 
   if (!format) return null;
@@ -89,7 +92,7 @@ export function ExportDialog({
       }
       const path = await api.exportFile(fileName, contents);
       if (path) {
-        showToast({ title: `Exported ${formatCount(rows.length)} ${rows.length === 1 ? "row" : "rows"}`, detail: path, copyDetail: true });
+        showToast({ title: withTruncatedNote(`Exported ${formatCount(rows.length)} ${rows.length === 1 ? "row" : "rows"}`, countTruncated(rows)), detail: path, copyDetail: true });
         onClose();
       }
     } catch (e) {
@@ -120,6 +123,14 @@ export function ExportDialog({
         <p className="text-[13px] text-muted">
           {formatCount(rowCount)} loaded {rowCount === 1 ? "row" : "rows"}, {columns.length} {columns.length === 1 ? "column" : "columns"}. Only rows already loaded in the grid are exported.
         </p>
+        {cutCount > 0 && (
+          <p role="alert" className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[12px] leading-5 text-fg">
+            {cutCount === 1 ? "1 value was" : `${formatCount(cutCount)} values were`} too large to load in full.{" "}
+            {format === "sql"
+              ? "INSERT statements cannot be written for such a value, so this export will stop with an error. Export CSV or JSON, or query a shorter form of the column."
+              : "The file will hold a note (‹value not loaded in full: …›) in place of each, not the data."}
+          </p>
+        )}
         {format === "csv" && (
           <div className="space-y-3">
             <Check checked={header} onChange={setHeader} label="Include a header row" />

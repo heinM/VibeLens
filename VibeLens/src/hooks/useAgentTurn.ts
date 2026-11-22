@@ -5,7 +5,7 @@ import { useAgentStore } from "../store/useAgentStore";
 import { useUIStore } from "../store/useUIStore";
 import { useWorkspaceStore } from "../store/useWorkspaceStore";
 import { useLastResultStore, withLastResult } from "../components/agent/lastResult";
-import { buildAgentContext, fileLabel, resolveTarget, type ChipExclusions } from "./useAgentContext";
+import { buildAgentContext, currentAgentTarget, fileLabel, type ChipExclusions } from "./useAgentContext";
 
 export interface SendArgs {
   prompt: string;
@@ -26,9 +26,9 @@ export function useAgentTurn() {
     const store = useAgentStore.getState();
     if (store.running || !prompt.trim()) return;
     const sessionId = store.sessionId;
-    const ui = useUIStore.getState();
     const tab = useWorkspaceStore.getState().activeTab();
-    const target = resolveTarget(tab, ui.activeProfileId, ui.activeDatabase);
+    // Pinned: the stored target, whatever has focus now. Otherwise the focused connection.
+    const target = currentAgentTarget();
     const context = buildAgentContext(target, tab, exclude);
 
     const attached: string[] = [];
@@ -54,7 +54,7 @@ export function useAgentTurn() {
           if (ev.type === "fileWritten") {
             void useWorkspaceStore
               .getState()
-              .openWorkspaceFile(ev.path, useUIStore.getState().activeProfileId)
+              .openWorkspaceFile(ev.path, s.pinnedTarget?.profileId ?? useUIStore.getState().activeProfileId)
               .catch(() => undefined);
           }
         },

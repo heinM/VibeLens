@@ -1,15 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Brain, CheckCircle2, Cog, Cpu, Database, HardDrive, KeyRound, Library, Lock, Network, Trash2 } from "lucide-react";
+import { Brain, CheckCircle2, Cog, Cpu, Database, HardDrive, KeyRound, Library, Lock, Network, Trash2, Warehouse } from "lucide-react";
 import { api, asError } from "../../ipc/commands";
-import type { ConnectionProfile, ErrorPayload, IcebergOptions, TestResult } from "../../ipc/types";
+import type { ConnectionProfile, ErrorPayload, IcebergOptions, PresentedHostKey, RedshiftOptions, TestResult } from "../../ipc/types";
 import { cn } from "../../lib/cn";
 import { useUIStore } from "../../store/useUIStore";
 import { Button, ConfirmDialog, Dialog, EmptyState, EnvBadge, ErrorBox, Spinner } from "../ui";
 import { FocusScope } from "../ui/formKit";
 import { aiAccessMeta } from "./aiAccess";
-import { cleanProfile, icebergSecretArgs, initialDraft, missingIcebergSecrets, secretArgs, testPasswordArg, type Draft, type S3KeysEdit, type SecretEdit } from "./draft";
+import { cleanProfile, draftErrors, icebergSecretArgs, initialDraft, reconcileDraft, missingIcebergSecrets, secretArgs, testEngineSecretArg, testPasswordArg, type Draft, type S3KeysEdit, type SecretEdit } from "./draft";
+import { HostKeyTrustDialog } from "./HostKeyDialog";
+import { isHostKeyFingerprint, withTrustedHostKey } from "./hostKey";
 import { catalogSummary, engineSummary, normalizeIceberg, storageSummary } from "./icebergForm";
+import type { ConfRow } from "./remoteEngineForm";
+import { mysqlPasswordError } from "./mysqlForm";
+import { normalizeRedshift, redshiftTargetName } from "./redshiftForm";
+import { RedshiftSection } from "./sections/RedshiftSection";
 import { AdvancedSection } from "./sections/AdvancedSection";
 import { AiAccessSection } from "./sections/AiAccessSection";
 import { AuthSection } from "./sections/AuthSection";
@@ -26,6 +32,7 @@ import { errorCountBySection, firstErrorSection, validateProfile, type SectionId
 const NAV: { id: SectionId; label: string; icon: typeof Database }[] = [
   { id: "general", label: "General", icon: Database },
   { id: "auth", label: "Authentication", icon: KeyRound },
+  { id: "warehouse", label: "Warehouse", icon: Warehouse },
   { id: "catalog", label: "Catalog", icon: Library },
   { id: "storage", label: "Storage", icon: HardDrive },
   { id: "queryEngine", label: "Query engine", icon: Cpu },
@@ -35,11 +42,17 @@ const NAV: { id: SectionId; label: string; icon: typeof Database }[] = [
   { id: "advanced", label: "Advanced", icon: Cog },
 ];
 
-/** Sections shown per engine. Iceberg swaps Authentication for Catalog and drops Network, TLS and Advanced. */
+/**
+ * Sections shown per engine. Iceberg swaps Authentication for Catalog and drops Network, TLS and Advanced.
+ * Redshift has one Warehouse section (target, database, AWS identity, sign-in): the Data API is reached
+ * through AWS with IAM, so there is no host, port, password, TLS or tunnel to set.
+ */
 const ENGINE_SECTIONS: Record<ConnectionProfile["engine"], SectionId[]> = {
   postgres: ["general", "auth", "network", "tls", "ai", "advanced"],
   valkey: ["general", "auth", "network", "tls", "ai", "advanced"],
   iceberg: ["general", "catalog", "storage", "queryEngine", "ai"],
+  redshift: ["general", "warehouse", "ai"],
+  mysql: ["general", "auth", "network", "tls", "ai", "advanced"],
 };
 
 type TestState =
@@ -97,15 +110,24 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
   const [saveError, setSaveError] = useState<ErrorPayload | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  /** The key an unpinned SSH host presented to the last Test, while the user is looking at it. */
+  const [keyToCheck, setKeyToCheck] = useState<PresentedHostKey | null>(null);
   const confirmingRef = useRef(false);
-  confirmingRef.current = confirmDelete;
+  confirmingRef.current = confirmDelete || keyToCheck !== null;
   const testSeq = useRef(0);
 
   const editing = existing != null;
   const profile = draft.profile;
   const storedSecrets = useSecretStatus(editing ? existing?.id : null).data;
   const missing = useMemo(() => missingIcebergSecrets(existing, draft, storedSecrets), [existing, draft, storedSecrets]);
-  const errors = useMemo(() => validateProfile(cleanProfile(profile), others, missing), [profile, others, missing]);
+  const mysqlPassword = useMemo(
+    () => mysqlPasswordError(existing, cleanProfile(profile), draft.password, storedSecrets?.hasPassword ?? editing),
+    [existing, profile, draft.password, storedSecrets, editing],
+  );
+  const errors = useMemo<Record<string, string>>(
+    () => ({ ...validateProfile(cleanProfile(profile), others, missing), ...draftErrors(draft), ...(mysqlPassword ? { "auth.password": mysqlPassword } : {}) }),
+    [profile, others, missing, draft, mysqlPassword],
+  );
   const counts = useMemo(() => errorCountBySection(errors), [errors]);
 
   const touch = useCallback(() => {
@@ -116,7 +138,7 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
   const patch = useCallback(
     (fn: (p: ConnectionProfile) => ConnectionProfile) => {
       touch();
-      setDraft((d) => ({ ...d, profile: fn(d.profile) }));
+      setDraft((d) => reconcileDraft(d, fn(d.profile)));
     },
     [touch],
   );
@@ -153,9 +175,27 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
     },
     [touch],
   );
+  const setSessionConfRows = useCallback(
+    (sessionConfRows: ConfRow[]) => {
+      touch();
+      setDraft((d) => ({ ...d, sessionConfRows }));
+    },
+    [touch],
+  );
+  const setEngineSecret = useCallback(
+    (engineSecret: SecretEdit) => {
+      touch();
+      setDraft((d) => ({ ...d, engineSecret }));
+    },
+    [touch],
+  );
+  const patchRedshift = useCallback(
+    (fn: (o: RedshiftOptions) => RedshiftOptions) => patch((p) => (p.redshift ? { ...p, redshift: normalizeRedshift(fn(p.redshift)) } : p)),
+    [patch],
+  );
 
   const onClose = useCallback(() => {
-    if (confirmingRef.current) return; // Esc belongs to the delete confirmation
+    if (confirmingRef.current) return; // Esc belongs to the dialog on top (delete confirmation, host key)
     closeWizard();
   }, [closeWizard]);
 
@@ -170,16 +210,30 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
     return true;
   };
 
-  const runTest = async () => {
+  /** `tested` replaces the draft's profile for this one run (state set in the same tick is not visible yet). */
+  const runTest = async (tested: ConnectionProfile = profile) => {
     if (!checkValid()) return;
     const seq = ++testSeq.current;
     setTest({ status: "running" });
     try {
-      const result = await api.testConnection(cleanProfile(profile), testPasswordArg(draft));
-      if (seq === testSeq.current) setTest({ status: "done", result });
+      const result = await api.testConnection(cleanProfile(tested), testPasswordArg(draft), testEngineSecretArg(draft));
+      if (seq !== testSeq.current) return;
+      setTest({ status: "done", result });
+      // An unpinned SSH host: nothing was sent to it. Show its key instead of just failing.
+      if (result.hostKey && isHostKeyFingerprint(result.hostKey.fingerprint)) setKeyToCheck(result.hostKey);
     } catch (e) {
       if (seq === testSeq.current) setTest({ status: "error", error: asError(e) });
     }
+  };
+
+  /** Trusting a key during Test pins it on the draft only. It reaches the saved profile with Save. */
+  const trustTestedKey = () => {
+    const key = keyToCheck;
+    setKeyToCheck(null);
+    const next = key && withTrustedHostKey(profile, key);
+    if (!next) return;
+    patch(() => next);
+    void runTest(next);
   };
 
   const save = async () => {
@@ -188,9 +242,9 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
     setSaveError(null);
     try {
       const { password, sshSecret } = secretArgs(existing, draft);
-      const { icebergSecret, s3Keys } = icebergSecretArgs(existing, draft);
+      const { icebergSecret, s3Keys, engineSecret } = icebergSecretArgs(existing, draft);
       const forgetHostKey = !!existing?.tunnel?.knownHostFingerprint && !profile.tunnel?.knownHostFingerprint;
-      await api.saveProfile(cleanProfile(profile), password, sshSecret, icebergSecret, s3Keys, forgetHostKey);
+      await api.saveProfile(cleanProfile(profile), password, sshSecret, icebergSecret, s3Keys, forgetHostKey, engineSecret);
       await qc.invalidateQueries({ queryKey: ["profiles"] });
       closeWizard();
     } catch (e) {
@@ -230,7 +284,7 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
   });
 
   const err = useCallback((field: string) => (submitted ? errors[field] : undefined), [submitted, errors]);
-  const props: SectionProps = { draft, profile, editing, original: existing, patch, patchIceberg, setPassword, setSshSecret, setIcebergSecret, setS3Keys, err };
+  const props: SectionProps = { draft, profile, editing, original: existing, patch, patchIceberg, patchRedshift, setPassword, setSshSecret, setIcebergSecret, setS3Keys, setEngineSecret, setSessionConfRows, err };
   const visible = ENGINE_SECTIONS[profile.engine];
   const current: SectionId = visible.includes(section) ? section : "general";
 
@@ -240,6 +294,7 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
     catalog: ice ? catalogSummary(ice.catalog) : "",
     storage: ice ? storageSummary(ice.storage) : "",
     queryEngine: ice ? engineSummary(ice.queryEngine) : "",
+    warehouse: profile.redshift ? redshiftTargetName(profile.redshift.target) || (profile.redshift.target.kind === "serverless" ? "Serverless" : "Provisioned") : "",
     auth: { none: "None", password: "Password", rdsIam: "RDS IAM", secretsManager: "Secrets Manager", elastiCacheIam: "ElastiCache IAM", accessToken: "Access token" }[profile.auth.kind],
     network: profile.tunnel ? "SSH tunnel" : "Direct",
     tls: { verifyFull: "Verify full", require: "No verification", disable: "Off" }[profile.tls.mode],
@@ -270,7 +325,7 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
                   <Trash2 className="size-3.5" /> Delete
                 </Button>
               )}
-              <TestResultView state={test} />
+              <TestResultView state={test} onCheckKey={setKeyToCheck} />
             </div>
             <Button onClick={() => void runTest()} loading={test.status === "running"} disabled={busy}>
               Test connection
@@ -322,6 +377,7 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
                 {current === "catalog" && <IcebergCatalogSection {...props} />}
                 {current === "storage" && <IcebergStorageSection {...props} />}
                 {current === "queryEngine" && <IcebergEngineSection {...props} />}
+                {current === "warehouse" && <RedshiftSection {...props} />}
                 {current === "network" && <NetworkSection {...props} />}
                 {current === "tls" && <TlsSection {...props} />}
                 {current === "ai" && <AiAccessSection {...props} />}
@@ -332,6 +388,7 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
           </div>
         </FocusScope>
       </Dialog>
+      <HostKeyTrustDialog hostKey={keyToCheck} connectionName={profile.name.trim() || null} trustLabel="Trust and test again" onTrust={trustTestedKey} onCancel={() => setKeyToCheck(null)} />
       <ConfirmDialog
         open={confirmDelete}
         title="Delete connection"
@@ -353,7 +410,7 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
   );
 }
 
-function TestResultView({ state }: { state: TestState }) {
+function TestResultView({ state, onCheckKey }: { state: TestState; onCheckKey: (key: PresentedHostKey) => void }) {
   if (state.status === "idle") return null;
   if (state.status === "running")
     return (
@@ -370,6 +427,16 @@ function TestResultView({ state }: { state: TestState }) {
         <span className="truncate">
           Connected in {r.latencyMs} ms{r.serverVersion ? ` · ${r.serverVersion}` : ""}
         </span>
+      </span>
+    );
+  const hostKey = r.hostKey;
+  if (hostKey)
+    return (
+      <span className="inline-flex min-w-0 items-center gap-2 text-xs text-warn" role="status">
+        <span className="truncate">The SSH host&rsquo;s key is not trusted yet. Nothing was sent to it.</span>
+        <Button size="sm" onClick={() => onCheckKey(hostKey)}>
+          Check host key
+        </Button>
       </span>
     );
   return (

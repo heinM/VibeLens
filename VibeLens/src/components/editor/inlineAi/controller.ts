@@ -199,7 +199,7 @@ export class InlineAiController {
       range = Range.lift(sel);
     } else {
       const line = model.getLineContent(pos.lineNumber);
-      const stmt = line.trim() ? statementAtOffset(model.getValue(), model.getOffsetAt(pos)) : null;
+      const stmt = line.trim() ? statementAtOffset(model.getValue(), model.getOffsetAt(pos), { mysql: this.host.getTarget().dialect === "mysql" }) : null;
       if (stmt) {
         mode = "statement";
         canSwitch = true;
