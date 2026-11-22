@@ -404,11 +404,6 @@ impl Stream {
         self.codec.as_ref().unwrap().get_ref().is_secure()
     }
 
-    #[cfg(unix)]
-    pub(crate) fn is_socket(&self) -> bool {
-        self.codec.as_ref().unwrap().get_ref().is_socket()
-    }
-
     pub(crate) fn reset_seq_id(&mut self) {
         if let Some(codec) = self.codec.as_mut() {
             codec.codec_mut().reset_seq_id();

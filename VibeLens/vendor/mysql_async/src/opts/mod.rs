@@ -1150,12 +1150,14 @@ impl Opts {
     }
 
     pub(crate) fn get_capabilities(&self) -> CapabilityFlags {
+        // VibeLens patch: CLIENT_LOCAL_FILES and CLIENT_MULTI_STATEMENTS are never advertised.
+        // Without the first the server refuses `LOAD DATA LOCAL`; without the second it refuses
+        // a COM_QUERY that holds more than one statement, so one statement cannot carry a
+        // second. See vendor/mysql_async/PATCH.md.
         let mut out = CapabilityFlags::CLIENT_PROTOCOL_41
             | CapabilityFlags::CLIENT_SECURE_CONNECTION
             | CapabilityFlags::CLIENT_LONG_PASSWORD
             | CapabilityFlags::CLIENT_TRANSACTIONS
-            | CapabilityFlags::CLIENT_LOCAL_FILES
-            | CapabilityFlags::CLIENT_MULTI_STATEMENTS
             | CapabilityFlags::CLIENT_MULTI_RESULTS
             | CapabilityFlags::CLIENT_PS_MULTI_RESULTS
             | CapabilityFlags::CLIENT_DEPRECATE_EOF

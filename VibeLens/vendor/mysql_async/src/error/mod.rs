@@ -176,8 +176,16 @@ pub enum DriverError {
     #[error("Client asked for SSL but server does not have this capability")]
     NoClientSslFlagFromServer,
 
-    #[error("mysql_clear_password must be enabled on the client side")]
+    #[error("mysql_clear_password must be enabled on the client side, and needs TLS")]
     CleartextPluginDisabled,
+
+    /// VibeLens patch: `caching_sha2_password` full authentication was requested on a
+    /// connection without TLS. See vendor/mysql_async/PATCH.md.
+    #[error(
+        "the server asked for the full password (caching_sha2_password full authentication) on \
+         a connection without TLS; it was not sent. Turn TLS on for this connection"
+    )]
+    InsecureFullAuth,
     #[error("Invalid parsec ext-salt packet received from server")]
     InvalidParsecSalt,
 

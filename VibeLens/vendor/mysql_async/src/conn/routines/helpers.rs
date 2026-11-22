@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use futures_util::StreamExt;
 use mysql_common::{
     constants::MAX_PAYLOAD_LEN,
     io::{ParseBuf, ReadMysqlExt},
@@ -80,44 +79,21 @@ impl Conn {
     }
 
     /// Will handle local infile packet.
+    ///
+    /// VibeLens patch: a server asking for a local file (`LOCAL INFILE` request, 0xFB) never
+    /// gets one, whatever handler is registered: no handler is consulted and no file is opened.
+    /// `CLIENT_LOCAL_FILES` is not advertised (see `Opts::get_capabilities`), so only a hostile
+    /// or broken server sends this request. The connection is closed instead of answered, so
+    /// nothing more is read from or sent to that server on it. See vendor/mysql_async/PATCH.md.
     pub(super) async fn handle_local_infile<P>(&mut self, packet: &[u8]) -> crate::Result<()>
     where
         P: Protocol,
     {
-        let local_infile = ParseBuf(packet).parse::<LocalInfilePacket>(())?;
-
-        let mut infile_data = if let Some(handler) = self.inner.infile_handler.take() {
-            handler.await?
-        } else if let Some(handler) = self.opts().local_infile_handler() {
-            handler.handle(local_infile.file_name_ref()).await?
-        } else {
-            return Err(LocalInfileError::NoHandler.into());
-        };
-
-        let mut result = Ok(());
-        while let Some(bytes) = infile_data.next().await {
-            match bytes {
-                Ok(bytes) => {
-                    // We'll skip empty chunks to stay compliant with the protocol.
-                    if !bytes.is_empty() {
-                        self.write_bytes(&bytes).await?;
-                    }
-                }
-                Err(err) => {
-                    // Abort the stream in case of an error.
-                    result = Err(LocalInfileError::from(err));
-                    break;
-                }
-            }
-        }
-        self.write_bytes(&[]).await?;
-
-        self.read_packet().await?;
-        self.set_pending_result(Some(P::result_set_meta(Arc::from(
-            Vec::new().into_boxed_slice(),
-        ))))?;
-
-        result.map_err(Into::into)
+        let _ = ParseBuf(packet).parse::<LocalInfilePacket>(())?;
+        self.inner.infile_handler = None;
+        self.inner.stream.take();
+        self.inner.disconnected = true;
+        Err(LocalInfileError::NoHandler.into())
     }
 
     /// Helper that handles result set packet.

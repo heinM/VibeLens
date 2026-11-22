@@ -12,7 +12,6 @@ use mysql_common::{
     constants::{
         MariadbCapabilities, DEFAULT_MAX_ALLOWED_PACKET, UTF8MB4_GENERAL_CI, UTF8_GENERAL_CI,
     },
-    crypto,
     io::ParseBuf,
     packets::{
         AuthPlugin, AuthSwitchRequest, CommonOkPacket, ErrPacket, HandshakePacket,
@@ -479,21 +478,6 @@ impl Conn {
         false
     }
 
-    /// Returns true if io stream is socket.
-    fn is_socket(&self) -> bool {
-        #[cfg(unix)]
-        {
-            self.inner
-                .stream
-                .as_ref()
-                .map(|x| x.is_socket())
-                .unwrap_or_default()
-        }
-
-        #[cfg(not(unix))]
-        false
-    }
-
     /// Hacky way to move connection through &mut. `self` becomes unusable.
     fn take(&mut self) -> Conn {
         mem::replace(self, Conn::empty(Default::default()))
@@ -661,7 +645,9 @@ impl Conn {
                     }
                 }
                 x @ AuthPlugin::MysqlClearPassword => {
-                    if self.inner.opts.enable_cleartext_plugin() {
+                    // VibeLens patch: the cleartext plugin answers only over TLS, even when the
+                    // caller enabled it. See vendor/mysql_async/PATCH.md.
+                    if self.inner.opts.enable_cleartext_plugin() && self.is_secure() {
                         x.gen_data(self.inner.opts.pass(), &self.inner.nonce)
                     } else {
                         return Err(DriverError::CleartextPluginDisabled.into());
@@ -809,22 +795,16 @@ impl Conn {
                     let mut pass = crate::buffer_pool().get_with(pass.as_bytes());
                     pass.as_mut().push(0);
 
-                    if self.is_secure() || self.is_socket() {
+                    // VibeLens patch: full authentication sends the password itself, so it
+                    // happens over TLS only. Without TLS upstream asks the server for its RSA
+                    // public key and encrypts the password with whatever key comes back, which
+                    // an active attacker can supply. Refused instead; nothing is sent. See
+                    // vendor/mysql_async/PATCH.md.
+                    if self.is_secure() {
                         self.write_packet(pass).await?;
                     } else {
-                        if self.inner.server_key.is_none() {
-                            self.write_bytes(&[0x02][..]).await?;
-                            let packet = self.read_packet().await?;
-                            self.inner.server_key = Some(packet[1..].to_vec());
-                        }
-                        for (i, byte) in pass.as_mut().iter_mut().enumerate() {
-                            *byte ^= self.inner.nonce[i % self.inner.nonce.len()];
-                        }
-                        let encrypted_pass = crypto::encrypt(
-                            &pass,
-                            self.inner.server_key.as_deref().expect("unreachable"),
-                        );
-                        self.write_bytes(&encrypted_pass).await?;
+                        drop(pass);
+                        return Err(DriverError::InsecureFullAuth.into());
                     };
                     self.drop_packet().await?;
                     Ok(())
@@ -948,12 +928,6 @@ impl Conn {
                 self.inner.disconnected = true;
                 From::from(io_err)
             })
-    }
-
-    /// Writes bytes to a server.
-    pub(crate) async fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        let buf = crate::buffer_pool().get_with(bytes);
-        self.write_packet(buf).await
     }
 
     /// Sends a serializable structure to a server.

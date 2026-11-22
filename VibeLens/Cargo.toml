@@ -12,6 +12,9 @@ authors = ["Hein van der Merwe"]
 # 0.8.6 source with the dependency range raised to 0.39 until upstream publishes a fix.
 [patch.crates-io]
 sqlx-sqlite = { path = "vendor/sqlx-sqlite" }
+# MySQL driver with four security changes (no LOCAL INFILE, no multi-statements capability,
+# no password over an unencrypted channel). See vendor/mysql_async/PATCH.md.
+mysql_async = { path = "vendor/mysql_async" }
 
 # Dependencies (DataFusion, Arrow, AWS SDK) are huge with full debug info: keep only line tables
 # for our crates and none for deps. Cuts target/ size and link time dramatically.
