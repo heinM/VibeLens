@@ -1,0 +1,83 @@
+{
+ "serverVersion": "8.4.13",
+ "customers": {
+  "sql": "SELECT id, full_name, country, last_login, flags, profile FROM customers ORDER BY id;",
+  "columns": [
+   {
+    "name": "id",
+    "typeName": "bigint unsigned",
+    "typeOid": 8
+   },
+   {
+    "name": "full_name",
+    "typeName": "varchar",
+    "typeOid": 253
+   },
+   {
+    "name": "country",
+    "typeName": "char",
+    "typeOid": 254
+   },
+   {
+    "name": "last_login",
+    "typeName": "date",
+    "typeOid": 10
+   },
+   {
+    "name": "flags",
+    "typeName": "bit",
+    "typeOid": 16
+   },
+   {
+    "name": "profile",
+    "typeName": "json",
+    "typeOid": 245
+   }
+  ],
+  "rows": [
+   [
+    "1",
+    "Ada Lovelace",
+    "GB",
+    "2026-11-01",
+    "0101",
+    {
+     "tags": [
+      "early",
+      "vip"
+     ],
+     "tier": "gold"
+    }
+   ],
+   [
+    "2",
+    "Alan Turing",
+    "GB",
+    "0000-00-00",
+    "0001",
+    null
+   ],
+   [
+    "3",
+    "Grace Hopper",
+    "US",
+    null,
+    "1000",
+    {
+     "tier": "silver"
+    }
+   ],
+   [
+    "4",
+    "Nomsa Dlamini",
+    "ZA",
+    "2026-10-30",
+    "0000",
+    {
+     "note": "ünïcödé ✓",
+     "tier": "bronze"
+    }
+   ]
+  ]
+ }
+}
