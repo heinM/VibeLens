@@ -1,7 +1,7 @@
 # Design: Trino and Spark query engines, and Amazon Redshift with IAM
 
-Status: design, 2026-11-21. Two features, built to the same rules as `docs/SECURITY_REVIEW.md`
-and the 2026-11-20 review fixes (PR #9).
+Status: design, 2026-11-21. Two features, built to the same security rules as `docs/DESIGN.md`
+and the 2026-11-20 review fixes.
 
 1. **Trino and Spark as remote query engines for Iceberg connections**, next to Athena.
 2. **Amazon Redshift connections authenticated with IAM**, through the Redshift Data API.
@@ -367,7 +367,7 @@ Trino and Spark need no new command: they run through `ice_execute`.
 - Each fix-style test states what would go wrong without the rule.
 - UI: validation, draft and dispatch tests in Vitest.
 - Not covered by automation: a real Trino, Livy or Redshift. First use against the EKS cluster
-  and a warehouse is a manual test (`docs/TEST_PLAN.md` gets the cases).
+  and a warehouse is a manual test (the manual test plan gets the cases).
 
 ---
 
@@ -599,7 +599,7 @@ them locally).
 - **The vendored driver** must be refreshed by hand for upstream fixes (its `PATCH.md` says how).
 - **Not tested against a live server:** Aurora MySQL, RDS IAM end to end (token signing is
   tested offline), MariaDB, the SSH tunnel path for MySQL (shared code, tested with Postgres and
-  Valkey). See `docs/TEST_PLAN.md` §11c.
+  Valkey).
 
 ### 6.6 Testing
 

@@ -4,7 +4,7 @@ How to turn the repo into installers other people can run: what it costs, what t
 
 **Short version**
 1. Work lands on `develop`, is tried on `test`, and is promoted to `release` (§0).
-2. On `release`: bump the version in **one place** (§3) and run the test plan (`docs/TEST_PLAN.md`).
+2. On `release`: bump the version in **one place** (§3) and run the manual test plan (kept outside this repository).
 3. Build the installers into a **draft** GitHub release: on a Mac with `VibeLens/scripts/release-local.sh` (macOS, optionally Linux), or on runners with `gh workflow run release.yml --ref vX.Y.Z` (macOS, Windows, Linux). Pushing a tag does not start a build.
 4. Open a pull request from `release` into `main`. This is the only thing that starts CI. Merge it when CI is green: `main` is what is in production.
 5. Runner builds publish release candidate tags as prereleases automatically once all platforms finish; stable tags, and anything built locally, stay drafts until you publish them (§9).
@@ -115,7 +115,7 @@ open target/universal-apple-darwin/release/bundle/dmg/
 - Visual Studio Build Tools (C++), Rust, Node 24, then `npm ci`, `scripts\fetch-rds-ca.ps1`, `npm run tauri build`.
 - Cross-compiling Windows installers from macOS is possible but experimental, and signing then needs a custom `signCommand`. Use CI instead.
 
-> **Honest status:** VibeLens has so far only been *run* on macOS. Windows is compiled in CI but has never been launched. Make the first Windows release a **beta**, and run TEST_PLAN §3 and §5 on a real Windows 11 machine first. The Credential Manager and WebView2 paths are the risk.
+> **Honest status:** VibeLens has so far only been *run* on macOS. Windows is compiled in CI but has never been launched. Make the first Windows release a **beta**, and run the smoke and platform sections of the manual test plan on a real Windows 11 machine first. The Credential Manager and WebView2 paths are the risk.
 
 ---
 
@@ -171,7 +171,7 @@ xcrun stapler staple "$DMG"
 - **Keychain prompts after the first signed release.** macOS ties keychain item access to the app's code signature. Testers moving from an unsigned or ad-hoc build to the Developer ID build get "VibeLens wants to use your confidential information stored in…" once, because all secrets share one keychain item. **Always Allow** fixes it. Say so in the release notes. After that, stay on the same Team ID forever.
 - **Minimum macOS is 11.0** (`bundle.macOS.minimumSystemVersion`), but the real floor is **Safari 16.4's WebKit**. Big Sur and Monterey users must have updated Safari. Older engines show the in-app "needs a newer system WebKit" screen rather than a blank window.
 - **Universal vs per-arch.** Universal is one download that works everywhere at about 2× the binary size. Fine for now.
-- **macOS 26 icons.** See `docs/LOGO_SPEC.md` §8. Without a Liquid Glass (Icon Composer) icon, Tahoe draws the classic icon inside a system squircle. Acceptable, not beautiful.
+- **macOS 26 icons.** Without a Liquid Glass (Icon Composer) icon, Tahoe draws the classic icon inside a system squircle. Acceptable, not beautiful.
 
 ### 5.5 Ad-hoc signing (free stopgap)
 `"signingIdentity": "-"` in `bundle.macOS` gives an ad-hoc signature. Apple Silicon needs *some* signature to run downloaded code, but users still have to use **Open Anyway** in Privacy & Security. It's OK for two or three technical friends, and not for anything you'd call a release.
@@ -291,7 +291,7 @@ Treat these secrets as production credentials:
 
 **After the workflow finishes:**
 1. Download each artifact **in a browser** onto a clean machine or user account. That's how the quarantine attribute and Mark-of-the-Web get set, which is the only realistic Gatekeeper/SmartScreen test.
-2. Run TEST_PLAN §3 (smoke) on macOS and Windows, plus INS-01/02 and CON-09.
+2. Run the smoke section of the manual test plan on macOS and Windows, plus its install and first-connection cases.
 3. Write the release notes:
    - what's new;
    - known issues (P1 failures from the test plan);
@@ -315,7 +315,7 @@ Treat these secrets as production credentials:
 - **Monaco, fonts, icons:** Monaco is MIT. Inter and JetBrains Mono are OFL; include their licence text if you bundle the font files. Lucide is ISC.
 - **Data and privacy statement for testers** (two sentences in the release notes): VibeLens sends no telemetry. In Assist/Agent modes it sends prompts and permitted schema/results to the AI provider *the user configures*, nothing otherwise.
 - **Export control:** standard TLS/SSH crypto in a mass-market app. Nothing to file for normal distribution, but don't ship to sanctioned destinations.
-- **Trademarks:** "PostgreSQL", "Valkey", "Redis", "Apache Iceberg", "AWS" are used descriptively. Don't use their logos in your icon or marketing (LOGO_SPEC §6).
+- **Trademarks:** "PostgreSQL", "Valkey", "Redis", "Apache Iceberg", "AWS" are used descriptively. Don't use their logos in your icon or marketing.
 
 ---
 
@@ -324,7 +324,7 @@ Treat these secrets as production credentials:
 ```text
 ☐ Version bumped in 4 files, CHANGELOG updated, tag pushed
 ☐ CI green on the release commit (ci.yml)
-☐ TEST_PLAN: P0 all pass, P1 failures listed in notes, results sheet attached
+☐ Manual test plan: P0 all pass, P1 failures listed in notes, results sheet attached
 ☐ release.yml draft created; artifacts: dmg, setup.exe, msi, AppImage, deb, rpm (+ .sig, latest.json once updater is on)
 ☐ macOS: spctl accepted (app + dmg), stapler validate OK, tested from a browser download
 ☐ Windows: Get-AuthenticodeSignature Valid (or unsigned → instructions in notes), installed + uninstalled cleanly

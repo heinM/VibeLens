@@ -318,7 +318,7 @@ npm run tauri dev
 npm run tauri build              # → src-tauri/../target/release/bundle/{dmg,macos,msi,nsis}
 ```
 Or build a release on a Mac without GitHub Actions: `scripts/release-local.sh` builds the universal macOS app (signed and notarised when the Apple variables of [docs/RELEASING.md](docs/RELEASING.md) are set), with `--linux` also the `.deb` and `.AppImage` in a container, and uploads them to a draft GitHub release (`--no-upload` builds only). Windows installers need a Windows machine or runner.
-Unsigned by default. Signing, notarisation, Windows certificates (and what they cost from South Africa), auto-update and the tag-triggered release workflow (`.github/workflows/release.yml`) are covered in **[docs/RELEASING.md](docs/RELEASING.md)**. What to test before sharing a build: **[docs/TEST_PLAN.md](docs/TEST_PLAN.md)**. Logo and app-icon brief: **[docs/LOGO_SPEC.md](docs/LOGO_SPEC.md)**.
+Unsigned by default. Signing, notarisation, Windows certificates (and what they cost from South Africa), auto-update and the tag-triggered release workflow (`.github/workflows/release.yml`) are covered in **[docs/RELEASING.md](docs/RELEASING.md)**.
 
 ---
 
@@ -424,7 +424,7 @@ Override the workspace with `VIBELENS_WORKSPACE=/path`.
 ```text
 .
 ├── .github/workflows/          ← CI and multi-platform releases
-├── docs/                       ← architecture, release and test plans
+├── docs/                       ← architecture and release documentation
 └── VibeLens/                   ← desktop application
     ├── Cargo.toml              ← Rust workspace
     ├── crates/vibelens-core/   ← engine logic (no Tauri dependency)
