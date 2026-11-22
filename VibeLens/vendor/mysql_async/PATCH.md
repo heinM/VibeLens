@@ -31,9 +31,45 @@ MySQL connections and changes the following, each marked `VibeLens patch` in the
      may take at most `MAX_COLUMN_DEFS_BYTES` (16 MiB; each is one packet of up to
      `max_allowed_packet`, so 4096 of them could otherwise reach hundreds of GiB). The now
      unused `Conn::read_packets` is removed.
-   Other `unwrap`/`expect`/`unreachable!` sites in the handshake, auth and result-header paths
-   were reviewed: they are behind conditions the driver itself sets (TLS options present,
-   prepared-statement metadata, settings queries VibeLens does not issue) or in tests.
+6. Third review, the whole class (server bytes reaching a panic):
+   - Fixed: `src/queryable/mod.rs`, `is_last_result_set_packet` indexed `packet[0]` (twice) and
+     panicked on a zero-length row packet; it uses `packet.first()`.
+   - Guarded before a `mysql_common` call: `src/conn/mod.rs`, `handle_handshake` refuses a
+     handshake whose auth-plugin-data length has the high bit set, because `HandshakePacket`
+     computes `len as i8 - 8`, which overflows (a panic where overflow checks are on) for
+     0x80..=0x87. Real servers send 21.
+   - Swept and shown unreachable from server bytes, for the paths VibeLens uses (connect,
+     handshake, TLS upgrade, every auth plugin and switch, COM_QUERY text protocol, result-set
+     header, column definitions, rows, OK/ERR/EOF, multi-result sets, COM_PING,
+     COM_RESET_CONNECTION, COM_QUIT, drop and cleanup):
+     - driver state invariants, not data: `io/mod.rs` `Endpoint`/stream/codec `unwrap` and
+       `unreachable!` (11), `io/write_packet.rs` codec `expect` (3), `io/tls/rustls_io.rs`
+       (3), `conn/mod.rs` `take_stream` (stream present after a successful write),
+       `use_pending_result` (`Err` handled first), `ssl_opts_and_connector().expect`
+       (`CLIENT_SSL` is requested only with TLS options), `drop_result`'s `unreachable!`
+       (`set_pending_result(None)?` returns early on a stored error);
+     - guarded by a check on the same line: `continue_parsec_auth` `&packet[1..]` (after
+       `first() == 0x01`), `caching_sha2` `packet.get(1)`;
+     - code paths VibeLens does not take: `read_settings` `row.unwrap()` (both settings are
+       preset in the options, `prefer_socket` is off), `drop_result`'s `Arc::try_unwrap`
+       (`Taken` results exist only through the stream API), `helpers.rs` `stmt.unwrap()`
+       (metadata skipping is binary protocol only), the `query_first`/`exec_first` family's
+       `expect` (`query.rs`, `queryable/mod.rs`, not called);
+     - `mysql_common`, on server bytes: the packet codec bounds each read by
+       `max_allowed_packet` (64 MiB, set by VibeLens) before reserving; `read_lenenc_int`'s
+       `unreachable!` is exhaustive; `read_varlen_uint` and text `Value` parsing check for an
+       empty buffer before `[0]`; OK/ERR/column/row parsers return errors through `ParseBuf`;
+       `scramble_native`/`scramble_sha256` take any nonce; `Seq` pre-allocation from a length
+       is used only by GTID, bulk-execute and binlog parsers (not reached); `Row::unwrap`,
+       indexing and `get` panics are avoided (VibeLens uses `unwrap_raw`); `ErrPacket`'s
+       panicking accessors are not called; the old-password and parsec scramble `unwrap`s and
+       the ed25519 panic sit behind plugins refused in (5) and by `secure_auth`; the version
+       regex `unwrap`s run only after a match whose digits fit `u16`.
+   Release builds have no overflow checks; the handshake length is the only server-controlled
+   arithmetic found that overflows, and it is guarded. `tests/mysql_hostile.rs`
+   (`fuzz::a_corrupting_server_never_panics_or_hangs_the_engine`) drives a seeded corrupting
+   server through every stage; it found the handshake overflow, and it finds the
+   `is_last_result_set_packet` panic within ~100 iterations when that fix is reverted.
 
 VibeLens adds its own checks on top (TLS required for passwords to other machines, the
 cleartext plugin enabled only for RDS IAM tokens over verified TLS); see

@@ -508,6 +508,22 @@ impl Conn {
 
     async fn handle_handshake(&mut self) -> Result<()> {
         let packet = self.read_packet().await?;
+        // VibeLens patch: mysql_common computes `auth_plugin_data_len as i8 - 8`, which overflows
+        // (a panic in builds with overflow checks) for 0x80..=0x87. Real servers send 21; a
+        // value with the high bit set is refused before the parse.
+        let after_version = packet
+            .iter()
+            .skip(1)
+            .position(|&b| b == 0)
+            .map(|nul| 1 + nul + 1);
+        if let Some(at) = after_version.map(|v| v + 20) {
+            if packet.get(at).is_some_and(|&b| b >= 0x80) {
+                return Err(DriverError::UnexpectedPacket {
+                    payload: Vec::new(),
+                }
+                .into());
+            }
+        }
         let handshake = ParseBuf(&packet).parse::<HandshakePacket>(())?;
 
         // Handshake scramble is always 21 bytes length (20 + zero terminator)

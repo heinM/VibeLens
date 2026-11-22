@@ -43,10 +43,12 @@ pub trait Protocol: fmt::Debug + Send + Sync + 'static {
     fn result_set_meta(columns: Arc<[Column]>) -> ResultSetMeta;
     fn read_result_set_row(packet: &[u8], columns: Arc<[Column]>) -> Result<Row>;
     fn is_last_result_set_packet(capabilities: CapabilityFlags, packet: &[u8]) -> bool {
+        // VibeLens patch: `first()`, not `[0]`: a zero-length packet from the server must not
+        // panic (release builds abort on a panic).
         if capabilities.contains(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
-            packet[0] == 0xFE && packet.len() < MAX_PAYLOAD_LEN
+            packet.first() == Some(&0xFE) && packet.len() < MAX_PAYLOAD_LEN
         } else {
-            packet[0] == 0xFE && packet.len() < 8
+            packet.first() == Some(&0xFE) && packet.len() < 8
         }
     }
     fn metadata_skip_possible(conn: &Conn) -> bool;
