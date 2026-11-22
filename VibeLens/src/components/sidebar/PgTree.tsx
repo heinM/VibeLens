@@ -10,6 +10,7 @@ import { useUIStore } from "../../store/useUIStore";
 import { pgQueries } from "../../hooks/usePg";
 import { useTabActions, quoteIdent } from "../../hooks/useTabActions";
 import { ErrorBox } from "../ui";
+import { TreeSsoReauth } from "../connections/SsoReauth";
 import { useMenu, type MenuEntry } from "../ui/Menu";
 import { copyToClipboard } from "../ui/clipboard";
 import { cn } from "../../lib/cn";
@@ -297,8 +298,9 @@ export function PgTree({ profile, showSystem }: { profile: ConnectionProfile; sh
 
   if (dbsQ.isError) {
     return (
-      <div className="p-2">
+      <div className="space-y-2 p-2">
         <ErrorBox error={asError(dbsQ.error)} />
+        <TreeSsoReauth profile={profile} error={asError(dbsQ.error)} reload={() => void dbsQ.refetch()} />
       </div>
     );
   }

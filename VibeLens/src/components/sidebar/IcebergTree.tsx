@@ -9,6 +9,7 @@ import type { ConnectionProfile, IcebergField, IcebergNamespace } from "../../ip
 import { useUIStore } from "../../store/useUIStore";
 import { useWorkspaceStore } from "../../store/useWorkspaceStore";
 import { ErrorBox } from "../ui";
+import { TreeSsoReauth } from "../connections/SsoReauth";
 import { useMenu, type MenuEntry } from "../ui/Menu";
 import { copyToClipboard } from "../ui/clipboard";
 import { cn } from "../../lib/cn";
@@ -272,6 +273,7 @@ export function IcebergTree({ profile }: { profile: ConnectionProfile }) {
     return (
       <div className="space-y-2 p-2">
         <ErrorBox error={asError(topQ.error)} />
+        <TreeSsoReauth profile={profile} error={asError(topQ.error)} reload={() => void topQ.refetch()} />
         <button type="button" onClick={() => void topQ.refetch()} className="inline-flex h-7 items-center gap-1.5 rounded-md border border-border bg-panel-2 px-2.5 text-xs font-medium hover:border-muted/60">
           <RefreshCw className="size-3.5" /> Try again
         </button>

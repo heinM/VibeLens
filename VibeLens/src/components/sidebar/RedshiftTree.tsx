@@ -11,6 +11,7 @@ import { useUIStore } from "../../store/useUIStore";
 import { rsQueries } from "../../hooks/useRedshift";
 import { useTabActions } from "../../hooks/useTabActions";
 import { ErrorBox } from "../ui";
+import { TreeSsoReauth } from "../connections/SsoReauth";
 import { useMenu, type MenuEntry } from "../ui/Menu";
 import { copyToClipboard } from "../ui/clipboard";
 import { cn } from "../../lib/cn";
@@ -187,6 +188,7 @@ export function RedshiftTree({ profile, showSystem }: { profile: ConnectionProfi
     return (
       <div className="space-y-2 p-2">
         <ErrorBox error={asError(schemasQ.error)} />
+        <TreeSsoReauth profile={profile} error={asError(schemasQ.error)} reload={() => void schemasQ.refetch()} />
         <button type="button" onClick={() => void schemasQ.refetch()} className="inline-flex h-7 items-center gap-1.5 rounded-md border border-border bg-panel-2 px-2.5 text-xs font-medium hover:border-muted/60">
           <RefreshCw className="size-3.5" /> Try again
         </button>

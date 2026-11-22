@@ -9,6 +9,8 @@ import { useConnect, useConnectionStatus } from "../../hooks/useConnectionStatus
 import { useProfile } from "../../hooks/useProfiles";
 import { Button, EmptyState, ErrorBox, IconButton, Spinner } from "../ui";
 import { cn } from "../../lib/cn";
+import { isSsoExpired } from "../../lib/ssoReauth";
+import { SsoReauth } from "../connections/SsoReauth";
 import { IcebergTree } from "./IcebergTree";
 import { PgTree } from "./PgTree";
 import { RedshiftTree } from "./RedshiftTree";
@@ -52,6 +54,10 @@ export function Explorer() {
     }
   };
 
+  // An expired Identity Center session, from the last connect attempt or the status poll.
+  const connectFailure = connect.error ? asError(connect.error).message : null;
+  const ssoError = [connectFailure, state === "error" ? status?.detail : null].find((m) => isSsoExpired(m)) ?? null;
+
   let body;
   if (!profile) {
     body = (
@@ -73,7 +79,8 @@ export function Explorer() {
           </div>
         )}
         {connect.error && <ErrorBox error={asError(connect.error)} />}
-        <Button variant="primary" loading={connect.isPending} onClick={() => connect.mutate(profile.id)}>
+        <SsoReauth profile={profile} error={ssoError} onSignedIn={() => connect.mutate(profile.id)} />
+        <Button variant={ssoError ? "secondary" : "primary"} loading={connect.isPending} onClick={() => connect.mutate(profile.id)}>
           <Plug className="size-4" /> Connect
         </Button>
       </div>
