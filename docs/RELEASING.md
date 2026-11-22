@@ -26,7 +26,7 @@ Builds are **unsigned until you add the signing secrets** (§5, §6). They work,
 - Promote with fast-forwards so the three working branches never diverge: `git push origin develop:test`, then `git push origin test:release`.
 - A fix found on `test` or `release` is made on `develop` and promoted again. An urgent production fix branches from `main`, goes back through a pull request into `main` (CI runs), and is then merged into `develop`.
 - The release workflow is started by hand on a tag (§9); it never runs on a push.
-- Branch protection needs GitHub Pro or a public repository. Until then, "no direct commits to `main`" is a convention, not an enforced rule.
+- Repository rulesets enforce this: `main` only changes through a pull request merged with a merge commit after CI passes; none of the four branches can be deleted or force-pushed; `v*` tags cannot be moved or deleted. Do not turn on "Automatically delete head branches": the head of a release pull request is `release`.
 
 ---
 
