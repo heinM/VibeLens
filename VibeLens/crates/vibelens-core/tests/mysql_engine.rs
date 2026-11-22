@@ -8,7 +8,7 @@
 //!
 //! The user must be able to create databases and users (root of a throwaway container). The
 //! verified-TLS tests also need `VG_TEST_MYSQL_CA`: a CA file that signed the server's
-//! certificate for `127.0.0.1` (see `docs/TEST_PLAN.md`, MY-T1).
+//! certificate for `127.0.0.1`.
 
 mod services;
 

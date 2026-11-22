@@ -234,7 +234,7 @@ provisioned only) or `secret` (a Secrets Manager ARN the Data API reads server-s
   * no scan statistics;
   * Lake Formation is not applied, because the engine reads S3 with the user's own credentials.
 * **Trino and Spark (Livy)** are tested against in-process mocks only (`tests/remote_*`). Livy cuts SQL results at `livy.rsc.sql.num-rows` (1000) without saying so; a result of exactly 1000 rows is reported as truncated. Livy returns decimals as JSON numbers, so a decimal with more digits than a double holds loses precision before VibeLens sees it. A Spark connection is not probed by "Test connection" (that would start a session); its first query reports problems.
-* **Athena** is tested against a mock endpoint only. The header-row and `UpdateCount` handling rest on the documented API shape until test plan ICE-60 to ICE-65 runs on a real account.
+* **Athena** is tested against a mock endpoint only. The header-row and `UpdateCount` handling rest on the documented API shape until the manual Athena test cases run on a real account.
 * **Redshift** is tested against a mock Data API only (RS-01 to RS-10 are manual). Results are limited to 100 MB per statement by the Data API, and there are no multi-statement transactions.
 * **Windows** compiles in CI but hasn't had a manual test pass.
 

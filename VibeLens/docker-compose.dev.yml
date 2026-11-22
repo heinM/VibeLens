@@ -27,8 +27,7 @@ services:
   # VibeLens connection: MySQL, host 127.0.0.1, port 53306, database shop, user vibelens /
   # vibelens (or vibelens_ro / vibelens, SELECT only, for agent use). TLS "Require": the image
   # generates a self-signed certificate, and caching_sha2_password sends the password only over
-  # TLS, so "Disable" fails the first login. Verify full needs a certificate for 127.0.0.1
-  # (docs/TEST_PLAN.md, MY-T1).
+  # TLS, so "Disable" fails the first login. Verify full needs a certificate for 127.0.0.1.
   mysql:
     image: mysql:8.4
     environment:
