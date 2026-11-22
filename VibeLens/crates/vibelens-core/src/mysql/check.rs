@@ -936,8 +936,13 @@ fn mentions_server_variable(stmt: &str, toks: &[Tok]) -> bool {
 
 /// The class and a short label of one statement.
 fn classify_statement(stmt: &str) -> (StatementClass, String) {
-    let Ok(toks) = lex(stmt, true) else {
-        return (StatementClass::Unknown, "unreadable statement".into());
+    // Both readings (with and without backslash escapes) must agree, as on the agent's path:
+    // under NO_BACKSLASH_ESCAPES `SET @a='\', @@global.x=1 -- '` sets a global.
+    let Ok(toks) = lex_unambiguous(stmt) else {
+        return (
+            StatementClass::Unknown,
+            "statement that reads differently under NO_BACKSLASH_ESCAPES".into(),
+        );
     };
     // What an executable comment holds runs but is not part of the words below
     // (`SET /*!PASSWORD = 'x'*/`): nothing is known about such a statement.
@@ -981,6 +986,17 @@ fn classify_statement(stmt: &str) -> (StatementClass, String) {
         "TRUNCATE" | "RENAME" | "GRANT" | "REVOKE" | "ANALYZE" | "OPTIMIZE" | "REPAIR"
         | "CHECK" | "CHECKSUM" | "FLUSH" | "INSTALL" | "UNINSTALL" | "PURGE" | "RESET"
         | "CHANGE" | "CACHE" => (StatementClass::Ddl, first),
+        // `SET @a = f()` or `SET @a = (SELECT f())` runs whatever the function does.
+        "SET"
+            if toks
+                .iter()
+                .any(|t| t.kind == Kind::Punct && text(stmt, t) == "(") =>
+        {
+            (
+                StatementClass::Unknown,
+                "SET with a function call or subquery".into(),
+            )
+        }
         // MariaDB `SET STATEMENT x=1 FOR <any statement>`.
         "SET" if w.get(1).map(String::as_str) == Some("STATEMENT") => {
             (StatementClass::Unknown, "SET STATEMENT … FOR".into())
@@ -1101,7 +1117,16 @@ pub fn agent_refusal(sql: &str) -> Option<String> {
             Some("SELECT … INTO OUTFILE/DUMPFILE writes a file on the database server")
         } else if first == "LOAD" {
             Some("LOAD DATA and LOAD XML read files on the database server or on this machine")
-        } else if has("PREPARE") || matches!(first, "EXECUTE" | "DEALLOCATE") {
+        } else if first == "SET" && words.get(1).map(String::as_str) == Some("STATEMENT") {
+            Some(
+                "MariaDB's SET STATEMENT … FOR runs any statement after FOR with changed settings; \
+                 send the statement itself",
+            )
+        } else if has("PREPARE")
+            || has("IMMEDIATE")
+            || (routine && has("EXECUTE"))
+            || matches!(first, "EXECUTE" | "DEALLOCATE")
+        {
             Some(
                 "PREPARE and EXECUTE run SQL built from a string or a variable, so the statement \
                  shown for approval is not the one that runs; send the statement itself",
@@ -1439,6 +1464,11 @@ mod tests {
                 StatementClass::Session,
             ),
             ("UNLOCK TABLES", StatementClass::Session),
+            // Third review, item F.
+            ("SET @a = f_that_writes()", StatementClass::Unknown),
+            ("SET @a = (SELECT f())", StatementClass::Unknown),
+            ("SET @a='\\', @@global.x=1 -- '", StatementClass::Unknown),
+            ("SET @a = 1, @b = 'x'", StatementClass::Session),
             // Re-audit item 4.
             ("SET @@global . max_connections = 1", StatementClass::Ddl),
             ("SET @@global/**/.max_connections = 1", StatementClass::Ddl),
@@ -1491,6 +1521,30 @@ mod tests {
             ("USE other", "USE"),
             ("SELECT 1 /*!50000 , 2 */", "executable comment"),
             ("DELIMITER $$", "DELIMITER"),
+            // Third review, item C (MariaDB).
+            (
+                "CREATE PROCEDURE p() BEGIN EXECUTE IMMEDIATE @q; END; CALL p()",
+                "PREPARE",
+            ),
+            ("CREATE PROCEDURE p() BEGIN EXECUTE s; END", "PREPARE"),
+            ("EXECUTE IMMEDIATE 'SELECT 1'", "PREPARE"),
+            (
+                "SET STATEMENT max_statement_time=0 FOR KILL 5",
+                "SET STATEMENT",
+            ),
+            (
+                "SET STATEMENT max_statement_time=0 FOR SHUTDOWN",
+                "SET STATEMENT",
+            ),
+            (
+                "SET STATEMENT x=1 FOR LOAD DATA INFILE '/etc/passwd' INTO TABLE t",
+                "SET STATEMENT",
+            ),
+            (
+                "SET STATEMENT x=1 FOR EXECUTE IMMEDIATE @q",
+                "SET STATEMENT",
+            ),
+            ("SET STATEMENT x=1 FOR USE mysql", "SET STATEMENT"),
             // Re-audit item 2: inside a routine body.
             (
                 "CREATE PROCEDURE p() BEGIN SET @q = 0x53454c454354; PREPARE s FROM @q; EXECUTE s; END; CALL p()",

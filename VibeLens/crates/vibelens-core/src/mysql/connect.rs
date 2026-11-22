@@ -54,46 +54,76 @@ const SERVER_UUID_SQL: &str = "SELECT @@server_uuid";
 /// Fallback where `@@server_uuid` does not exist (MariaDB, some proxies).
 const SERVER_HOST_SQL: &str = "SELECT @@hostname, @@port, @@server_id";
 
+/// The connection can no longer be trusted: a reply timed out or the conversation broke, so
+/// the next reply read on it may belong to an earlier request. It must be closed.
+#[derive(Debug)]
+pub(super) struct Broken;
+
 /// The first row of `sql` as text, read without any typed conversion: the driver's typed row
 /// conversions panic on a row of the wrong shape, and a release build aborts on a panic. Every
-/// value is lossy UTF-8; NULL is `None`. `None` for an error, no row, or a timeout.
-pub(super) async fn first_row_text(conn: &mut Conn, sql: &str) -> Option<Vec<Option<String>>> {
+/// value is lossy UTF-8; NULL is `None`.
+///
+/// `Ok(None)`: the server answered with an error or no row; the connection is in step.
+/// `Err(Broken)`: a timeout (the driver future was dropped mid-reply), an I/O or protocol
+/// error; the caller must not send anything else on the connection.
+pub(super) async fn first_row_text(
+    conn: &mut Conn,
+    sql: &str,
+) -> std::result::Result<Option<Vec<Option<String>>>, Broken> {
+    let broken = |e: &mysql_async::Error| !matches!(e, mysql_async::Error::Server(_));
     let read = async {
-        let mut result = conn.query_iter(sql).await.ok()?;
-        let row = result.next().await.ok()??;
-        let values: Vec<Option<String>> = row
-            .unwrap_raw()
-            .into_iter()
-            .map(|v| match v {
-                Some(mysql_async::Value::Bytes(b)) => Some(super::exec::catalog_text(&b)),
-                Some(mysql_async::Value::NULL) | None => None,
-                Some(other) => Some(other.as_sql(false)),
-            })
-            .collect();
-        result.drop_result().await.ok()?;
-        Some(values)
+        let mut result = match conn.query_iter(sql).await {
+            Ok(r) => r,
+            Err(e) if broken(&e) => return Err(Broken),
+            Err(_) => return Ok(None),
+        };
+        let row = match result.next().await {
+            Ok(r) => r,
+            Err(e) if broken(&e) => return Err(Broken),
+            Err(_) => return Ok(None),
+        };
+        let values = row.map(|row| {
+            row.unwrap_raw()
+                .into_iter()
+                .map(|v| match v {
+                    Some(mysql_async::Value::Bytes(b)) => Some(super::exec::catalog_text(&b)),
+                    Some(mysql_async::Value::NULL) | None => None,
+                    Some(other) => Some(other.as_sql(false)),
+                })
+                .collect::<Vec<_>>()
+        });
+        match result.drop_result().await {
+            Ok(()) => Ok(values),
+            Err(e) if broken(&e) => Err(Broken),
+            Err(_) => Ok(None),
+        }
     };
-    tokio::time::timeout(std::time::Duration::from_secs(5), read)
-        .await
-        .ok()
-        .flatten()
+    match tokio::time::timeout(std::time::Duration::from_secs(5), read).await {
+        Ok(r) => r,
+        Err(_) => Err(Broken),
+    }
 }
 
 /// This server's identity: `uuid:<@@server_uuid>`, else `host:<@@hostname>:<@@port>#<@@server_id>`,
-/// else `None` (then no `KILL QUERY` is ever sent for its sessions).
-pub(super) async fn server_id(conn: &mut Conn) -> Option<String> {
+/// else `None` (then no `KILL QUERY` is ever sent for its sessions). `Err(Broken)` when the
+/// connection fell out of step while asking; it must be closed.
+pub(super) async fn server_id(conn: &mut Conn) -> std::result::Result<Option<String>, Broken> {
     if let Some(v) = first_row_text(conn, SERVER_UUID_SQL)
-        .await
+        .await?
         .and_then(|r| r.into_iter().next().flatten())
         .filter(|v| !v.is_empty())
     {
-        return Some(format!("uuid:{v}"));
+        return Ok(Some(format!("uuid:{v}")));
     }
-    let r = first_row_text(conn, SERVER_HOST_SQL).await?;
-    let host = r.first().cloned().flatten().filter(|h| !h.is_empty())?;
+    let Some(r) = first_row_text(conn, SERVER_HOST_SQL).await? else {
+        return Ok(None);
+    };
+    let Some(host) = r.first().cloned().flatten().filter(|h| !h.is_empty()) else {
+        return Ok(None);
+    };
     let port = r.get(1).cloned().flatten().unwrap_or_default();
     let id = r.get(2).cloned().flatten().unwrap_or_default();
-    Some(format!("host:{host}:{port}#{id}"))
+    Ok(Some(format!("host:{host}:{port}#{id}")))
 }
 
 pub(super) struct MysqlManager {
@@ -108,7 +138,18 @@ impl managed::Manager for MysqlManager {
         let shared = Arc::clone(&self.shared);
         async move {
             let mut conn = shared.connect_new().await?;
-            let server = server_id(&mut conn).await;
+            let server = match server_id(&mut conn).await {
+                Ok(s) => s,
+                Err(Broken) => {
+                    // Replies on it may now be one behind: never hand it out.
+                    close_hard(conn).await;
+                    return Err(CoreError::Database(
+                        "the MySQL server did not answer the session setup in time; the \
+                         connection was closed"
+                            .into(),
+                    ));
+                }
+            };
             Ok(MyConn {
                 conn,
                 reset_done: false,
@@ -282,9 +323,16 @@ impl Shared {
         let fut = async {
             for _ in 0..3 {
                 let mut c = self.connect_new().await?;
-                if server_id(&mut c).await.as_deref() != Some(server) {
-                    let _ = c.disconnect().await;
-                    continue;
+                match server_id(&mut c).await {
+                    Ok(Some(id)) if id == server => {}
+                    Ok(_) => {
+                        let _ = c.disconnect().await;
+                        continue;
+                    }
+                    Err(Broken) => {
+                        close_hard(c).await;
+                        continue;
+                    }
                 }
                 let r = c
                     .query_drop(format!("KILL QUERY {id}"))

@@ -73,9 +73,34 @@ const AGENT_SCRIPT_DEADLINE: Duration = Duration::from_secs(150);
 const AGENT_REDSHIFT_TIMEOUT_MS: u64 = 120_000;
 /// Most MySQL database pools one profile may hold at once (one per database name).
 pub const MAX_MYSQL_POOLS_PER_PROFILE: usize = 8;
-/// Connect-lock name for counting and opening a profile's MySQL pools (database names cannot
-/// hold NUL, so it never equals one).
-const MYSQL_POOLS_LOCK: &str = "\u{0}mysql-pools";
+/// A reserved place for one MySQL pool being dialed; freed on insert, failure or drop.
+struct DialSlot<'a> {
+    manager: &'a ConnectionManager,
+    profile_id: ProfileId,
+    released: bool,
+}
+
+impl DialSlot<'_> {
+    /// Frees the slot under a state lock the caller already holds.
+    fn release(mut self, st: &mut State) {
+        if let Some(n) = st.mysql_dialing.get_mut(&self.profile_id) {
+            *n = n.saturating_sub(1);
+        }
+        self.released = true;
+    }
+}
+
+impl Drop for DialSlot<'_> {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let mut st = self.manager.lock();
+        if let Some(n) = st.mysql_dialing.get_mut(&self.profile_id) {
+            *n = n.saturating_sub(1);
+        }
+    }
+}
 /// Safety valve for `valkey_scan`: stop after this many SCAN pages even if the cursor never ends.
 const MAX_SCAN_PAGES: usize = 2_000;
 
@@ -146,6 +171,8 @@ struct State {
     transient: HashMap<ProfileId, Transient>,
     epochs: HashMap<ProfileId, u64>,
     connect_locks: HashMap<ConnectLockKey, Arc<tokio::sync::Mutex<()>>>,
+    /// MySQL pools being dialed per profile (reserved against the pool cap).
+    mysql_dialing: HashMap<ProfileId, usize>,
 }
 
 impl State {
@@ -807,24 +834,25 @@ impl ConnectionManager {
         }
 
         // Each database name gets its own pool, and the name comes from the UI or the model;
-        // `shop`, `Shop` and `sHop` would each open one. A connection holds a bounded number:
-        // count, dial and insert happen under one per-profile lock, and at the cap the least
-        // recently used idle pool is closed to make room.
-        let pools_lock = self.connect_lock((profile.id.clone(), Some(MYSQL_POOLS_LOCK.into())));
-        let _pools = pools_lock.lock().await;
-        if let Some(handle) = self.cached_mysql(&key, &signature).await {
-            return Ok(handle);
-        }
-        let evicted = {
+        // `shop`, `Shop` and `sHop` would each open one. A connection holds a bounded number.
+        // A slot is reserved under the state lock (counting open pools and dials in flight);
+        // the dial runs outside any lock, so one slow server does not hold up the others; the
+        // slot is released when the pool is inserted or the dial fails or is dropped. At the cap
+        // the least recently used pool that nobody holds (no handle outside the registry, no
+        // operation running) is closed to make room.
+        let (slot, evicted) = {
             let mut st = self.lock();
-            let open = st.mysql.keys().filter(|(id, _)| *id == profile.id).count();
-            if open < MAX_MYSQL_POOLS_PER_PROFILE {
+            let open = st.mysql.keys().filter(|(id, _)| *id == profile.id).count()
+                + st.mysql_dialing.get(&profile.id).copied().unwrap_or(0);
+            let evicted = if open < MAX_MYSQL_POOLS_PER_PROFILE {
                 None
             } else {
                 let lru = st
                     .mysql
                     .iter()
-                    .filter(|((id, _), e)| *id == profile.id && !e.handle.in_use())
+                    .filter(|((id, _), e)| {
+                        *id == profile.id && Arc::strong_count(&e.handle) == 1 && !e.handle.in_use()
+                    })
                     .max_by_key(|(_, e)| e.handle.idle_ms())
                     .map(|(k, _)| k.clone());
                 match lru {
@@ -832,12 +860,21 @@ impl ConnectionManager {
                     None => {
                         return Err(CoreError::Invalid(format!(
                             "connection \"{}\" has {MAX_MYSQL_POOLS_PER_PROFILE} databases open \
-                             and all of them are running queries; try again when one finishes",
+                             and all of them are in use; try again when one is free",
                             profile.name
                         )));
                     }
                 }
-            }
+            };
+            *st.mysql_dialing.entry(profile.id.clone()).or_insert(0) += 1;
+            (
+                DialSlot {
+                    manager: self,
+                    profile_id: profile.id.clone(),
+                    released: false,
+                },
+                evicted,
+            )
         };
         if let Some(old) = evicted {
             tracing::info!(profile_id = %profile.id, "closing the least recently used MySQL database pool");
@@ -864,6 +901,7 @@ impl ConnectionManager {
         };
         let inserted = {
             let mut st = self.lock();
+            slot.release(&mut st);
             if st.epoch(&profile.id) != epoch {
                 Err(entry)
             } else {

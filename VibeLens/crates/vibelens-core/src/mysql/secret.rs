@@ -83,17 +83,14 @@ pub async fn save_password(
         }
         Some(s) => {
             let origin = password_origin(p)?;
-            // Remove the old password, unbind, write, bind. A failure at any step leaves no
-            // password without its binding: a password without an origin would be readable by
-            // every other engine (`load_any_password` treats it as theirs).
+            // Remove the old password and binding, then write the binding first and the password
+            // second. A failure at any step leaves no password without its binding (one
+            // without an origin would be readable by every other engine); a binding without a
+            // password fails closed.
             vault.delete(&key).await?;
             vault.delete(&origin_key).await?;
-            vault.set(&key, &SecretString::from(s)).await?;
-            if let Err(e) = vault.set(&origin_key, &SecretString::from(origin)).await {
-                let _ = vault.delete(&key).await;
-                return Err(e);
-            }
-            Ok(())
+            vault.set(&origin_key, &SecretString::from(origin)).await?;
+            vault.set(&key, &SecretString::from(s)).await
         }
         None => {
             // A CA file that cannot be read is an error, not a reason to delete the password.
@@ -344,6 +341,19 @@ mod tests {
         };
         assert!(save_password(&vault, &p, Some("pw".into())).await.is_err());
         assert!(vault.get("profile:p:password").await.unwrap().is_none());
+        // Third review, item E: the password write fails after the binding was written (and
+        // no compensating delete runs): the lone binding fails closed for every engine.
+        let vault2 = FailingVault {
+            inner: MemoryVault::new(),
+            fail_set: "profile:p:password".into(),
+            fail_delete: String::new(),
+        };
+        assert!(save_password(&vault2, &p, Some("pw".into())).await.is_err());
+        assert!(vault2.get("profile:p:password").await.unwrap().is_none());
+        let mut other = p.clone();
+        other.engine = EngineKind::Postgres;
+        assert!(load_any_password(&vault2, &other).await.is_err());
+        assert!(load_any_password(&vault2, &p).await.unwrap().is_none());
         let mut pg = p.clone();
         pg.engine = EngineKind::Postgres;
         assert!(load_any_password(&vault, &pg).await.unwrap().is_none());
