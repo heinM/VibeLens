@@ -1,15 +1,9 @@
 # Advisories cargo-audit cannot clear yet. Each entry says why; revisit by 2027-02-01.
 [advisories]
 ignore = [
-    # quick-xml 0.39 DoS: only parses S3 ListObjects replies from endpoints the user configured.
-    # Needs opendal >= 0.59, which needs a newer iceberg. Remove with iceberg 0.11.
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
-    # rsa Marvin timing attack: no patched release. Pinned by russh; prefer ed25519 SSH keys.
+    # rsa Marvin timing attack: fixed in rsa 0.10.0, which russh now uses. rsa 0.9.10 is still in
+    # Cargo.lock for sqlx-mysql, an optional sqlx driver that is locked but never built (no
+    # `mysql` feature; `cargo tree -i rsa@0.9.10 --target all` is empty). Remove once sqlx stops
+    # locking rsa 0.9.
     "RUSTSEC-2023-0071",
-    # zstd 0.13.4 / zstd-safe 7.4.0 carry the backported fixes, but the advisories only list
-    # >= 0.14.3 / >= 8.2.0 as patched. Remove once advisory-db catches up.
-    "RUSTSEC-2026-0391",
-    "RUSTSEC-2026-0398",
-    "RUSTSEC-2026-0403",
 ]
