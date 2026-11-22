@@ -408,8 +408,8 @@ upstream copy is its own commit; the patch is the next one and is listed in
 5. (Audit 2026-11-22) A server cannot abort the process (release builds use `panic = "abort"`):
    an auth switch to MariaDB's `client_ed25519` or `parsec` is refused as an unknown plugin
    (both reached a `panic`/`unwrap`), a second switch is an error instead of `unreachable!`,
-   and a result header announcing more than 4096 columns is refused before anything is
-   allocated for it.
+   and a result header announcing more than 4096 columns, or column definitions totalling more
+   than 16 MiB, is refused before anything is allocated for it.
 
 ### 6.2 Design
 
@@ -419,7 +419,9 @@ upstream copy is its own commit; the patch is the next one and is listed in
   `idleDisconnectSecs` and `maxPoolSize` (1–32). Rules in `mysql/validate.rs`, run on save and on
   every connect and test (`cleartext::check_profile`).
 - **Connect.** One `deadpool` pool per (profile, database), at most 8 databases per connection
-  at once (a name differing only in case opens another pool, so the number is capped); `create()` resolves credentials per
+  at once (a name differing only in case opens another pool, so the number is capped; counting,
+  dialing and inserting happen under one per-profile lock, and at the cap the least recently
+  used idle pool is closed); `create()` resolves credentials per
   physical connection (a fresh RDS IAM token each time, signed for the real host and port).
   The SSH tunnel and its pinned host key are the Postgres ones; the driver dials the tunnel's
   local port and verifies TLS against the profile's host. Driver options: `prefer_socket(false)`
@@ -462,7 +464,10 @@ upstream copy is its own commit; the patch is the next one and is listed in
   Postgres or Valkey, or a `test_connection` with the same id and another engine, gets an
   authentication error. A hand-edited `profiles.json` or a direct `test_connection` cannot send it
   elsewhere; saving a profile that points elsewhere without a new password deletes it, and saving
-  it as another engine deletes password and binding together. RDS IAM tokens are minted per connection and never stored. Errors
+  it as another engine deletes password and binding together. Writes go: delete password, delete
+  binding, write password, write binding (and delete the password again if that write fails);
+  deleting a profile removes the password before the binding and stops if it cannot. An
+  unreadable CA file is an error on save, not a reason to drop the password. RDS IAM tokens are minted per connection and never stored. Errors
   carry no password (`map_error` never formats options).
 - **R2 (no secret in cleartext to another machine).** Stricter than Postgres: a password to any
   host other than `localhost`, `127.0.0.0/8` or `::1`, or through any SSH tunnel, needs
@@ -501,21 +506,29 @@ upstream copy is its own commit; the patch is the next one and is listed in
   from the profile. Refused at every access level, even with approval
   (`mysql::agent_refusal`): `INTO OUTFILE/DUMPFILE`, `LOAD DATA/XML`, `LOAD_FILE()`,
   `SET GLOBAL/PERSIST`, `KILL`, `SHUTDOWN`, `RESTART`, `CLONE`, `INSTALL/UNINSTALL`, anything
-  with `SONAME`, `USE`, `DELIMITER`, `PREPARE`/`EXECUTE`/`DEALLOCATE` (dynamic SQL), executable
+  with `SONAME`, `USE`, `DELIMITER`, `PREPARE` anywhere in a statement and
+  `EXECUTE`/`DEALLOCATE` (dynamic SQL), inside a `CREATE PROCEDURE/FUNCTION/TRIGGER/EVENT` body
+  also `SET GLOBAL`/`PERSIST`, `KILL`, `SHUTDOWN`, `RESTART`, `CLONE` and `INSTALL`/`UNINSTALL`
+  (checked as if the body ran now), executable
   comments (the card would not read as what runs), `LOAD_FILE` however its name is quoted, and
   any statement that does not lex, or lexes differently with and without backslash escapes.
   Statements that change the server or other sessions are never "session-only": `SET PASSWORD`,
   `SET DEFAULT ROLE`, `SET ROLE`, `SET RESOURCE GROUP` and every `START` other than
-  `START TRANSACTION` are DDL; `LOCK` and `XA` are writes; so the production guard and the card
-  treat them as changes. Database errors under a withholding policy collapse to `SQLSTATE` + a fixed sentence
+  `START TRANSACTION` are DDL; `LOCK` and `XA` are writes; `@@global`/`@@persist` count with or
+  without spacing before the dot (`SET @@global . x = 1` is accepted by MySQL 8.4); a statement
+  with an executable comment and MariaDB's `SET STATEMENT … FOR` are Unknown; so the production
+  guard and the card treat them as changes. Database errors under a withholding policy collapse to `SQLSTATE` + a fixed sentence
   (the message carries `SQLSTATE xxxxx`).
 - **R8 (cancel and timeout stop the server).** Cancel, a timeout, a dropped run (agent tool
   timeout, aborted task) and a closed result channel send `KILL QUERY <id>` from a separate,
   freshly authenticated connection, then close the connection. The kill is sent only when that
-  connection reports the same `@@server_uuid` as the session it targets (recorded when the
+  connection reports the same server identity as the session it targets (recorded when the
   session opened; up to three tries), so behind a reader endpoint or proxy it cannot reach
-  another instance's session with the same id; when the server cannot be identified no kill is
-  sent and the connection is only closed. The per-statement timeout is
+  another instance's session with the same id. The identity is `@@server_uuid`, else (MariaDB,
+  some proxies) `@@hostname`, `@@port` and `@@server_id`; both are read as raw text, never with
+  a typed row conversion (those panic on a reply of the wrong shape). When neither is available
+  no kill is sent: the connection is only closed, and the statement may run on until the server
+  notices the closed socket or `max_execution_time` stops it (SELECT only). The per-statement timeout is
   enforced on the client for every statement and by `max_execution_time` on the server for
   `SELECT`s. Agent SQL keeps the 30 s statement and 150 s script budgets.
 - **R9 (validation in Rust; enums refused, not defaulted).** All rules above are in Rust;
@@ -537,7 +550,9 @@ upstream copy is its own commit; the patch is the next one and is listed in
 | A server aborts the client (ed25519 / parsec switch, repeated switch, huge column count) | Patch 5 | `mysql_hostile::ed25519_and_parsec_switches_are_refused_not_panics`, `::a_second_auth_switch_is_an_error`, `::a_huge_column_count_is_refused_before_allocating` |
 | A bound password read through another engine | Origin includes the engine; `load_any_password`; `unbind_if_not_mysql` | `mysql::secret::tests::switching_the_engine_does_not_release_a_bound_password`, `aws_service::app_credential_source_binds_a_mysql_password_to_its_endpoint` |
 | `ANSI_QUOTES` calls (`"SLEEP"(1)`) | Double-quoted name before `(` is a call; sessions are reset or closed | `check::tests::hostile_reads_are_refused`, live `mysql_engine::ansi_quotes_calls_are_refused_in_read_only_runs` |
-| A kill reaching another instance | `@@server_uuid` match | `mysql_hostile::kill_query_is_sent_only_to_the_same_server` |
+| A kill reaching another instance; identity replies of the wrong shape | Identity match (`@@server_uuid`, else host/port/server_id), raw-row reads | `mysql_hostile::kill_query_is_sent_only_to_the_same_server` (same, moving, two-column, non-UTF-8 and missing replies) |
+| Routine bodies hiding dynamic SQL or administration | `agent_refusal` scans the whole statement | `check::tests::agent_refusals` |
+| Oversized column definitions | Patch 5 (16 MiB total) | `mysql_hostile::fat_column_definitions_are_refused` |
 | Unbounded catalog text, oversized table cap, many pools | Value and byte caps, clamp, 8 pools | `mysql_hostile::catalog_listings_are_bounded_per_value_and_in_total`, `::an_oversized_table_cap_does_not_overflow`, `::database_pools_per_connection_are_capped` |
 
 Removing patch 1, 3 or 4 makes the corresponding `mysql_hostile` tests fail (checked by reverting
