@@ -70,7 +70,7 @@ export interface Runnable {
 }
 
 /** The text a ⌘Enter should run: the selection, else the statement under the cursor. */
-export function runnableAtCursor(editor: CodeEditor): Runnable | null {
+export function runnableAtCursor(editor: CodeEditor, dialect?: SqlDialect | null): Runnable | null {
   const model = editor.getModel();
   const sel = editor.getSelection();
   if (!model || !sel) return null;
@@ -81,7 +81,7 @@ export function runnableAtCursor(editor: CodeEditor): Runnable | null {
   }
   const pos = editor.getPosition();
   if (!pos) return null;
-  const stmt = statementAtOffset(model.getValue(), model.getOffsetAt(pos));
+  const stmt = statementAtOffset(model.getValue(), model.getOffsetAt(pos), { mysql: dialect === "mysql" });
   return stmt ? { sql: stmt.text, kind: "statement", start: stmt.start, end: stmt.end } : null;
 }
 
@@ -206,12 +206,13 @@ export function SqlEditor({ value, onChange, onSelectionChange, handlers, editor
       if (!model || !pos) return;
       const text = model.getValue();
       // Only worth marking when the script has more than one statement.
-      const stmts = splitStatements(text);
+      const split = { mysql: targetRef.current.dialect === "mysql" };
+      const stmts = splitStatements(text, split);
       if (stmts.length < 2) {
         decoRef.current?.set([]);
         return;
       }
-      const stmt = statementAtOffset(text, model.getOffsetAt(pos));
+      const stmt = statementAtOffset(text, model.getOffsetAt(pos), split);
       if (!stmt) return decoRef.current?.set([]);
       const a = model.getPositionAt(stmt.start);
       const b = model.getPositionAt(stmt.end);

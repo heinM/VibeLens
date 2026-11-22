@@ -12,7 +12,8 @@ export function asError(e: unknown): T.ErrorPayload {
 export const api = {
   // app
   appInfo: () => invoke<T.AppInfo>("app_info"),
-  sqlClassify: (sql: string) => invoke<T.SqlClassification>("sql_classify", { sql }),
+  /** `engine` "mysql" classifies with MySQL's own lexer and rules; anything else uses PostgreSQL's. */
+  sqlClassify: (sql: string, engine?: T.EngineKind) => invoke<T.SqlClassification>("sql_classify", { sql, engine: engine ?? null }),
   /** Number of tabs with unsaved changes; Rust guards window close / quit while it is > 0. */
   appSetUnsaved: (count: number) => invoke<void>("app_set_unsaved", { count }),
 
@@ -165,6 +166,29 @@ export const api = {
     ch.onmessage = args.onEvent;
     const options: T.ExecOptions = { readOnly: false, maxRows: 100_000, pageSize: 500, timeoutMs: null, ...args.options };
     return invoke<string>("rs_execute", { profileId: args.profileId, sql: args.sql, database: args.database, options, confirmed: args.confirmed ?? false, onEvent: ch });
+  },
+
+  // mysql. Objects carry `schema` = their database.
+  myListDatabases: (profileId: string) => invoke<string[]>("my_list_databases", { profileId }),
+  myListObjects: (profileId: string, database: string) => invoke<T.SchemaObject[]>("my_list_objects", { profileId, database }),
+  myDescribeTable: (profileId: string, database: string, table: string) =>
+    invoke<T.TableDescription>("my_describe_table", { profileId, database, table }),
+  /** `database` null = the profile's database. */
+  mySchemaMetadata: (profileId: string, database: string | null, maxTables?: number) =>
+    invoke<T.SchemaMetadata>("my_schema_metadata", { profileId, database, maxTables: maxTables ?? null }),
+  /** Same streaming contract as pgExecute; cancel with pgCancel(queryId) (KILL QUERY on the server). */
+  myExecute: (args: {
+    profileId: string;
+    database: string | null;
+    sql: string;
+    options?: Partial<T.ExecOptions>;
+    confirmed?: boolean;
+    onEvent: (ev: T.QueryEvent) => void;
+  }) => {
+    const ch = new Channel<T.QueryEvent>();
+    ch.onmessage = args.onEvent;
+    const options: T.ExecOptions = { readOnly: false, maxRows: 100_000, pageSize: 500, timeoutMs: null, ...args.options };
+    return invoke<string>("my_execute", { profileId: args.profileId, database: args.database, sql: args.sql, options, confirmed: args.confirmed ?? false, onEvent: ch });
   },
 
   // files

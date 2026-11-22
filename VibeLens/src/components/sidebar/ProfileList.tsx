@@ -75,7 +75,7 @@ export function ProfileList() {
         ? { label: "New SQL tab", onSelect: () => newSqlTab({ profileId: p.id, database: null }) }
         : p.engine === "iceberg"
           ? { label: "New SQL tab", onSelect: () => openIcebergBlankTab(p.id) }
-          : p.engine === "redshift"
+          : p.engine === "redshift" || p.engine === "mysql"
             ? { label: "New SQL tab", onSelect: () => newSqlTab({ profileId: p.id, database: null }) }
             : { label: "New Valkey console", onSelect: () => newValkeyConsole({ profileId: p.id }) },
       "separator",

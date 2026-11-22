@@ -13,6 +13,7 @@ import { HostKeyTrustDialog } from "./HostKeyDialog";
 import { isHostKeyFingerprint, withTrustedHostKey } from "./hostKey";
 import { catalogSummary, engineSummary, normalizeIceberg, storageSummary } from "./icebergForm";
 import type { ConfRow } from "./remoteEngineForm";
+import { mysqlPasswordError } from "./mysqlForm";
 import { normalizeRedshift, redshiftTargetName } from "./redshiftForm";
 import { RedshiftSection } from "./sections/RedshiftSection";
 import { AdvancedSection } from "./sections/AdvancedSection";
@@ -51,6 +52,7 @@ const ENGINE_SECTIONS: Record<ConnectionProfile["engine"], SectionId[]> = {
   valkey: ["general", "auth", "network", "tls", "ai", "advanced"],
   iceberg: ["general", "catalog", "storage", "queryEngine", "ai"],
   redshift: ["general", "warehouse", "ai"],
+  mysql: ["general", "auth", "network", "tls", "ai", "advanced"],
 };
 
 type TestState =
@@ -118,7 +120,14 @@ function WizardForm({ existing, others }: { existing: ConnectionProfile | null; 
   const profile = draft.profile;
   const storedSecrets = useSecretStatus(editing ? existing?.id : null).data;
   const missing = useMemo(() => missingIcebergSecrets(existing, draft, storedSecrets), [existing, draft, storedSecrets]);
-  const errors = useMemo(() => ({ ...validateProfile(cleanProfile(profile), others, missing), ...draftErrors(draft) }), [profile, others, missing, draft]);
+  const mysqlPassword = useMemo(
+    () => mysqlPasswordError(existing, cleanProfile(profile), draft.password, storedSecrets?.hasPassword ?? editing),
+    [existing, profile, draft.password, storedSecrets, editing],
+  );
+  const errors = useMemo<Record<string, string>>(
+    () => ({ ...validateProfile(cleanProfile(profile), others, missing), ...draftErrors(draft), ...(mysqlPassword ? { "auth.password": mysqlPassword } : {}) }),
+    [profile, others, missing, draft, mysqlPassword],
+  );
   const counts = useMemo(() => errorCountBySection(errors), [errors]);
 
   const touch = useCallback(() => {

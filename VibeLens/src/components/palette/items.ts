@@ -8,6 +8,7 @@ export type IconKey =
   | "pg"
   | "iceberg"
   | "redshift"
+  | "mysql"
   | "valkey"
   | "table"
   | "view"
@@ -99,6 +100,7 @@ export function connectionItems(profiles: readonly ConnectionProfile[], stateOf:
     const pg = p.engine === "postgres";
     const ice = p.engine === "iceberg";
     const rs = p.engine === "redshift";
+    const my = p.engine === "mysql";
     const state = stateOf(p.id);
     return {
       id: `conn:${p.id}`,
@@ -108,16 +110,16 @@ export function connectionItems(profiles: readonly ConnectionProfile[], stateOf:
         ? `${icebergWhere(p)} iceberg lakehouse athena trino spark glue rest ${p.environment}`
         : rs
           ? `${redshiftWhere(p)} redshift warehouse aws ${p.environment}`
-          : `${p.host} ${pg ? "postgres postgresql" : "valkey redis"} ${p.environment}`,
-      icon: ice ? "iceberg" : rs ? "redshift" : pg ? "pg" : "valkey",
-      tone: ice ? "cyan" : rs ? "violet" : pg ? "sky" : "rose",
+          : `${p.host} ${pg ? "postgres postgresql" : my ? "mysql aurora" : "valkey redis"} ${p.environment}`,
+      icon: ice ? "iceberg" : rs ? "redshift" : my ? "mysql" : pg ? "pg" : "valkey",
+      tone: ice ? "cyan" : rs ? "violet" : my ? "amber" : pg ? "sky" : "rose",
       crumbs: [ice ? icebergWhere(p) : rs ? redshiftWhere(p) : `${p.host}:${p.port}`],
       meta: state === "connected" ? "connected" : state === "connecting" ? "connecting" : state === "error" ? "error" : undefined,
       env: p.environment,
       state,
       primary: state === "connected" ? "Focus" : "Connect",
       run: () => a.openConnection(p),
-      alt: { label: pg || ice || rs ? "New SQL tab" : "New console", run: () => a.newTabOnConnection(p) },
+      alt: { label: pg || ice || rs || my ? "New SQL tab" : "New console", run: () => a.newTabOnConnection(p) },
     };
   });
 }
@@ -161,6 +163,37 @@ export function catalogItems(p: ConnectionProfile, db: string | null, meta: Sche
       primary: "Open ER diagram",
       run: () => a.openErd(p, db, schema),
       alt: { label: "Insert name", run: () => a.insertName(p, db, schema, "") },
+    });
+  }
+  return out;
+}
+
+/**
+ * Tables and views of a MySQL database. MySQL has no data tab or ER diagram (Postgres features), so the
+ * primary action opens a SELECT in a SQL tab and the alternative inserts the backtick-quoted name.
+ */
+export function mysqlCatalogItems(
+  p: ConnectionProfile,
+  meta: SchemaMetadata,
+  a: { query: (db: string, name: string) => void; insertName: (p: ConnectionProfile, db: string | null, schema: string, name: string) => void },
+): PaletteItem[] {
+  const out: PaletteItem[] = [];
+  for (const t of meta.tables) {
+    if (t.kind === "sequence" || t.kind === "function" || t.kind === "procedure") continue;
+    const isView = VIEW_KINDS.has(t.kind);
+    out.push({
+      id: `myobj:${p.id}:${t.schema}.${t.name}`,
+      group: isView ? "Views" : "Tables",
+      title: t.name,
+      search: `${t.schema}.${t.name}`,
+      context: p.name,
+      icon: isView ? "view" : "table",
+      tone: isView ? "emerald" : "sky",
+      crumbs: [p.name, t.schema],
+      meta: compactRows(t.estimatedRows) || undefined,
+      primary: "Query in new tab",
+      run: () => a.query(t.schema, t.name),
+      alt: { label: "Insert name", run: () => a.insertName(p, t.schema, t.schema, t.name) },
     });
   }
   return out;

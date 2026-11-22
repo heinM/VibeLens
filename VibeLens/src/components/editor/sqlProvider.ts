@@ -30,7 +30,11 @@ const keyFor = (t: ModelTarget) => schemaMetadataKey(t.profileId, t.database, ca
 
 /** The catalog index for a fetched `SchemaMetadata` under this target's dialect. */
 export function catalogOf(meta: SchemaMetadata, t: ModelTarget): Catalog {
-  return catalogEngineOf(t.dialect) === "iceberg" ? indexCatalog(meta, { dotted: true, defaultSchema: t.defaultSchema ?? null }) : indexCatalog(meta);
+  const engine = catalogEngineOf(t.dialect);
+  if (engine === "iceberg") return indexCatalog(meta, { dotted: true, defaultSchema: t.defaultSchema ?? null });
+  // MySQL: a table's schema is its database; unqualified names resolve in the one the catalog describes.
+  if (engine === "mysql") return indexCatalog(meta, { defaultSchema: meta.database || null });
+  return indexCatalog(meta);
 }
 
 const STALE_MS = 5 * 60_000;

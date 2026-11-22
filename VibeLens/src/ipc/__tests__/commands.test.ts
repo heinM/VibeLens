@@ -62,3 +62,42 @@ describe("Redshift commands", () => {
     expect(onEvent).toHaveBeenCalledWith({ type: "finished", elapsedMs: 1 });
   });
 });
+
+describe("MySQL commands", () => {
+  it("use the contract's command and argument names", async () => {
+    await api.myListDatabases("p1");
+    expect(lastCall()).toEqual(["my_list_databases", { profileId: "p1" }]);
+    await api.myListObjects("p1", "shop");
+    expect(lastCall()).toEqual(["my_list_objects", { profileId: "p1", database: "shop" }]);
+    await api.myDescribeTable("p1", "shop", "orders");
+    expect(lastCall()).toEqual(["my_describe_table", { profileId: "p1", database: "shop", table: "orders" }]);
+    await api.mySchemaMetadata("p1", null);
+    expect(lastCall()).toEqual(["my_schema_metadata", { profileId: "p1", database: null, maxTables: null }]);
+    await api.mySchemaMetadata("p1", "shop", 50);
+    expect(lastCall()).toEqual(["my_schema_metadata", { profileId: "p1", database: "shop", maxTables: 50 }]);
+  });
+  it("my_execute sends the database, full options and a channel; events reach the callback", async () => {
+    const onEvent = vi.fn();
+    await api.myExecute({ profileId: "p1", database: "shop", sql: "select 1", options: { readOnly: true }, onEvent });
+    const [cmd, args] = lastCall();
+    expect(cmd).toBe("my_execute");
+    expect(args).toMatchObject({ profileId: "p1", database: "shop", sql: "select 1", confirmed: false, options: { readOnly: true, maxRows: 100_000, pageSize: 500, timeoutMs: null } });
+    const ch = args.onEvent as { onmessage: (m: unknown) => void };
+    ch.onmessage({ type: "finished", elapsedMs: 1 });
+    expect(onEvent).toHaveBeenCalledWith({ type: "finished", elapsedMs: 1 });
+  });
+  it("sql_classify passes the engine so MySQL SQL is read by MySQL's rules", async () => {
+    await api.sqlClassify("select 1", "mysql");
+    expect(lastCall()).toEqual(["sql_classify", { sql: "select 1", engine: "mysql" }]);
+    await api.sqlClassify("select 1");
+    expect(lastCall()).toEqual(["sql_classify", { sql: "select 1", engine: null }]);
+  });
+  it("a saved profile always carries MySQL options, never null (Rust's field is not optional)", async () => {
+    const p = newProfile("mysql");
+    await api.saveProfile(p);
+    const sent = lastCall()[1].profile as { mysql: unknown; engine: string };
+    expect(sent.engine).toBe("mysql");
+    expect(sent.mysql).toEqual({ connectTimeoutSecs: 30, statementTimeoutMs: null, idleDisconnectSecs: 300, maxPoolSize: 4 });
+    expect((newProfile("postgres") as { mysql?: unknown }).mysql).not.toBeNull();
+  });
+});

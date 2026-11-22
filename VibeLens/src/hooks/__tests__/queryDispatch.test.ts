@@ -8,6 +8,7 @@ const api = vi.hoisted(() => ({
   pgExecute: vi.fn(async (_a: unknown) => "pg-1"),
   iceExecute: vi.fn(async (_a: unknown) => "ice-1"),
   rsExecute: vi.fn(async (_a: unknown) => "rs-1"),
+  myExecute: vi.fn(async (_a: unknown) => "my-1"),
   pgCancel: vi.fn(async (_id: string) => undefined),
 }));
 vi.mock("../../ipc/commands", () => ({ api, asError: (e: unknown) => e }));
@@ -177,5 +178,35 @@ describe("history is tagged with the engine", () => {
     useHistoryStore.setState({ entries: [] });
     record(ctx({ engine: "iceberg", environment: "prod" }), "select 1", true, 1, 1, null);
     expect(useHistoryStore.getState().entries).toHaveLength(0);
+  });
+});
+
+describe("MySQL dispatch", () => {
+  it("runs MySQL through myExecute with the tab's database, never through pgExecute", async () => {
+    expect(await executeOnEngine("mysql", { ...base, options: { readOnly: true }, confirmed: true })).toBe("my-1");
+    expect(api.pgExecute).not.toHaveBeenCalled();
+    expect(api.myExecute).toHaveBeenCalledWith({ profileId: "p1", database: "orders", sql: "select 1", options: { readOnly: true }, confirmed: true, onEvent });
+    expect(runsSql("mysql")).toBe(true);
+  });
+  it("passes a null database through so Rust uses the profile's default", async () => {
+    await executeOnEngine("mysql", { ...base, database: null });
+    expect((api.myExecute.mock.calls[0][0] as { database: unknown }).database).toBeNull();
+  });
+  it("cancels through pgCancel like every engine", async () => {
+    await cancelQuery("my-1");
+    expect(api.pgCancel).toHaveBeenCalledWith("my-1");
+  });
+  it("after DDL refreshes only the MySQL catalog of that connection", () => {
+    const qc = new QueryClient();
+    qc.setQueryData(schemaMetadataKey("p1", "shop", "mysql"), { database: "shop", serverVersion: null, tables: [], truncated: false });
+    qc.setQueryData(["my", "p1", "shop", "objects"], []);
+    qc.setQueryData(schemaMetadataKey("p2", "shop", "mysql"), { database: "shop", serverVersion: null, tables: [], truncated: false });
+    qc.setQueryData(schemaMetadataKey("p1", "shop"), { database: "shop", serverVersion: null, tables: [], truncated: false });
+    invalidateAfterDdl(qc, "mysql", "p1");
+    expect(qc.getQueryState(schemaMetadataKey("p1", "shop", "mysql"))?.isInvalidated).toBe(true);
+    expect(qc.getQueryState(["my", "p1", "shop", "objects"])?.isInvalidated).toBe(true);
+    expect(qc.getQueryState(schemaMetadataKey("p2", "shop", "mysql"))?.isInvalidated).toBe(false);
+    expect(qc.getQueryState(schemaMetadataKey("p1", "shop"))?.isInvalidated).toBe(false);
+    expect(DDL_TAG.test("RENAME TABLE")).toBe(true);
   });
 });

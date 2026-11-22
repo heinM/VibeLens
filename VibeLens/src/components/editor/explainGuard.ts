@@ -13,6 +13,7 @@ export const ALREADY_EXPLAIN = "This is already an EXPLAIN; run it normally.";
 
 export const ICEBERG_NO_ANALYZE = "Explain Analyze isn't available for Iceberg connections yet. Use Explain for the plan, or run the query and read its data-scanned figure.";
 export const REDSHIFT_NO_EXPLAIN = "Explain isn't available for Redshift connections. Run EXPLAIN <statement> to see Redshift's text plan.";
+export const MYSQL_NO_EXPLAIN = "The plan view isn't available for MySQL connections. Run EXPLAIN <statement> (or EXPLAIN FORMAT=TREE) to see MySQL's plan as rows.";
 export const ICEBERG_ONE_STATEMENT = "Explain works on one statement at a time. Select a single statement, or put the cursor in it.";
 
 export type ExplainPlan =
@@ -31,6 +32,7 @@ export function planExplain(sql: string, mode: "plan" | "analyze", dialect?: Sql
   // The plan view reads Postgres JSON plans and Iceberg text plans; Redshift's plan is neither (and the
   // toolbar hides the buttons for it). Refuse rather than send Postgres-only EXPLAIN options to Redshift.
   if (dialect === "redshift") return { ok: false, message: REDSHIFT_NO_EXPLAIN };
+  if (dialect === "mysql") return { ok: false, message: MYSQL_NO_EXPLAIN };
   if (startsWithExplain(sql)) return { ok: false, message: ALREADY_EXPLAIN };
   const body = stripSemicolon(sql);
   if (isIcebergDialect(dialect)) {

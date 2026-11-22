@@ -5,6 +5,21 @@ import { Button, Input } from "../../ui";
 import { FormField, Notice, RadioCards, Switch, invalidRing } from "../../ui/formKit";
 import { isAwsHost } from "../awsHelpers";
 import type { SectionProps } from "./types";
+import { isLoopbackHost } from "../remoteEngineForm";
+
+/** MySQL refuses (in Rust) a password to another machine or an IAM token without verified TLS; say so up front. */
+function MysqlTlsRule({ tlsMode, host, tunneled, iam }: { tlsMode: TlsMode; host: string; tunneled: boolean; iam: boolean }) {
+  if (tlsMode === "verifyFull") return null;
+  const remote = tunneled || !isLoopbackHost(host);
+  if (!iam && !remote) return null;
+  return (
+    <Notice tone="danger">
+      {iam
+        ? "RDS IAM sends its token with the cleartext plugin, so MySQL connections with RDS IAM need Verify full (turn on the Amazon RDS CA bundle)."
+        : "MySQL connections send a password to another machine (or through an SSH tunnel) only with Verify full: without verification, whoever is in the path can obtain a reusable credential. Turn on Verify full with the server's CA file, or the Amazon RDS CA bundle."}
+    </Notice>
+  );
+}
 
 export function TlsSection({ profile, patch, err }: SectionProps) {
   const uid = useId();
@@ -40,6 +55,7 @@ export function TlsSection({ profile, patch, err }: SectionProps) {
           },
         ]}
       />
+      {profile.engine === "mysql" && <MysqlTlsRule tlsMode={tls.mode} host={profile.host} tunneled={!!profile.tunnel} iam={profile.auth.kind === "rdsIam"} />}
       {tls.mode === "require" && <Notice tone="warn">Certificates won&rsquo;t be checked. Prefer Verify full with the right CA, even on private networks.</Notice>}
       {tls.mode === "disable" && (
         <Notice tone={prod ? "danger" : "warn"}>

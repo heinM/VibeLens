@@ -2,6 +2,7 @@ import type { AwsTarget, ConnectionProfile, IcebergOptions } from "../../ipc/typ
 import { REGION_RE, SECRET_ARN_RE, awsTargetError } from "./awsHelpers";
 import { isHostKeyFingerprint } from "./hostKey";
 import { S3_TABLES_ARN_RE, headerRowError, headerRows, httpUrlError, isAwsCatalog, isS3Url, sqlFlavour } from "./icebergForm";
+import { validateMysql } from "./mysqlForm";
 import { validateRedshift } from "./redshiftForm";
 import { isRemoteEngine, validateRemoteEngine } from "./remoteEngineForm";
 
@@ -16,7 +17,7 @@ export function sectionOf(field: string): SectionId {
   if (field.startsWith("auth") || field.startsWith("aws")) return "auth";
   if (field.startsWith("tunnel")) return "network";
   if (field.startsWith("tls")) return "tls";
-  if (field.startsWith("pg.") || field.startsWith("valkey.")) return "advanced";
+  if (field.startsWith("pg.") || field.startsWith("valkey.") || field.startsWith("my.")) return "advanced";
   return "general";
 }
 
@@ -144,7 +145,7 @@ export function validateProfile(p: ConnectionProfile, others: ConnectionProfile[
   const a = p.auth;
   switch (a.kind) {
     case "password":
-      if (p.engine === "postgres" && !a.username.trim()) e["auth.username"] = "Username is required.";
+      if ((p.engine === "postgres" || p.engine === "mysql") && !a.username.trim()) e["auth.username"] = "Username is required.";
       break;
     case "rdsIam":
       if (!a.username.trim()) e["auth.username"] = "Database user is required.";
@@ -179,6 +180,9 @@ export function validateProfile(p: ConnectionProfile, others: ConnectionProfile[
   }
 
   if (p.tls.mode !== "disable" && p.tls.caCertPath && /^\s*$/.test(p.tls.caCertPath)) e["tls.caCertPath"] = "Path is blank.";
+
+  // Stricter than Postgres: credentials and TLS rules of mysql/validate.rs.
+  if (p.engine === "mysql") Object.assign(e, validateMysql(p));
 
   if (p.engine === "postgres") {
     if (!intIn(p.pg.connectTimeoutSecs, 1, 600)) e["pg.connectTimeoutSecs"] = "1-600 seconds.";

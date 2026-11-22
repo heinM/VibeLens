@@ -1,7 +1,7 @@
 // Mirror of crates/vibelens-core/src/model/*.rs (serde camelCase). Change both together.
 
 export type ProfileId = string;
-export type EngineKind = "postgres" | "valkey" | "iceberg" | "redshift";
+export type EngineKind = "postgres" | "valkey" | "iceberg" | "redshift" | "mysql";
 export type Environment = "dev" | "test" | "staging" | "prod";
 export type AiDataAccess = "none" | "schemaOnly" | "resultsWithApproval" | "results";
 export type TlsMode = "disable" | "require" | "verifyFull";
@@ -99,6 +99,21 @@ export interface ConnectionProfile {
   iceberg?: IcebergOptions | null;
   /** Required when engine === "redshift"; host/port/auth/tls/tunnel are unused then. */
   redshift?: RedshiftOptions | null;
+  /** MySQL settings (Rust always has them; `#[serde(default)]`). Never send null: omit it instead. */
+  mysql?: MysqlOptions;
+}
+
+/** MySQL connection settings (crates/vibelens-core/src/model/mysql.rs). A MySQL profile also uses
+ *  host, port, database (required), auth (password | rdsIam), tls and tunnel. */
+export interface MysqlOptions {
+  /** 1 to 600 seconds. */
+  connectTimeoutSecs: number;
+  /** Per-statement limit; on expiry the statement is stopped with KILL QUERY. null = none. */
+  statementTimeoutMs: number | null;
+  /** 0 = never. */
+  idleDisconnectSecs: number;
+  /** 1 to 32. */
+  maxPoolSize: number;
 }
 
 // ---------- import ----------

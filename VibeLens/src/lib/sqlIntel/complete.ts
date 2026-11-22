@@ -2,7 +2,7 @@
 // types here, so it is unit-testable and the provider is a thin mapping.
 import type { TableDescription } from "../../ipc/types";
 import { type Catalog, childNamespaces, describeColumnBadges, foreignKeysByColumn, formatRows, ident, isDefaultSchema, kindLabel, lookupTable, quoteIdent, resolveSchemaQualifier, schemaIdent, schemaTables } from "./catalog";
-import { METADATA_TABLES, type SqlDialect, afterRelationExtras, functionsFor, isTrinoFamily, nestedNamespaceIsOneIdent, snippetsFor, statementStartFor, tableSuffixTarget, typeNamesFor } from "./dialect";
+import { METADATA_TABLES, type SqlDialect, afterRelationExtras, hashComments, functionsFor, isTrinoFamily, nestedNamespaceIsOneIdent, snippetsFor, statementStartFor, tableSuffixTarget, typeNamesFor } from "./dialect";
 import { type Analysis, type Context, analyzeAt, tokenizeCached } from "./analysis";
 import { type ColumnEntry, columnsOf, tableOf } from "./columns";
 import { joinConditions } from "./joins";
@@ -359,7 +359,7 @@ function expressionSuggestions(cat: Catalog | null, a: Analysis, clause: Context
 // -- entry point ------------------------------------------------------------------------------------
 
 export function complete(cat: Catalog | null, sql: string, offset: number, opts: CompleteOptions = {}): CompletionResult | null {
-  const a = analyzeAt(sql, offset);
+  const a = analyzeAt(sql, offset, hashComments(opts.dialect));
   if (!a) return null;
   const ctx = a.ctx;
   const force = a.quoted;

@@ -56,3 +56,24 @@ describe("tool summaries for the new targets", () => {
     expect(summarizeToolArgs("get_schema", { database: "dev" })).toBe("dev");
   });
 });
+
+describe("MySQL agent UI", () => {
+  const myCtx = (over: Partial<SuggestionContext> = {}): SuggestionContext => ({ engine: "mysql", connectionName: "shop", database: "shop", access: "results", hasEditorText: false, ...over });
+  it("suggestions are MySQL-shaped: performance_schema, ALTER TABLE indexes, no Postgres or Redshift advice", () => {
+    const s = suggestionsFor(myCtx());
+    const text = s.map((x) => `${x.title} ${x.prompt}`).join("\n");
+    expect(text).toMatch(/shop database/);
+    expect(text).toMatch(/performance_schema/);
+    expect(text).not.toMatch(/pg_stat_statements|COMMENT ON|SYS_QUERY_HISTORY|CREATE INDEX/);
+    expect(s.some((x) => x.id.startsWith("pg-") || x.id.startsWith("rs-"))).toBe(false);
+  });
+  it("gate the slow-query suggestion on results access", () => {
+    expect(suggestionsFor(myCtx({ access: "schemaOnly" })).find((x) => x.id === "my-slow")?.disabledReason).toMatch(/results access/);
+    expect(suggestionsFor(myCtx({ hasEditorText: true })).some((x) => x.id === "my-review")).toBe(true);
+  });
+  it("the approval header names the database and Rust's MySQL target line, and warns off the default", () => {
+    const t = describeTarget({ connection: "shop", engine: "mysql", environment: "prod", database: "billing", defaultDatabase: "shop", valkeyDb: null, detail: "MySQL · db.internal:3306 · as app · via SSH bastion:22" });
+    expect(t).toMatchObject({ where: "database billing", detail: "MySQL · db.internal:3306 · as app · via SSH bastion:22" });
+    expect(t?.warning).toMatch(/default database \(shop\)/);
+  });
+});

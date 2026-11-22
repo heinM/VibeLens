@@ -3,31 +3,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import {
-  Bot,
-  Database,
-  Eye,
-  FileCode2,
-  FileText,
-  History,
-  Network,
-  Plug,
-  Plus,
-  RefreshCw,
-  Search,
-  Settings2,
-  SlidersHorizontal,
-  SquareFunction,
-  SquareTerminal,
-  PanelLeft,
-  Sun,
-  Moon,
-  Table2,
-  Trash2,
-  Unplug,
-  Zap,
-  XCircle,
-} from "lucide-react";
+import { Bot, Database, Eye, FileCode2, FileText, History, Moon, Network, PanelLeft, Plug, Plus, RefreshCw, Search, Server, Settings2, SlidersHorizontal, SquareFunction, SquareTerminal, Sun, Table2, Trash2, Unplug, XCircle, Zap } from "lucide-react";
 import { Warehouse } from "lucide-react";
 import { useProfiles } from "../../hooks/useProfiles";
 import { useConnect, useConnectionStatuses, useDisconnect } from "../../hooks/useConnectionStatus";
@@ -60,6 +36,7 @@ const ICONS: Record<IconKey, ReactNode> = {
   pg: <Database className="size-3.5" />,
   iceberg: <IcebergGlyph className="size-3.5" />,
   redshift: <Warehouse className="size-3.5" />,
+  mysql: <Server className="size-3.5" />,
   valkey: <Zap className="size-3.5" />,
   table: <Table2 className="size-3.5" />,
   view: <Eye className="size-3.5" />,
@@ -154,6 +131,7 @@ function useCommandItems(onAskClearHistory: () => void): PaletteItem[] {
     const connectedPg = list.filter((p) => p.engine === "postgres" && stateOf(p.id) === "connected");
     const connectedIce = list.filter((p) => p.engine === "iceberg" && stateOf(p.id) === "connected");
     const connectedRs = list.filter((p) => p.engine === "redshift" && stateOf(p.id) === "connected");
+    const connectedMy = list.filter((p) => p.engine === "mysql" && stateOf(p.id) === "connected");
     const iceberg = resolveIcebergTarget({ profiles: list, activeTabProfileId: tab?.profileId, activeProfileId: ui.activeProfileId, stateOf });
     const env: CommandEnv = {
       aiMode,
@@ -188,6 +166,7 @@ function useCommandItems(onAskClearHistory: () => void): PaletteItem[] {
           for (const p of connectedPg) void qc.invalidateQueries({ queryKey: ["pg", p.id] });
           for (const p of connectedIce) void qc.invalidateQueries({ queryKey: ["ice", p.id] });
           for (const p of connectedRs) void qc.invalidateQueries({ queryKey: ["rs", p.id] });
+          for (const p of connectedMy) void qc.invalidateQueries({ queryKey: ["my", p.id] });
         },
         refreshFiles: () => void qc.invalidateQueries({ queryKey: WS_FILES_KEY }),
         openErd: (t) => openErdTab(t.profileId, t.database, t.schema),

@@ -1,4 +1,4 @@
-import { Database, Warehouse, Zap } from "lucide-react";
+import { Database, Server, Warehouse, Zap } from "lucide-react";
 import type { EngineKind } from "../../ipc/types";
 import { cn } from "../../lib/cn";
 import { IcebergGlyph } from "../iceberg/IcebergGlyph";
@@ -12,6 +12,8 @@ export function EngineIcon({ engine, className }: { engine: EngineKind; classNam
       return <IcebergGlyph className={cn("size-4 shrink-0 text-cyan-400", className)} />;
     case "redshift":
       return <Warehouse className={cn("size-4 shrink-0 text-violet-400", className)} />;
+    case "mysql":
+      return <Server className={cn("size-4 shrink-0 text-amber-500", className)} />;
     case "valkey":
       return <Zap className={cn("size-4 shrink-0 text-rose-400", className)} />;
   }

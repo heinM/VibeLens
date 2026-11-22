@@ -46,7 +46,7 @@ const HistoryItem = memo(function HistoryItem({
 }) {
   const age = now - entry.at < 86_400_000 ? timeAgo(entry.at, now) : clockTime(entry.at);
   // Postgres is the default; don't label it.
-  const engine = entry.engine === "iceberg" ? "Iceberg" : entry.engine === "redshift" ? "Redshift" : null;
+  const engine = entry.engine === "iceberg" ? "Iceberg" : entry.engine === "redshift" ? "Redshift" : entry.engine === "mysql" ? "MySQL" : null;
   const connection = [entry.profileName, engine, entry.database].filter(Boolean).join(" · ");
   const action = (fn: (e: HistoryEntry) => void) => (ev: { stopPropagation: () => void }) => {
     ev.stopPropagation();

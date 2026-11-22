@@ -19,7 +19,7 @@ import { layoutStorage, panelStyle } from "../layout/storage";
 import { consumeAutoRun } from "./autoRun";
 import { redactDbError } from "../../lib/sqlIntel/redact";
 import { dialectOf, isIcebergDialect } from "../../lib/sqlIntel/dialect";
-import { ICEBERG_NO_ANALYZE, REDSHIFT_NO_EXPLAIN, planExplain, startsWithExplain } from "./explainGuard";
+import { ICEBERG_NO_ANALYZE, MYSQL_NO_EXPLAIN, REDSHIFT_NO_EXPLAIN, planExplain, startsWithExplain } from "./explainGuard";
 import { AI_OFF_HINT } from "../../lib/aiInline";
 import { SaveAsDialog } from "./SaveAsDialog";
 import { SqlEditor, runnableAtCursor, type CodeEditor, type SqlEditorControls, type SqlEditorHandlers, type TrackedRange } from "./SqlEditor";
@@ -77,8 +77,10 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
   // Iceberg engines and Redshift (Data API) have no READ ONLY transaction: read-only means the statement
   // is checked and refused before it is sent.
   const refusesWrites = isIce || isRedshift;
-  // EXPLAIN view and Explain Analyze are Postgres (JSON plan) and Iceberg (text plan) features. Not offered on Redshift.
-  const canExplain = !isRedshift;
+  const isMysql = dialect === "mysql";
+  // EXPLAIN view and Explain Analyze are Postgres (JSON plan) and Iceberg (text plan) features. Not offered
+  // on Redshift or MySQL (whose plans are neither); EXPLAIN <statement> still runs as an ordinary query.
+  const canExplain = !isRedshift && !isMysql;
   const defaultNamespace = isIce ? (profile?.iceberg?.defaultNamespace ?? null) : null;
   const database = isIce ? null : isRedshift ? (tab.database ?? profile?.redshift?.database ?? null) : (tab.database ?? profile?.database ?? null);
 
@@ -151,13 +153,13 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
   const runCurrent = useCallback(
     (mode: RunMode = "run", readOnlyOnce = false) => {
       const ed = editorRef.current;
-      const r = ed ? runnableAtCursor(ed) : null;
+      const r = ed ? runnableAtCursor(ed, dialect) : null;
       if (!r) return void setLocalError({ code: "empty", message: "There is nothing to run at the cursor." });
       let sql = r.sql;
       let ro = readOnlyOnce;
       let textPlan = false;
       if (mode !== "run") {
-        if (!canExplain) return void setNotice({ tone: "info", text: REDSHIFT_NO_EXPLAIN });
+        if (!canExplain) return void setNotice({ tone: "info", text: isMysql ? MYSQL_NO_EXPLAIN : REDSHIFT_NO_EXPLAIN });
         // Explain and Explain Analyze never get write access: EXPLAIN ANALYZE really executes the
         // statement, and a statement that already starts with EXPLAIN is refused rather than run as is.
         // On Iceberg connections the engine answers a plain `EXPLAIN <sql>` with a text plan.
@@ -170,7 +172,7 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
       track(r.sql, r.start, r.end);
       void execute(sql, { readOnly: ro || undefined, textPlan: textPlan || undefined });
     },
-    [execute, track, dialect, canExplain],
+    [execute, track, dialect, canExplain, isMysql],
   );
 
   const runScript = useCallback(
@@ -224,7 +226,7 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
   // -- Explain Analyze gate: ask the classifier when the menu opens, never per keystroke ------------
   const openExplainMenu = (anchor: HTMLElement) => {
     const ed = editorRef.current;
-    const r = ed ? runnableAtCursor(ed) : null;
+    const r = ed ? runnableAtCursor(ed, dialect) : null;
     setMenu({ kind: "explain", anchor });
     // The Iceberg engines have no read-only ANALYZE that this app can vouch for: Explain only.
     if (isIce) return setGate({ state: "blocked", reason: ICEBERG_NO_ANALYZE });
@@ -253,7 +255,11 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
             label: refusesWrites ? "Run read-only" : "Run in read-only transaction",
             hint: `${MOD}⌥↵`,
             icon: <Lock className="size-3.5" />,
-            detail: refusesWrites ? "Refuses statements that would change data or tables." : "Wraps this run in BEGIN READ ONLY. Writes fail instead of changing data.",
+            detail: refusesWrites
+              ? "Refuses statements that would change data or tables."
+              : isMysql
+                ? "Checks each statement is a plain read before sending it, and wraps the run in START TRANSACTION READ ONLY."
+                : "Wraps this run in BEGIN READ ONLY. Writes fail instead of changing data.",
             onSelect: () => runCurrent("run", true),
           },
           { id: "script", label: "Run whole script", hint: `${MOD}⇧↵`, icon: <ListVideo className="size-3.5" />, onSelect: () => runScript() },
@@ -290,7 +296,7 @@ export function SqlTabPane({ tab, active }: { tab: WorkspaceTab; active: boolean
     let range = tr;
     // A script: narrow to the statement the server rejected when our splitter agrees on the count.
     if (failed && model.getValueInRange(tr) === run.sql) {
-      const stmts = splitStatements(run.sql);
+      const stmts = splitStatements(run.sql, { mysql: isMysql });
       const stmt = stmts.length === runner.statementCount ? stmts[failed.index] : undefined;
       if (stmt) {
         const base = model.getOffsetAt({ lineNumber: tr.startLineNumber, column: tr.startColumn });

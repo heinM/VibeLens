@@ -67,7 +67,7 @@ export function CodeBody({ kind, code, className, wrap }: { kind: PreviewBodyKin
   );
 }
 
-const SQL_LANGS = new Set(["sql", "pgsql", "postgres", "postgresql", "psql", "plpgsql"]);
+const SQL_LANGS = new Set(["sql", "pgsql", "postgres", "postgresql", "psql", "plpgsql", "mysql"]);
 const VALKEY_LANGS = new Set(["redis", "valkey"]);
 
 export function kindForLang(lang: string): PreviewBodyKind {

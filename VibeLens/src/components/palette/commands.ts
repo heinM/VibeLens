@@ -6,7 +6,7 @@ import type { ErdTarget } from "./erdTarget";
 import type { PaletteItem } from "./items";
 
 /** Engine named on the Connect / Disconnect rows. */
-const ENGINE_PALETTE_META: Record<EngineKind, string> = { postgres: "PostgreSQL", iceberg: "Iceberg", redshift: "Redshift", valkey: "Valkey" };
+const ENGINE_PALETTE_META: Record<EngineKind, string> = { postgres: "PostgreSQL", iceberg: "Iceberg", redshift: "Redshift", mysql: "MySQL", valkey: "Valkey" };
 
 export interface CommandActions {
   newSqlTab: () => void;

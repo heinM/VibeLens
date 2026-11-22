@@ -59,6 +59,26 @@ export function suggestionsFor(ctx: SuggestionContext): Suggestion[] {
     ];
   }
 
+  if (ctx.engine === "mysql") {
+    // MySQL: performance_schema instead of pg_stat_statements; no COMMENT ON (comments live in ALTER TABLE).
+    const db = ctx.database?.trim() || "database";
+    return [
+      s("my-schema", "schema", `Map out the ${db} database`, "Tables, keys and how they relate", `Map out the ${db} database on this MySQL server: the main tables, their primary and foreign keys and how they relate. Group them by domain and point out anything that looks odd.`),
+      s(
+        "my-slow",
+        "slow",
+        "Find slow queries in performance_schema",
+        "Total latency, average latency, calls",
+        "Find the slowest statement digests in performance_schema.events_statements_summary_by_digest (or sys.statement_analysis): show total and average latency and calls, and say which ones are worth optimising and why.",
+        { disabledReason: gate },
+      ),
+      s("my-index", "index", "Suggest missing indexes", "Foreign keys and filters without support", "From the schema, find foreign keys and likely filter columns that have no supporting index. Give me ALTER TABLE … ADD INDEX statements and name the write cost of each."),
+      ctx.hasEditorText
+        ? s("my-review", "review", "Review the SQL in my editor", "Correctness, performance, indexes", "Review the MySQL SQL in my editor for correctness and performance. Suggest indexes or rewrites if they would help, and say what each would cost.")
+        : s("my-query", "query", "Write a query…", "Describe the result you want", "Write a MySQL query that ", { incomplete: true }),
+    ];
+  }
+
   if (ctx.engine === "redshift") {
     // Redshift: no pg_stat_statements, no CREATE INDEX, no COMMENT-heavy migrations. Its own system views instead.
     const db = ctx.database?.trim() || "database";
