@@ -620,6 +620,29 @@ async fn ed25519_and_parsec_switches_are_refused_not_panics() {
     }
 }
 
+/// A greeting whose version uses non-ASCII decimal digits ("٣.٣.٣") reached `btoi(..).unwrap()`
+/// in mysql_common: a panic, before TLS. The driver refuses it.
+#[tokio::test]
+async fn a_non_ascii_version_in_the_greeting_is_refused_not_a_panic() {
+    for suffix in ["", "-MariaDB"] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let tail = suffix.to_string();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut p = handshake("mysql_native_password");
+            let nul = p.iter().skip(1).position(|&b| b == 0).unwrap() + 1;
+            let mut version = "٣.٣.٣".as_bytes().to_vec();
+            version.extend_from_slice(tail.as_bytes());
+            p.splice(1..nul, version);
+            write_packet(&mut s, 0, &p).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        });
+        let r = tokio::spawn(MysqlHandle::connect(params(port, false), creds())).await;
+        assert!(r.expect("no panic").is_err(), "refused ({suffix:?})");
+    }
+}
+
 /// Audit finding 3b: a second auth switch is an error.
 #[tokio::test]
 async fn a_second_auth_switch_is_an_error() {

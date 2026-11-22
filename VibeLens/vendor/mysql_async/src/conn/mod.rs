@@ -80,10 +80,15 @@ fn disconnect(mut conn: Conn) {
         // Server will report broken connection if spawn fails.
         // this might fail if, say, the runtime is shutting down, but we've done what we could
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            // VibeLens patch: the drain is bounded, so a server that streams rows forever
+            // cannot keep a task and a socket alive for every connection dropped mid-result.
             handle.spawn(async move {
-                if let Ok(conn) = conn.cleanup_for_pool().await {
-                    let _ = conn.disconnect().await;
-                }
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+                    if let Ok(conn) = conn.cleanup_for_pool().await {
+                        let _ = conn.disconnect().await;
+                    }
+                })
+                .await;
             });
         }
     }
@@ -523,6 +528,21 @@ impl Conn {
                 }
                 .into());
             }
+        }
+        // VibeLens patch: mysql_common parses the version with Unicode-aware `\d` and then
+        // `btoi(..).unwrap()`, which panics on a non-ASCII digit such as U+0663. This greeting
+        // arrives before TLS, so anyone on the path could send it. A version that is not plain
+        // ASCII is refused before the parse; with ASCII, `\d` can only match 0-9.
+        if packet
+            .iter()
+            .skip(1)
+            .take_while(|&&b| b != 0)
+            .any(|b| !b.is_ascii())
+        {
+            return Err(DriverError::UnexpectedPacket {
+                payload: Vec::new(),
+            }
+            .into());
         }
         let handshake = ParseBuf(&packet).parse::<HandshakePacket>(())?;
 

@@ -25,7 +25,7 @@ This build was made on a Mac, not by CI: it contains the macOS universal app (Ap
 
 ## Verification
 
-- Rust: formatting and clippy clean; 1,050 tests pass against Postgres 17 (TLS), Valkey 8 and MySQL 8.4.
+- Rust: formatting and clippy clean; 1,051 tests pass against Postgres 17 (TLS), Valkey 8 and MySQL 8.4.
 - Frontend: typecheck clean; 982 tests pass.
 - CI did not run for this candidate.
 

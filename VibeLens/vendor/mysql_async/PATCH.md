@@ -64,7 +64,7 @@ MySQL connections and changes the following, each marked `VibeLens patch` in the
        indexing and `get` panics are avoided (VibeLens uses `unwrap_raw`); `ErrPacket`'s
        panicking accessors are not called; the old-password and parsec scramble `unwrap`s and
        the ed25519 panic sit behind plugins refused in (5) and by `secure_auth`; the version
-       regex `unwrap`s run only after a match whose digits fit `u16`.
+       regex `unwrap`s are guarded: the driver refuses a version string that is not plain ASCII before the parse (item 7), and with ASCII input the matched digits fit `u16`.
    Release builds have no overflow checks; the handshake length is the only server-controlled
    arithmetic found that overflows, and it is guarded. `tests/mysql_hostile.rs`
    (`fuzz::a_corrupting_server_never_panics_or_hangs_the_engine`) drives a seeded corrupting
@@ -79,3 +79,10 @@ Drop this copy only for an upstream release that offers all of these.
 Helpers left unused by (2) and (3) are removed so the crate builds without warnings:
 `Conn::is_socket`, `Conn::write_bytes` (`src/conn/mod.rs`) and `Stream::is_socket`
 (`src/io/mod.rs`), and the `crypto` import in `src/conn/mod.rs`.
+
+7. **Handshake version string, and the drop-time drain.** `mysql_common` matches the server
+   version with a Unicode-aware `\d` and converts the capture with `btoi(..).unwrap()`, so a
+   greeting whose version contains a non-ASCII decimal digit (for example U+0663) panicked. The
+   greeting is read before TLS, so this needed no credentials. `handle_handshake` now refuses a
+   version that is not plain ASCII. Separately, the cleanup task spawned when a connection is
+   dropped mid-result is limited to 5 seconds.

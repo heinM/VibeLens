@@ -1115,9 +1115,14 @@ pub fn agent_refusal(sql: &str) -> Option<String> {
         let routine = starts_routine(&words[..words.len().min(10)]);
         let reason = if has("OUTFILE") || has("DUMPFILE") {
             Some("SELECT … INTO OUTFILE/DUMPFILE writes a file on the database server")
-        } else if first == "LOAD" {
+        } else if first == "LOAD" || (routine && has("LOAD")) {
             Some("LOAD DATA and LOAD XML read files on the database server or on this machine")
-        } else if first == "SET" && words.get(1).map(String::as_str) == Some("STATEMENT") {
+        } else if (first == "SET" && words.get(1).map(String::as_str) == Some("STATEMENT"))
+            || (routine
+                && words
+                    .windows(2)
+                    .any(|w| w[0] == "SET" && w[1] == "STATEMENT"))
+        {
             Some(
                 "MariaDB's SET STATEMENT … FOR runs any statement after FOR with changed settings; \
                  send the statement itself",
@@ -1545,6 +1550,14 @@ mod tests {
                 "SET STATEMENT",
             ),
             ("SET STATEMENT x=1 FOR USE mysql", "SET STATEMENT"),
+            (
+                "CREATE PROCEDURE p() SET STATEMENT x=1 FOR DELETE FROM t",
+                "SET STATEMENT",
+            ),
+            (
+                "CREATE PROCEDURE p() LOAD DATA INFILE '/etc/passwd' INTO TABLE t",
+                "LOAD DATA",
+            ),
             // Re-audit item 2: inside a routine body.
             (
                 "CREATE PROCEDURE p() BEGIN SET @q = 0x53454c454354; PREPARE s FROM @q; EXECUTE s; END; CALL p()",

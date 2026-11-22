@@ -274,15 +274,15 @@ impl ConnectionManager {
             .iter()
             .map(|(k, e)| (k.clone(), e.handle.clone()))
             .collect();
-        let mysql: Vec<_> = self
-            .lock()
-            .mysql
-            .iter()
-            .map(|(k, e)| (k.clone(), e.handle.clone()))
-            .collect();
+        // Keys only: a clone of every MySQL handle held for the whole pass would make each pool
+        // look "held" to the eviction in `mysql()`, which would then refuse a new database.
+        let mysql_keys: Vec<_> = self.lock().mysql.keys().cloned().collect();
 
         let mut closed = 0;
-        for (key, handle) in mysql {
+        for key in mysql_keys {
+            let Some(handle) = self.lock().mysql.get(&key).map(|e| e.handle.clone()) else {
+                continue;
+            };
             let gone = match self.profiles.get(&key.0) {
                 Ok(p) => {
                     if idle_exceeded(handle.idle_secs(), p.mysql.idle_disconnect_secs) {
